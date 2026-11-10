@@ -40,6 +40,24 @@ pub enum Error {
     NotRegistered { prog: u32, vers: u32 },
     /// Bad user input (address parse, etc.).
     Invalid(String),
+    /// The server returned a non-OK NFS or MOUNT status.
+    Nfs(crate::fs::Status),
+    /// The server does not support the requested NFS version / minor version.
+    VersionUnsupported(String),
+}
+
+impl Error {
+    /// True when the error means "this protocol version isn't offered", so a
+    /// caller negotiating versions should try the next one.
+    pub fn is_version_unsupported(&self) -> bool {
+        matches!(
+            self,
+            Error::VersionUnsupported(_)
+                | Error::NotRegistered { .. }
+                | Error::Accept(AcceptError::ProgUnavail)
+                | Error::Accept(AcceptError::ProgMismatch { .. })
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -80,6 +98,8 @@ impl fmt::Display for Error {
                 write!(f, "program {prog} version {vers} is not registered with portmapper")
             }
             Error::Invalid(m) => write!(f, "{m}"),
+            Error::Nfs(st) => write!(f, "{st}"),
+            Error::VersionUnsupported(m) => write!(f, "version not supported: {m}"),
         }
     }
 }

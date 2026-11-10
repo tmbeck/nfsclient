@@ -5,9 +5,11 @@ without mounting them. Pure Rust, no kernel involvement.
 
 ## Scope
 
-- **Protocols:** NFSv2 (RFC 1094), NFSv3 (RFC 1813), MOUNT v1/v3, portmap v2
-  (RFC 1833), ONC-RPC v2 (RFC 5531), XDR (RFC 4506). All implemented in-repo.
+- **Protocols:** NFSv2 (RFC 1094), NFSv3 (RFC 1813), NFSv4.0 (RFC 7530),
+  NFSv4.1 (RFC 8881), NFSv4.2 (RFC 7862), MOUNT v1/v3, portmap v2 (RFC 1833),
+  ONC-RPC v2 (RFC 5531), XDR (RFC 4506). All implemented in-repo.
   (NFSv1 was never publicly released.)
+- **Version negotiation:** `auto` tries v4.2 → v4.1 → v4.0 → v3 → v2.
 - **Transports:** TCP (record marking) and UDP (retransmit with timeout/backoff).
 - **Auth:** AUTH_NONE, AUTH_SYS with an arbitrary uid/gid/aux gids (defaulting
   to the local user). The auth layer is a trait so RPCSEC_GSS/Kerberos can be
@@ -27,11 +29,12 @@ src/lib.rs
   xdr/        encoder/decoder, Pack/Unpack traits
   rpc/        call/reply, auth flavors, tcp+udp transports, reserved-port bind
   portmap.rs  GETPORT, DUMP
-  mount.rs    MNT, UMNT, EXPORT (v1 + v3)
-  nfs2.rs     v2 procedures + types
-  nfs3.rs     v3 procedures + types
-  client.rs   version-agnostic facade (lookup/readdir/read/write/...),
-              path resolution, v3→v2 negotiation
+  mount.rs    MNT, UMNT, EXPORT (v1 + v3), export resolution
+  fs.rs       version-agnostic Filesystem trait + normalized types/status
+  client.rs   version negotiation behind fs::connect
+  nfs2/       v2 codec + Filesystem backend
+  nfs3/       v3 codec + Filesystem backend
+  nfs4/       v4.x COMPOUND codec, sessions/clientid state, Filesystem backend
 src/bin/nfsc/
   main.rs     clap CLI
   shell.rs    REPL (rustyline), command parsing, -c scripting
@@ -44,7 +47,7 @@ clap, rustyline.
 ## CLI
 
 ```
-nfsc shell   nfs://host[:port]/export[/path] | host:/export  [-c 'cmd; cmd'] [-v 2|3|auto]
+nfsc shell   nfs://host[:port]/export[/path] | host:/export  [-c 'cmd; cmd'] [-v 2|3|4|4.0|4.1|4.2|auto]
 nfsc exports host     # MOUNT EXPORT  (showmount -e)
 nfsc rpcinfo host     # portmap DUMP  (rpcinfo -p)
 
@@ -67,17 +70,17 @@ Shell commands (kept deliberately small):
 - **Read-only integration:** run against an externally supplied read-only
   export (discovery, browse, stat, get, privileged vs unprivileged ports,
   root squash, crossing filesystem boundaries). Never write to it.
-- **Writes:** run against a container. nfs-ganesha (userspace, no host
-  module) is preferred; kernel nfsd in `--privileged` docker is the fallback.
+- **Writes and v4:** run against local podman containers in `testenv/`:
+  kernel nfsd (v3/v4.x, needs the host `nfsd` module and a privileged
+  container) and nfs-ganesha (userspace, v3/v4.x).
 - Integration tests are gated behind env vars (`NFSC_TEST_RO=host:/export`,
   `NFSC_TEST_RW=host:/export`) so `cargo test` stays offline by default.
   Test targets are never committed to the repo.
 
 ## Milestones
 
-1. XDR + RPC (TCP/UDP, AUTH_SYS, reserved ports) + portmap → `nfsc rpcinfo`
-2. MOUNT → `nfsc exports`, MNT/UMNT
-3. NFSv3 read path + client facade + shell: ls, cd, stat, get, df
-4. NFSv3 write path: put, mkdir, rm, rmdir, mv, ln, chmod, chown; ganesha container tests
-5. NFSv2 behind the same facade, version negotiation
-6. Polish: tab completion, recursive transfers, progress bars, pipelined READ/WRITE
+1. ✅ XDR + RPC (TCP/UDP, AUTH_SYS, reserved ports) + portmap → `nfsc rpcinfo`
+2. MOUNT → `nfsc exports`; Filesystem facade; shell
+3. NFSv3, NFSv2, NFSv4.x backends (read + write), container test env
+4. Polish: tab completion, recursive transfers, progress, pipelined READ/WRITE,
+   RPCSEC_GSS
