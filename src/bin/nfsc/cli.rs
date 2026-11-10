@@ -2,7 +2,8 @@
 
 use std::io::{self, Write};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nfsc::fs::{NfsVersion, VersionPref};
@@ -263,32 +264,88 @@ pub fn rpc_options(g: &Globals, auth: Auth) -> RpcOptions {
     }
 }
 
+/// Retry notices with the same text are shown at most once per this interval,
+/// so several pipelined requests failing together give one line, not dozens.
+const RETRY_NOTE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Thins out repeated retry notices; see [`RetryNotes::render`].
+struct RetryNotes {
+    /// What was printed last (without numbers) and when.
+    last: Option<(String, Instant)>,
+    /// Notices dropped since the last printed one.
+    suppressed: u32,
+}
+
+static RETRY_NOTES: Mutex<RetryNotes> = Mutex::new(RetryNotes {
+    last: None,
+    suppressed: 0,
+});
+
+impl RetryNotes {
+    /// The line to print for `ev` at `now`, or `None` when it repeats the
+    /// previous notice within [`RETRY_NOTE_INTERVAL`]. Giving up is reported
+    /// by the failing command itself, with the path, so it prints nothing.
+    fn render(&mut self, ev: &RetryEvent<'_>, now: Instant) -> Option<String> {
+        let (key, line) = match ev {
+            RetryEvent::Retrying {
+                op,
+                error,
+                delay,
+                elapsed,
+                budget,
+                ..
+            } => (
+                format!("retry {op}: {error}"),
+                format!(
+                    "nfsc: {op}: {error}; retrying in {:.1}s ({:.0}s of {:.0}s)",
+                    delay.as_secs_f64(),
+                    elapsed.as_secs_f64(),
+                    budget.as_secs_f64()
+                ),
+            ),
+            RetryEvent::Recovered {
+                op,
+                attempts,
+                elapsed,
+            } => (
+                format!("recovered {op}"),
+                format!(
+                    "nfsc: {op}: recovered after {attempts} attempts ({:.1}s)",
+                    elapsed.as_secs_f64()
+                ),
+            ),
+            RetryEvent::GaveUp { .. } => return None,
+        };
+        if let Some((k, at)) = &self.last
+            && *k == key
+            && now.saturating_duration_since(*at) < RETRY_NOTE_INTERVAL
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        let line = match self.suppressed {
+            0 => line,
+            n => format!(
+                "{line} [{n} repeated notice{} not shown]",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        self.suppressed = 0;
+        self.last = Some((key, now));
+        Some(line)
+    }
+}
+
 /// Prints retry progress on stderr so a stalled transfer is visibly waiting,
-/// not frozen. Giving up is reported by the failing command itself.
+/// not frozen. While progress bars are drawn the line goes above them;
+/// otherwise (no terminal, cron) it is a plain line.
 fn report_retry(ev: &RetryEvent<'_>) {
-    match ev {
-        RetryEvent::Retrying {
-            op,
-            error,
-            delay,
-            elapsed,
-            budget,
-            ..
-        } => eprintln!(
-            "nfsc: {op}: {error}; retrying in {:.1}s ({:.0}s of {:.0}s)",
-            delay.as_secs_f64(),
-            elapsed.as_secs_f64(),
-            budget.as_secs_f64()
-        ),
-        RetryEvent::Recovered {
-            op,
-            attempts,
-            elapsed,
-        } => eprintln!(
-            "nfsc: {op}: recovered after {attempts} attempts ({:.1}s)",
-            elapsed.as_secs_f64()
-        ),
-        RetryEvent::GaveUp { .. } => {}
+    let line = match RETRY_NOTES.lock() {
+        Ok(mut notes) => notes.render(ev, Instant::now()),
+        Err(_) => None,
+    };
+    if let Some(line) = line {
+        shell::status_line(&line);
     }
 }
 
@@ -365,6 +422,65 @@ fn rpcinfo(g: &Globals, host: &str) -> Result<(), CmdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_notices_render_and_repeats_are_thinned() {
+        let mut notes = RetryNotes {
+            last: None,
+            suppressed: 0,
+        };
+        let error = nfsc::Error::Timeout;
+        let retrying = RetryEvent::Retrying {
+            op: "READ",
+            attempt: 2,
+            error: &error,
+            delay: Duration::from_secs(4),
+            elapsed: Duration::from_secs(1),
+            budget: Duration::from_secs(120),
+        };
+        let t0 = Instant::now();
+        assert_eq!(
+            notes.render(&retrying, t0).as_deref(),
+            Some("nfsc: READ: RPC timed out; retrying in 4.0s (1s of 120s)")
+        );
+        // The same notice from other in-flight requests is dropped and counted.
+        assert!(
+            notes
+                .render(&retrying, t0 + Duration::from_millis(100))
+                .is_none()
+        );
+        assert!(
+            notes
+                .render(&retrying, t0 + Duration::from_millis(200))
+                .is_none()
+        );
+        let later = notes
+            .render(&retrying, t0 + Duration::from_secs(3))
+            .unwrap();
+        assert!(later.ends_with("[2 repeated notices not shown]"), "{later}");
+        let recovered = RetryEvent::Recovered {
+            op: "READ",
+            attempts: 3,
+            elapsed: Duration::from_millis(4500),
+        };
+        assert_eq!(
+            notes
+                .render(&recovered, t0 + Duration::from_secs(3))
+                .as_deref(),
+            Some("nfsc: READ: recovered after 3 attempts (4.5s)")
+        );
+        let gave_up = RetryEvent::GaveUp {
+            op: "READ",
+            attempts: 9,
+            error: &error,
+            elapsed: Duration::from_secs(120),
+        };
+        assert!(
+            notes
+                .render(&gave_up, t0 + Duration::from_secs(9))
+                .is_none()
+        );
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("nfsc").chain(args.iter().copied()))

@@ -254,6 +254,12 @@ pub struct Session {
     pub(super) tree: Option<super::progress::TreeProgress>,
     /// Listings gathered by a recursive get's pre-scan, used once by the download.
     pub(super) scan_cache: std::collections::HashMap<nfsc::fs::FileHandle, Vec<nfsc::fs::DirEntry>>,
+    /// Permission bits cleared from modes that `get` applies locally (the
+    /// process umask; `get -p` ignores it). Tests pin it.
+    pub umask: u32,
+    /// The local path of the entry that stopped a recursive transfer, so the
+    /// failure names the file and not only the tree.
+    pub(super) tree_failed_at: Option<PathBuf>,
 }
 
 impl Session {
@@ -288,6 +294,8 @@ impl Session {
             cache: Rc::new(RefCell::new(DirCache::default())),
             tree: None,
             scan_cache: std::collections::HashMap::new(),
+            umask: super::transfer::process_umask(),
+            tree_failed_at: None,
         };
         for name in remainder {
             let parent = last_node(&session.cwd).fh.clone();
