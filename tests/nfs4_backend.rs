@@ -674,10 +674,6 @@ fn expired_lease(minor: u32) {
 }
 
 #[test]
-#[ignore = "BUG: NFSv4.0 EXPIRED loop: exec_stateid (src/nfs4/backend.rs:1067) captures the \
-            stateid once; exec answers EXPIRED (backend.rs:731) with a full recover() \
-            (backend.rs:906), which drops the expired client's opens, then resends the dead \
-            stateid; the server (like knfsd) keeps answering EXPIRED until Error::GaveUp"]
 fn expired_lease_mid_read_recovers_v40() {
     expired_lease(0);
 }

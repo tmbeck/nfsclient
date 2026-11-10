@@ -728,6 +728,15 @@ impl Nfs4Backend {
                     recoveries += 1;
                     fix = Fix::Resume;
                 }
+                code::EXPIRED if recoveries > 0 => {
+                    // The client state was already re-established in this
+                    // call, so EXPIRED now refers to a stateid in the request
+                    // that belonged to the old client (NFSv4.0 servers such as
+                    // knfsd answer EXPIRED for those). Recovering again would
+                    // loop until the budget runs out; let the caller replace
+                    // the stateid instead (see `exec_stateid`).
+                    return Err(self.status_err(res.status));
+                }
                 code::STALE_CLIENTID | code::EXPIRED | code::BADSLOT | code::BAD_HIGH_SLOT => {
                     if recoveries > 0 {
                         retry.backoff(self.status_err(res.status))?;
@@ -1054,7 +1063,8 @@ impl Nfs4Backend {
     }
 
     /// Run `build` with the stateid for I/O on `fh`. If the stateid is rejected,
-    /// forget it and retry once with the anonymous stateid.
+    /// forget it, open the file again and retry with the new stateid; if that
+    /// fails too, retry once with the anonymous stateid.
     pub(super) fn exec_stateid<F>(
         &mut self,
         fh: &FileHandle,
@@ -1070,6 +1080,17 @@ impl Nfs4Backend {
                 if sid != ANON_STATEID && Self::is_stateid_error(c) =>
             {
                 self.opens.forget(fh);
+                let fresh = self.stateid_for_io(fh, write);
+                if fresh != ANON_STATEID {
+                    match self.exec(|_| build(fresh)) {
+                        Err(Error::Nfs(crate::fs::Status::Other(_, c)))
+                            if Self::is_stateid_error(c) =>
+                        {
+                            self.opens.forget(fh);
+                        }
+                        other => return other,
+                    }
+                }
                 self.exec(|_| build(ANON_STATEID))
             }
             other => other,
