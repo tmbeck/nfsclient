@@ -6,6 +6,10 @@
 //! The backend is not a faithful server: directories always report `nlink` 2,
 //! owner/group strings are never set, and only mode/uid/gid/size/times can be
 //! changed by `setattr`.
+//!
+//! [`MemFs::add_sparse_file`] creates a file of any size (up to `u64::MAX`)
+//! that stores only the bytes written to it and reads back a fill byte
+//! elsewhere, so tests can exercise offsets beyond 4 GiB cheaply.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +28,13 @@ enum Body {
         entries: BTreeMap<Vec<u8>, u64>,
     },
     File(Vec<u8>),
+    /// Sparse regular file: `size` bytes, `fill` where nothing was written,
+    /// and `extents` (offset -> bytes) holding the written data.
+    Sparse {
+        size: u64,
+        fill: u8,
+        extents: BTreeMap<u64, Vec<u8>>,
+    },
     Symlink(Vec<u8>),
 }
 
@@ -101,6 +112,80 @@ fn split_path(path: &str) -> (&str, &str) {
     match path.trim_end_matches('/').rsplit_once('/') {
         Some((dir, name)) => (dir, name),
         None => ("", path.trim_end_matches('/')),
+    }
+}
+
+/// Reads `count` bytes at `offset` from a byte slice; returns (data, eof).
+fn slice_read(data: &[u8], offset: u64, count: u32) -> (Vec<u8>, bool) {
+    let len = data.len() as u64;
+    let start = offset.min(len);
+    let end = offset.saturating_add(u64::from(count)).min(len);
+    let (start, end) = (start as usize, end as usize);
+    (data[start..end].to_vec(), end == len as usize)
+}
+
+/// Reads from a sparse file, filling holes with `fill`.
+fn sparse_read(
+    size: u64,
+    fill: u8,
+    extents: &BTreeMap<u64, Vec<u8>>,
+    offset: u64,
+    count: u32,
+) -> (Vec<u8>, bool) {
+    if offset >= size {
+        return (Vec::new(), true);
+    }
+    let end = offset.saturating_add(u64::from(count)).min(size);
+    let mut out = vec![fill; (end - offset) as usize];
+    for (&k, v) in extents.range(..end) {
+        let vend = k + v.len() as u64;
+        if vend <= offset {
+            continue;
+        }
+        let (from, to) = (k.max(offset), vend.min(end));
+        out[(from - offset) as usize..(to - offset) as usize]
+            .copy_from_slice(&v[(from - k) as usize..(to - k) as usize]);
+    }
+    (out, end == size)
+}
+
+/// Stores `data` at `offset`, replacing whatever extents it overlaps.
+fn sparse_write(extents: &mut BTreeMap<u64, Vec<u8>>, size: &mut u64, offset: u64, data: &[u8]) {
+    let start = offset;
+    let end = offset + data.len() as u64;
+    let hit: Vec<u64> = extents
+        .range(..end)
+        .filter(|(k, v)| **k + v.len() as u64 > start)
+        .map(|(k, _)| *k)
+        .collect();
+    for k in hit {
+        let Some(v) = extents.remove(&k) else {
+            continue;
+        };
+        let vend = k + v.len() as u64;
+        if k < start {
+            extents.insert(k, v[..(start - k) as usize].to_vec());
+        }
+        if vend > end {
+            extents.insert(end, v[(end - k) as usize..].to_vec());
+        }
+    }
+    if !data.is_empty() {
+        extents.insert(start, data.to_vec());
+    }
+    *size = (*size).max(end);
+}
+
+/// Drops data at or beyond `size`.
+fn sparse_truncate(extents: &mut BTreeMap<u64, Vec<u8>>, size: u64) {
+    let gone: Vec<u64> = extents.range(size..).map(|(k, _)| *k).collect();
+    for k in gone {
+        extents.remove(&k);
+    }
+    if let Some((k, v)) = extents.range_mut(..size).next_back()
+        && *k + v.len() as u64 > size
+    {
+        v.truncate((size - *k) as usize);
     }
 }
 
@@ -190,10 +275,42 @@ impl MemFs {
         Ok(())
     }
 
-    /// Contents of the regular file at `path`, if there is one.
+    /// Creates a sparse regular file of `size` bytes whose unwritten bytes read as `fill`.
+    /// Fails with `Exist` if the name is taken.
+    pub fn add_sparse_file(&mut self, path: &str, size: u64, fill: u8) -> Result<()> {
+        let (dir, name) = split_path(path);
+        let parent = self.mkdir_p(dir)?;
+        if self.child(parent, name.as_bytes()).is_some() {
+            return Err(Error::Nfs(Status::Exist));
+        }
+        let body = Body::Sparse {
+            size,
+            fill,
+            extents: BTreeMap::new(),
+        };
+        self.add_entry(parent, name.as_bytes(), body, 0o644, 0, 0)?;
+        Ok(())
+    }
+
+    /// Contents of the regular file at `path`, if there is one. Sparse files
+    /// are not materialized; use [`MemFs::read_at`] for those.
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         match &self.nodes.get(&self.walk(path)?)?.body {
             Body::File(data) => Some(data.clone()),
+            _ => None,
+        }
+    }
+
+    /// Up to `len` bytes of the regular file at `path` starting at `offset`
+    /// (regular or sparse), or `None` if there is no such file.
+    pub fn read_at(&self, path: &str, offset: u64, len: u32) -> Option<Vec<u8>> {
+        match &self.nodes.get(&self.walk(path)?)?.body {
+            Body::File(data) => Some(slice_read(data, offset, len).0),
+            Body::Sparse {
+                size,
+                fill,
+                extents,
+            } => Some(sparse_read(*size, *fill, extents, offset, len).0),
             _ => None,
         }
     }
@@ -300,6 +417,7 @@ impl MemFs {
         let (ftype, size, nlink) = match &body {
             Body::Dir { .. } => (FileType::Directory, 4096, 2),
             Body::File(data) => (FileType::Regular, data.len() as u64, 1),
+            Body::Sparse { size, .. } => (FileType::Regular, *size, 1),
             Body::Symlink(target) => (FileType::Symlink, target.len() as u64, 1),
         };
         let mut attr = new_attr(ftype, mode, id, size, self.clock, nlink);
@@ -366,6 +484,16 @@ impl Filesystem for MemFs {
                     node.attr.size = size;
                     node.attr.used = size;
                 }
+                Body::Sparse {
+                    size: total,
+                    extents,
+                    ..
+                } => {
+                    sparse_truncate(extents, size);
+                    *total = size;
+                    node.attr.size = size;
+                    node.attr.used = size;
+                }
                 Body::Dir { .. } => return Err(Error::Nfs(Status::IsDir)),
                 Body::Symlink(_) => return Err(Error::Nfs(Status::Inval)),
             }
@@ -423,16 +551,16 @@ impl Filesystem for MemFs {
     }
 
     fn read(&mut self, fh: &FileHandle, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
-        let data = match &self.node(id_of(fh)?)?.body {
-            Body::File(data) => data,
-            Body::Dir { .. } => return Err(Error::Nfs(Status::IsDir)),
-            Body::Symlink(_) => return Err(Error::Nfs(Status::Inval)),
-        };
-        let len = data.len() as u64;
-        let start = offset.min(len);
-        let end = offset.saturating_add(u64::from(count)).min(len);
-        let (start, end) = (start as usize, end as usize);
-        Ok((data[start..end].to_vec(), end == len as usize))
+        match &self.node(id_of(fh)?)?.body {
+            Body::File(data) => Ok(slice_read(data, offset, count)),
+            Body::Sparse {
+                size,
+                fill,
+                extents,
+            } => Ok(sparse_read(*size, *fill, extents, offset, count)),
+            Body::Dir { .. } => Err(Error::Nfs(Status::IsDir)),
+            Body::Symlink(_) => Err(Error::Nfs(Status::Inval)),
+        }
     }
 
     fn write(&mut self, fh: &FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
@@ -443,18 +571,23 @@ impl Filesystem for MemFs {
             .map_or(data.len(), |cap| data.len().min(cap));
         let data = &data[..take];
         let node = self.node_mut(id)?;
-        let contents = match &mut node.body {
-            Body::File(contents) => contents,
+        match &mut node.body {
+            Body::File(contents) => {
+                let start = offset as usize;
+                let end = start + data.len();
+                if contents.len() < end {
+                    contents.resize(end, 0);
+                }
+                contents[start..end].copy_from_slice(data);
+                node.attr.size = contents.len() as u64;
+            }
+            Body::Sparse { size, extents, .. } => {
+                sparse_write(extents, size, offset, data);
+                node.attr.size = *size;
+            }
             Body::Dir { .. } => return Err(Error::Nfs(Status::IsDir)),
             Body::Symlink(_) => return Err(Error::Nfs(Status::Inval)),
-        };
-        let start = offset as usize;
-        let end = start + data.len();
-        if contents.len() < end {
-            contents.resize(end, 0);
         }
-        contents[start..end].copy_from_slice(data);
-        node.attr.size = contents.len() as u64;
         node.attr.used = node.attr.size;
         node.attr.mtime = time(now);
         node.attr.ctime = time(now);

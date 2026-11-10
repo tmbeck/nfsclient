@@ -5,19 +5,23 @@
 //! current directory, so `..` never needs a server round trip and can never
 //! climb above the root.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nfsc::fs::{Attr, FileHandle, FileType, Filesystem, NfsVersion, Status};
 use nfsc::{Error, Result};
 
+use super::complete::ShellHelper;
 use super::format;
-
-/// Symlinks followed while resolving one path before giving up.
-const MAX_SYMLINKS: usize = 40;
+use super::interrupt;
+use super::remote::{DirCache, RemoteCtx, SharedFs, resolve_path};
 
 /// Commands accepted by the shell, including aliases.
 pub const COMMANDS: &[&str] = &[
@@ -46,6 +50,7 @@ pub struct CmdFailure {
     cmd: String,
     path: Option<String>,
     msg: String,
+    interrupted: bool,
 }
 
 impl CmdFailure {
@@ -54,11 +59,24 @@ impl CmdFailure {
             cmd: cmd.to_string(),
             path: path.map(str::to_string),
             msg: msg.into(),
+            interrupted: false,
         }
     }
 
+    /// Maps a protocol or local error. An interrupt becomes an "interrupted" failure.
     pub fn from_error(cmd: &str, path: &str, e: Error) -> Self {
+        if interrupt::is_interrupt(&e) {
+            return CmdFailure {
+                interrupted: true,
+                ..Self::new(cmd, Some(path), "interrupted")
+            };
+        }
         Self::new(cmd, Some(path), e.to_string())
+    }
+
+    /// True when the command stopped because of Ctrl-C.
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted
     }
 }
 
@@ -120,7 +138,7 @@ pub fn check_name(name: &str) -> Result<()> {
     }
 }
 
-fn components(path: &[u8]) -> VecDeque<Vec<u8>> {
+pub(super) fn components(path: &[u8]) -> VecDeque<Vec<u8>> {
     path.split(|&b| b == b'/')
         .filter(|c| !c.is_empty())
         .map(<[u8]>::to_vec)
@@ -186,7 +204,7 @@ fn default_term_width() -> usize {
 
 /// A connected shell session.
 pub struct Session {
-    pub(super) fs: Box<dyn Filesystem>,
+    pub(super) fs: SharedFs,
     /// Host as shown in the prompt.
     pub(super) host: String,
     pub(super) version: NfsVersion,
@@ -202,6 +220,10 @@ pub struct Session {
     pub term_width: usize,
     /// Show a transfer progress line on stderr.
     pub progress: bool,
+    /// Set by Ctrl-C. Transfers check it between chunks.
+    pub interrupt: Arc<AtomicBool>,
+    /// Directory listings for tab completion.
+    pub(super) cache: Rc<RefCell<DirCache>>,
 }
 
 impl Session {
@@ -222,7 +244,7 @@ impl Session {
             attr,
         };
         let mut session = Session {
-            fs,
+            fs: SharedFs::new(fs),
             host,
             version,
             export,
@@ -232,6 +254,8 @@ impl Session {
             clock: now_secs(),
             term_width: default_term_width(),
             progress: false,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            cache: Rc::new(RefCell::new(DirCache::default())),
         };
         for name in remainder {
             let parent = last_node(&session.cwd).fh.clone();
@@ -267,78 +291,16 @@ impl Session {
         display_path(&self.export, &self.cwd)
     }
 
-    /// Resolves `path` to the chain of nodes from the export root to its target.
-    ///
-    /// Absolute paths start at the export root (`/` is the root), others at the
-    /// working directory; `.` is skipped and `..` pops one level, staying at the
-    /// root. Symlinks are followed for every component, and for the last one
-    /// only when `follow_last` is set. Absolute symlink targets must lie inside
-    /// the export; relative ones are resolved from the link's directory.
+    /// Resolves `path` relative to the working directory (see [`resolve_path`]).
     pub(super) fn resolve(&mut self, path: &str, follow_last: bool) -> Result<Vec<Node>> {
-        let mut stack = if path.starts_with('/') {
-            vec![self.root.clone()]
-        } else {
-            self.cwd.clone()
-        };
-        let mut pending = components(path.as_bytes());
-        let mut links = 0;
-        while let Some(name) = pending.pop_front() {
-            if name.as_slice() == b"." {
-                continue;
-            }
-            if name.as_slice() == b".." {
-                if stack.len() > 1 {
-                    stack.pop();
-                }
-                continue;
-            }
-            let is_last = pending.is_empty();
-            let dir = last_node(&stack).fh.clone();
-            let (fh, attr) = self.fs.lookup(&dir, &name)?;
-            if attr.ftype == FileType::Symlink && (follow_last || !is_last) {
-                links += 1;
-                if links > MAX_SYMLINKS {
-                    return Err(Error::Invalid("too many levels of symbolic links".into()));
-                }
-                let target = self.fs.readlink(&fh)?;
-                let mut next = if target.first() == Some(&b'/') {
-                    stack.truncate(1);
-                    components(&self.within_export(&target)?)
-                } else {
-                    components(&target)
-                };
-                next.extend(pending.drain(..));
-                pending = next;
-                continue;
-            }
-            stack.push(Node { name, fh, attr });
-        }
-        Ok(stack)
-    }
-
-    /// Maps an absolute symlink target onto the export root, or refuses it.
-    fn within_export(&self, target: &[u8]) -> Result<Vec<u8>> {
-        let end = self
-            .export
-            .iter()
-            .rposition(|&b| b != b'/')
-            .map_or(0, |i| i + 1);
-        let export = &self.export[..end];
-        if export.is_empty() {
-            // The export is "/": every absolute target is already inside it.
-            return Ok(target.to_vec());
-        }
-        if target == export {
-            return Ok(Vec::new());
-        }
-        if target.len() > export.len() && target.starts_with(export) && target[export.len()] == b'/'
-        {
-            return Ok(target[export.len()..].to_vec());
-        }
-        Err(Error::Invalid(format!(
-            "symbolic link target '{}' is outside the export",
-            String::from_utf8_lossy(target)
-        )))
+        resolve_path(
+            &mut self.fs,
+            &self.root,
+            &self.export,
+            &self.cwd,
+            path,
+            follow_last,
+        )
     }
 
     /// Resolves the directory that will hold `path` and returns it with the final name.
@@ -403,6 +365,34 @@ impl Session {
         normalize_local(&self.local_cwd.join(p))
     }
 
+    /// Whether Ctrl-C has been pressed since the flag was last cleared.
+    pub fn interrupt_requested(&self) -> bool {
+        self.interrupt.load(Ordering::SeqCst)
+    }
+
+    /// Clears the Ctrl-C flag before a new command line.
+    pub fn clear_interrupt(&self) {
+        self.interrupt.store(false, Ordering::SeqCst);
+    }
+
+    pub fn local_cwd(&self) -> &Path {
+        &self.local_cwd
+    }
+
+    /// Hands the completer what it needs for the next prompt.
+    pub fn sync_completer(&self, helper: &mut ShellHelper) {
+        helper.sync(
+            RemoteCtx {
+                fs: self.fs.clone(),
+                root: self.root.clone(),
+                export: self.export.clone(),
+                cwd: self.cwd.clone(),
+                cache: self.cache.clone(),
+            },
+            self.local_cwd.clone(),
+        );
+    }
+
     /// Runs one command. Output goes to `out`; progress and per-file summaries to `err`.
     pub fn execute(
         &mut self,
@@ -413,7 +403,27 @@ impl Session {
         let Some((cmd, args)) = words.split_first() else {
             return Ok(Flow::Continue);
         };
-        match cmd.as_str() {
+        // Commands that can change names on the server, and `cd`, drop the
+        // completion cache once they have run, whether or not they succeeded.
+        let invalidates = matches!(
+            cmd.as_str(),
+            "cd" | "put" | "mkdir" | "rm" | "rmdir" | "mv" | "ln" | "chmod" | "chown"
+        );
+        let result = self.dispatch(cmd, args, out, err);
+        if invalidates {
+            self.cache.borrow_mut().clear();
+        }
+        result
+    }
+
+    fn dispatch(
+        &mut self,
+        cmd: &str,
+        args: &[String],
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> CmdResult<Flow> {
+        match cmd {
             "ls" | "dir" => self.cmd_ls(args, out)?,
             "cd" => self.cmd_cd(args)?,
             "pwd" => {

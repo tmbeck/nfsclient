@@ -102,3 +102,23 @@ fn port_flags_reject_zero() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("invalid value"), "{}", stderr(&out));
 }
+
+#[test]
+fn version_flag_prints_the_package_version() {
+    let out = nfsc(&["--version"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("nfsc {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn help_documents_exit_status_and_interactive_keys() {
+    let top = String::from_utf8_lossy(&nfsc(&["--help"]).stdout).into_owned();
+    assert!(top.contains("Exit status"), "{top}");
+    let shell = String::from_utf8_lossy(&nfsc(&["shell", "--help"]).stdout).into_owned();
+    assert!(shell.contains("130"), "{shell}");
+    assert!(shell.contains("Ctrl-C"), "{shell}");
+    assert!(shell.contains("Tab"), "{shell}");
+}
