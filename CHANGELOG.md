@@ -18,8 +18,11 @@ First release.
 - Shell commands: `ls [-l]`, `dir`, `cd`, `pwd`, `lcd`, `stat`, `get [-r]`,
   `put [-r]`, `cat`, `mkdir`, `rm`, `rmdir`, `mv`, `ln [-s]`, `chmod`,
   `chown`, `df`, `help`, `exit`, `quit`.
-- Resumable transfers with `get -c` and `put -c`, a progress line on stderr
-  when it is a terminal, and the remote mtime applied on `get`.
+- Resumable transfers with `get -c` and `put -c`, and the remote mtime
+  applied on `get`.
+- Progress bars on stderr when it is a terminal (rate, ETA). `get -r` and
+  `put -r` pre-scan the tree and add a totals bar (files and bytes), then
+  print a summary.
 - Ctrl-C interrupts a running transfer. Tab completion in the interactive shell.
 - NFSv2, NFSv3, and NFSv4.0, 4.1 and 4.2, with `-v auto|2|3|4|4.0|4.1|4.2`
   (`auto` tries 4.2, 4.1, 4.0, 3, then 2).

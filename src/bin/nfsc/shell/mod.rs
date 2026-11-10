@@ -15,6 +15,7 @@ mod format;
 mod interrupt;
 mod line;
 mod ops;
+mod progress;
 mod remote;
 mod session;
 #[cfg(test)]

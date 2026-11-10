@@ -25,16 +25,11 @@ use nfsc::{Error, Result};
 use super::format;
 use super::interrupt;
 use super::line::parse_args;
+use super::progress::{LineWriter, Meter, TreeProgress};
 use super::session::{
     CmdFailure, CmdResult, Ctx, Session, io_text, is_plain_name, last_node, split_last, usage,
 };
 use crate::text::{display_name, display_path, display_str};
-
-/// Transfers smaller than this get no progress line.
-const PROGRESS_MIN: u64 = 1 << 20;
-
-/// Minimum time between progress redraws.
-const REDRAW: Duration = Duration::from_millis(200);
 
 /// Directory levels a recursive get descends. Deeper subtrees are skipped with a
 /// note, so a server cannot make the recursion (or local paths) unbounded.
@@ -73,106 +68,6 @@ fn system_time(t: Time) -> Option<SystemTime> {
         UNIX_EPOCH.checked_sub(Duration::from_secs(t.seconds.unsigned_abs()))?
     };
     base.checked_add(Duration::from_nanos(u64::from(t.nseconds.min(999_999_999))))
-}
-
-/// Blends a new rate sample into the running estimate.
-fn smooth(prev: Option<f64>, sample: f64) -> f64 {
-    match prev {
-        Some(p) => 0.75 * p + 0.25 * sample,
-        None => sample,
-    }
-}
-
-/// Completed percentage, computed in 128 bits so large files cannot overflow.
-fn percent(done: u64, total: u64) -> u64 {
-    if total == 0 {
-        100
-    } else {
-        ((u128::from(done) * 100) / u128::from(total)).min(100) as u64
-    }
-}
-
-/// `mm:ss`, or `h:mm:ss` from an hour up.
-fn format_eta(secs: u64) -> String {
-    if secs >= 3600 {
-        format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
-    } else {
-        format!("{:02}:{:02}", secs / 60, secs % 60)
-    }
-}
-
-/// The progress line: name, percent, bytes, rate and ETA. `rate` is bytes per second.
-fn progress_line(label: &str, done: u64, total: u64, rate: f64) -> String {
-    let name: String = label.chars().take(24).collect();
-    let eta = if done >= total {
-        "00:00".to_string()
-    } else if rate >= 1.0 {
-        format_eta(((total - done) as f64 / rate) as u64)
-    } else {
-        "--:--".to_string()
-    };
-    format!(
-        "{name:<24} {:>3}% {} / {}  {}/s  ETA {eta}",
-        percent(done, total),
-        format::human(done),
-        format::human(total),
-        format::human(rate as u64),
-    )
-}
-
-/// One progress line on stderr, redrawn at most every 200 ms. Used only when
-/// stderr is a terminal and the transfer is large enough to be worth showing.
-struct Meter {
-    enabled: bool,
-    label: String,
-    total: u64,
-    last_bytes: u64,
-    last_at: Instant,
-    rate: Option<f64>,
-    drawn: bool,
-}
-
-impl Meter {
-    /// `total` is the full size of the file; `start` is the offset already present.
-    fn new(enabled: bool, label: &str, total: u64, start: u64) -> Self {
-        Meter {
-            enabled: enabled && total >= PROGRESS_MIN,
-            label: label.to_string(),
-            total,
-            last_bytes: start,
-            last_at: Instant::now(),
-            rate: None,
-            drawn: false,
-        }
-    }
-
-    /// `done` is the absolute offset reached so far.
-    fn tick(&mut self, err: &mut dyn Write, done: u64) {
-        if !self.enabled {
-            return;
-        }
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_at);
-        if elapsed < REDRAW {
-            return;
-        }
-        let sample = done.saturating_sub(self.last_bytes) as f64 / elapsed.as_secs_f64();
-        self.rate = Some(smooth(self.rate, sample));
-        self.last_at = now;
-        self.last_bytes = done;
-        self.drawn = true;
-        let line = progress_line(&self.label, done, self.total, self.rate.unwrap_or(0.0));
-        let _ = write!(err, "\r{line}\x1b[K");
-        let _ = err.flush();
-    }
-
-    fn finish(&mut self, err: &mut dyn Write) {
-        if self.drawn {
-            let _ = write!(err, "\r\x1b[K");
-            let _ = err.flush();
-            self.drawn = false;
-        }
-    }
 }
 
 /// Opens a local download target. Without `resume` the file is truncated. With
@@ -291,8 +186,28 @@ impl Session {
             let label = display_str(base);
             if node.attr.ftype == FileType::Directory {
                 let key = (node.attr.fsid, node.attr.fileid);
-                self.get_tree(&node.fh, key, &dest, resume, err, &mut Vec::new())
-                    .ctx(CMD, src)?;
+                let totals = if self.progress {
+                    Some(
+                        self.scan_remote_tree(&node.fh, key, &mut Vec::new())
+                            .ctx(CMD, src)?,
+                    )
+                } else {
+                    None
+                };
+                let tree = TreeProgress::new(totals);
+                let mut lines = LineWriter::new(err, tree.multi());
+                self.tree = Some(tree);
+                let result =
+                    self.get_tree(&node.fh, key, &dest, resume, &mut lines, &mut Vec::new());
+                drop(lines);
+                self.scan_cache.clear();
+                let tree = self.tree.take();
+                let summary = tree.map(|t| t.finish("got"));
+                result.ctx(CMD, src)?;
+                if let Some(line) = summary {
+                    writeln!(err, "{line}")
+                        .map_err(|e| CmdFailure::new(CMD, None, e.to_string()))?;
+                }
             } else {
                 self.fetch_to_path(&label, &node.fh, &node.attr, &dest, resume, false, err)
                     .ctx(CMD, src)?;
@@ -326,8 +241,19 @@ impl Session {
             if !recursive {
                 return Err(CmdFailure::new(CMD, Some(local), "is a directory (use -r)"));
             }
-            self.put_tree(&path, &dir, &name, resume, err)
-                .ctx(CMD, local)
+            let totals = self.progress.then(|| scan_local_tree(&path, 0));
+            let tree = TreeProgress::new(totals);
+            let mut lines = LineWriter::new(err, tree.multi());
+            self.tree = Some(tree);
+            let result = self.put_tree(&path, &dir, &name, resume, &mut lines);
+            drop(lines);
+            let tree = self.tree.take();
+            let summary = tree.map(|t| t.finish("put"));
+            result.ctx(CMD, local)?;
+            if let Some(line) = summary {
+                writeln!(err, "{line}").map_err(|e| CmdFailure::new(CMD, None, e.to_string()))?;
+            }
+            Ok(())
         } else {
             self.put_file(&path, &meta, &dir, &name, resume, err)
                 .ctx(CMD, local)
@@ -386,7 +312,8 @@ impl Session {
             )));
         }
         let started = Instant::now();
-        let mut meter = Meter::new(self.progress, label, size, start);
+        let mut tree = self.tree.take();
+        let mut meter = Meter::new(self.progress, label, size, start, tree.as_mut());
         let mut done = start;
         let result = if start < size {
             file.seek(SeekFrom::Start(start)).map_err(local_err)?;
@@ -397,14 +324,16 @@ impl Session {
                 &mut |chunk: &[u8]| -> Result<()> {
                     file.write_all(chunk).map_err(local_err)?;
                     done += chunk.len() as u64;
-                    meter.tick(err, done);
+                    meter.tick(done);
                     Ok(())
                 },
             )
         } else {
             Ok(0)
         };
-        meter.finish(err);
+        let complete = matches!(result, Ok(n) if start + n >= size);
+        meter.finish(complete);
+        self.tree = tree;
         let delivered = match result {
             Ok(n) => n,
             Err(e) => {
@@ -453,6 +382,54 @@ impl Session {
         .map_err(local_err)
     }
 
+    /// Counts the regular files and bytes that [`Self::get_tree`] would
+    /// download, applying the same skip rules (unsafe names, loops, depth).
+    /// Listings (with handles and attributes filled in) are kept in
+    /// `scan_cache` so the download does not list each directory twice.
+    fn scan_remote_tree(
+        &mut self,
+        fh: &FileHandle,
+        key: (u64, u64),
+        ancestors: &mut Vec<(u64, u64)>,
+    ) -> Result<(u64, u64)> {
+        ancestors.push(key);
+        let mut entries = self.fs.readdir(fh)?;
+        let (mut files, mut bytes) = (0u64, 0u64);
+        let mut subdirs = Vec::new();
+        for entry in &mut entries {
+            if !is_plain_name(&entry.name) {
+                continue;
+            }
+            if entry.handle.is_none() || entry.attr.is_none() {
+                let (h, a) = self.fs.lookup(fh, &entry.name)?;
+                entry.handle = Some(h);
+                entry.attr = Some(a);
+            }
+            let attr = entry.attr.as_ref().expect("filled above");
+            match attr.ftype {
+                FileType::Regular => {
+                    files += 1;
+                    bytes = bytes.saturating_add(attr.size);
+                }
+                FileType::Directory => {
+                    let k = (attr.fsid, attr.fileid);
+                    if !(k.1 != 0 && ancestors.contains(&k)) && ancestors.len() < MAX_TREE_DEPTH {
+                        subdirs.push((entry.handle.clone().expect("filled above"), k));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.scan_cache.insert(fh.clone(), entries);
+        for (h, k) in subdirs {
+            let (f, b) = self.scan_remote_tree(&h, k, ancestors)?;
+            files += f;
+            bytes = bytes.saturating_add(b);
+        }
+        ancestors.pop();
+        Ok((files, bytes))
+    }
+
     /// Downloads a directory tree. Entries are skipped with a note when they are
     /// symlinks or special files, when their name is not one plain component, when
     /// the directory is already one of its ancestors (a loop, detected by
@@ -484,7 +461,10 @@ impl Session {
         ancestors: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
         fs::create_dir_all(dir).map_err(local_err)?;
-        let mut entries = self.fs.readdir(fh)?;
+        let mut entries = match self.scan_cache.remove(fh) {
+            Some(e) => e,
+            None => self.fs.readdir(fh)?,
+        };
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         for entry in entries {
             let label = display_name(&entry.name);
@@ -596,9 +576,12 @@ impl Session {
         self.fs.setattr(&fh, &attrs)?;
 
         let started = Instant::now();
-        let mut meter = Meter::new(self.progress, &label, size, start);
+        let mut tree = self.tree.take();
+        let mut meter = Meter::new(self.progress, &label, size, start, tree.as_mut());
         let mut sent = start;
-        if start < size {
+        if start >= size {
+            meter.finish(true);
+        } else {
             file.seek(SeekFrom::Start(start)).map_err(local_err)?;
             let flag = Arc::clone(&self.interrupt);
             let result = self
@@ -607,11 +590,12 @@ impl Session {
                     interrupt::check(&flag)?;
                     let n = file.read(buf).map_err(local_err)?;
                     sent += n as u64;
-                    meter.tick(err, sent);
+                    meter.tick(sent);
                     Ok(n)
                 });
-            meter.finish(err);
+            meter.finish(result.is_ok());
             if let Err(e) = result {
+                self.tree = tree;
                 if interrupt::is_interrupt(&e) {
                     let _ = writeln!(
                         err,
@@ -621,6 +605,7 @@ impl Session {
                 return Err(e);
             }
         }
+        self.tree = tree;
         writeln!(
             err,
             "putting file {} as {label} ({}{})",
@@ -681,38 +666,31 @@ impl Session {
     }
 }
 
+/// Counts the regular files and bytes under `dir` the way `put_tree` walks
+/// it (symlinks and special files skipped). Unreadable entries are ignored;
+/// the upload itself reports them.
+fn scan_local_tree(dir: &Path, depth: usize) -> (u64, u64) {
+    let (mut files, mut bytes) = (0u64, 0u64);
+    let Ok(rd) = fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    for entry in rd.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() && depth < MAX_TREE_DEPTH {
+            let (f, b) = scan_local_tree(&entry.path(), depth + 1);
+            files += f;
+            bytes = bytes.saturating_add(b);
+        } else if meta.is_file() {
+            files += 1;
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    (files, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn progress_percent_is_exact_past_four_gib() {
-        let total = 6 << 30;
-        assert_eq!(percent(0, total), 0);
-        assert_eq!(percent(total / 2, total), 50);
-        assert_eq!(percent((4u64 << 30) + 1, total), 66);
-        assert_eq!(percent(total, total), 100);
-        assert_eq!(percent(total + 1, total), 100);
-        assert_eq!(percent(0, 0), 100);
-    }
-
-    #[test]
-    fn eta_and_progress_line_format() {
-        assert_eq!(format_eta(65), "01:05");
-        assert_eq!(format_eta(3725), "1:02:05");
-        let line = progress_line("backup.img", 1 << 30, 4 << 30, 100.0 * 1024.0 * 1024.0);
-        assert!(line.starts_with("backup.img"), "{line}");
-        assert!(line.contains(" 25%"), "{line}");
-        assert!(line.contains("1.0G / 4.0G"), "{line}");
-        assert!(line.contains("ETA 00:30"), "{line}");
-        assert!(progress_line("x", 0, 10, 0.0).contains("ETA --:--"));
-    }
-
-    #[test]
-    fn rate_smoothing_moves_toward_new_samples() {
-        assert_eq!(smooth(None, 100.0), 100.0);
-        assert_eq!(smooth(Some(100.0), 200.0), 125.0);
-    }
 
     #[test]
     fn remote_times_convert_to_system_time() {

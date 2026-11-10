@@ -234,6 +234,10 @@ pub struct Session {
     pub interrupt: Arc<AtomicBool>,
     /// Directory listings for tab completion.
     pub(super) cache: Rc<RefCell<DirCache>>,
+    /// Totals of the recursive transfer in progress, if any.
+    pub(super) tree: Option<super::progress::TreeProgress>,
+    /// Listings gathered by a recursive get's pre-scan, used once by the download.
+    pub(super) scan_cache: std::collections::HashMap<nfsc::fs::FileHandle, Vec<nfsc::fs::DirEntry>>,
 }
 
 impl Session {
@@ -266,6 +270,8 @@ impl Session {
             progress: false,
             interrupt: Arc::new(AtomicBool::new(false)),
             cache: Rc::new(RefCell::new(DirCache::default())),
+            tree: None,
+            scan_cache: std::collections::HashMap::new(),
         };
         for name in remainder {
             let parent = last_node(&session.cwd).fh.clone();
