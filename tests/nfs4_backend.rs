@@ -1002,6 +1002,75 @@ fn lost_write_reply_mid_window_caching_server_v41() {
     });
 }
 
+/// A lost reply, and then the reply to the client's own slot probe is lost
+/// too (the server ran the probe): the client must learn the slot's seqid
+/// again before reusing it, or a real request would get the probe's cached
+/// SEQUENCE-only reply back.
+fn lost_reply_then_lost_probe(cfg: Config, write: bool) {
+    let probe_lost = Rule::op(OP_SEQUENCE, Fault::DropReply)
+        .when(|c| c.ops == [OP_SEQUENCE])
+        .times(1);
+    if write {
+        let srv = server(cfg);
+        let mut fs = mount(&srv, 1);
+        let root = fs.root();
+        let (fh, _) = fs
+            .create(
+                &root,
+                b"out.bin",
+                CreateMode::Unchecked,
+                &SetAttr::default(),
+            )
+            .expect("create");
+        srv.script(vec![
+            Rule::op(OP_WRITE, Fault::DropReply).after(5).times(1),
+            probe_lost,
+        ]);
+        let data = data_bytes((10 * MIB + 3) as usize, 13);
+        let r = write_from(fs.as_mut(), &fh, 0, &data);
+        assert_eq!(r.expect("write_stream"), data.len() as u64);
+        assert!(srv.file("export/out.bin") == data, "file content differs");
+        assert_clean(&srv);
+    } else {
+        let size = 4 * MIB + 11;
+        let (srv, mut fs, fh) = with_big(cfg, 1, size);
+        srv.script(vec![
+            Rule::op(OP_READ, Fault::DropReply).after(5).times(1),
+            probe_lost,
+        ]);
+        let c = stream_pattern(fs.as_mut(), &fh, 7, 0, None);
+        assert_complete(&c, size);
+        assert_clean(&srv);
+    }
+}
+
+#[test]
+fn lost_probe_reply_read_caching_server_v41() {
+    lost_reply_then_lost_probe(
+        Config {
+            cache_all_replies: true,
+            ..Config::default()
+        },
+        false,
+    );
+}
+
+#[test]
+fn lost_probe_reply_write_caching_server_v41() {
+    lost_reply_then_lost_probe(
+        Config {
+            cache_all_replies: true,
+            ..Config::default()
+        },
+        true,
+    );
+}
+
+#[test]
+fn lost_probe_reply_write_v41() {
+    lost_reply_then_lost_probe(Config::default(), true);
+}
+
 fn server_down_mid_transfer(minor: u32) {
     let size = 4 * MIB + 5;
     let (srv, mut fs, fh) = with_big(Config::default(), minor, size);

@@ -16,8 +16,8 @@ use crate::rpc::{RpcClient, RpcOptions};
 
 use super::compound::{CompoundArgs, CompoundRes, PROC_COMPOUND};
 use super::ops::{
-    ChannelAttrs, Claim, CreateKind, FILE_SYNC4, OP_CLOSE, OP_OPEN, OP_OPEN_CONFIRM, Op, OpenHow,
-    Res, ResOp, UNSTABLE4,
+    ChannelAttrs, Claim, CreateKind, FILE_SYNC4, OP_CLOSE, OP_OPEN, OP_OPEN_CONFIRM, Op, OpSig,
+    OpenHow, Res, ResOp, UNSTABLE4, results_match,
 };
 use super::types::{
     ANON_STATEID, BASIC_ATTRS, FSSTAT_ATTRS, Fattr, OPEN4_SHARE_ACCESS_BOTH, READDIR_ATTRS,
@@ -116,6 +116,8 @@ pub(super) struct Pending {
     slot: Option<usize>,
     /// NFSv4.0: whether a successful reply renews the lease.
     renews: bool,
+    /// Opcodes sent, SEQUENCE included, to check the reply against.
+    opcodes: OpSig,
 }
 
 pub(crate) struct Nfs4Backend {
@@ -440,6 +442,7 @@ impl Nfs4Backend {
             slot = Some(free);
         }
         all.extend(ops);
+        let opcodes = OpSig::of(&all);
         let args = CompoundArgs {
             minor: self.minor,
             ops: all,
@@ -453,6 +456,12 @@ impl Nfs4Backend {
                 return Err(e);
             }
         };
+        if !results_match(&opcodes, res.status, &res.results) {
+            if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
+                s.mark_uncertain(i);
+            }
+            return Err(mismatched_reply());
+        }
         if renews && res.status == code::OK {
             self.last_activity = Instant::now();
         }
@@ -508,6 +517,7 @@ impl Nfs4Backend {
             slot = Some(free);
         }
         all.extend(ops);
+        let opcodes = OpSig::of(&all);
         let args = CompoundArgs {
             minor: self.minor,
             ops: all,
@@ -524,7 +534,12 @@ impl Nfs4Backend {
         if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
             s.busy[i] = true;
         }
-        Ok(Pending { xid, slot, renews })
+        Ok(Pending {
+            xid,
+            slot,
+            renews,
+            opcodes,
+        })
     }
 
     /// Read the reply to a pipelined COMPOUND, free its slot, advance the slot's
@@ -536,13 +551,19 @@ impl Nfs4Backend {
             s.busy[i] = false;
             let confused = match &reply {
                 Err(_) => true,
-                Ok(r) => r.results.first().is_some_and(|r| slot_confused(r.status)),
+                Ok(r) => {
+                    !results_match(&p.opcodes, r.status, &r.results)
+                        || r.results.first().is_some_and(|r| slot_confused(r.status))
+                }
             };
             if confused {
                 s.mark_uncertain(i);
             }
         }
         let res = reply?;
+        if !results_match(&p.opcodes, res.status, &res.results) {
+            return Err(mismatched_reply());
+        }
         if p.renews && res.status == code::OK {
             self.last_activity = Instant::now();
         }
@@ -892,7 +913,18 @@ impl Nfs4Backend {
                     highest: highest as u32,
                 }],
             };
-            let res: CompoundRes = self.rpc.call(PROC_COMPOUND, &args)?;
+            let res: CompoundRes = match self.rpc.call(PROC_COMPOUND, &args) {
+                Ok(r) => r,
+                Err(e) => {
+                    // The server may have run the probe: until we learn the
+                    // slot's seqid again, reusing it could replay the probe's
+                    // cached (SEQUENCE-only) reply for a real request.
+                    if let Some(s) = self.session.as_mut() {
+                        s.mark_uncertain(slot);
+                    }
+                    return Err(e);
+                }
+            };
             if res.status == code::CONN_NOT_BOUND_TO_SESSION && !bound {
                 bound = true;
                 let r = self.send(vec![Op::BindConnToSession(id)], false)?;
@@ -1268,6 +1300,15 @@ impl WriteIo for V4Writes<'_, '_> {
             _ => Err(xdr_err("COMMIT")),
         }
     }
+}
+
+/// The error for a COMPOUND reply whose results do not match the request: the
+/// reply belongs to another request, so the request's outcome is unknown.
+/// Retryable at the transport level (the slot is marked uncertain and probed).
+fn mismatched_reply() -> Error {
+    Error::Protocol(
+        "COMPOUND reply does not match the request (replayed reply for another request)".into(),
+    )
 }
 
 /// Result body of op `i`, or an error if it is missing.

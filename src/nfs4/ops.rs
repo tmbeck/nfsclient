@@ -258,6 +258,70 @@ impl Pack for OpenArgs {
     }
 }
 
+impl Op {
+    /// The operation number this op is encoded with.
+    pub fn opcode(&self) -> u32 {
+        match self {
+            // Avoid copying the payload just to learn the opcode.
+            Op::Write { .. } => OP_WRITE,
+            _ => {
+                let mut e = Encoder::new();
+                self.pack(&mut e);
+                let b = e.as_bytes();
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            }
+        }
+    }
+}
+
+/// The opcodes of a COMPOUND, kept to check its reply against (`Copy`, so it
+/// fits in a pipeline tag). Only the first [`OpSig::CAP`] opcodes are compared;
+/// the count is always checked.
+#[derive(Debug, Clone, Copy)]
+pub struct OpSig {
+    len: u16,
+    ops: [u32; OpSig::CAP],
+}
+
+impl OpSig {
+    pub const CAP: usize = 8;
+
+    pub fn of(ops: &[Op]) -> Self {
+        let mut sig = OpSig {
+            len: u16::try_from(ops.len()).unwrap_or(u16::MAX),
+            ops: [0; Self::CAP],
+        };
+        for (slot, op) in sig.ops.iter_mut().zip(ops) {
+            *slot = op.opcode();
+        }
+        sig
+    }
+}
+
+/// Whether `results` can be the reply to a COMPOUND with signature `sig`: one result
+/// per op in order, stopping early only at a failing op. A reply that does not
+/// match belongs to another request (for example a server replaying the cached
+/// reply of a different request on the same session slot) and must not be
+/// taken as this request's answer.
+pub fn results_match(sig: &OpSig, status: u32, results: &[ResOp]) -> bool {
+    let n = usize::from(sig.len);
+    if results.len() > n
+        || results
+            .iter()
+            .zip(&sig.ops[..n.min(OpSig::CAP)])
+            .any(|(r, &o)| r.opcode != o)
+    {
+        return false;
+    }
+    if status == code::OK {
+        results.len() == n
+    } else {
+        // The last result is the failing op (or the list is empty when the
+        // server rejected the whole COMPOUND, e.g. MINOR_VERS_MISMATCH).
+        results.last().is_none_or(|r| r.status != code::OK)
+    }
+}
+
 impl Pack for Op {
     fn pack(&self, e: &mut Encoder) {
         match self {
@@ -735,6 +799,37 @@ impl Unpack for SkipImplId {
         d.get_i64()?;
         d.get_u32()?;
         Ok(SkipImplId)
+    }
+}
+
+#[cfg(test)]
+mod results_match_tests {
+    use super::*;
+
+    fn r(opcode: u32, status: u32) -> ResOp {
+        ResOp {
+            opcode,
+            status,
+            body: Res::Empty,
+        }
+    }
+
+    #[test]
+    fn matches_only_replies_to_this_compound() {
+        let sig = OpSig::of(&[Op::Putrootfh, Op::Getfh]);
+        let (a, b) = (OP_PUTROOTFH, OP_GETFH);
+        assert!(results_match(&sig, code::OK, &[r(a, 0), r(b, 0)]));
+        // OK but a result missing: another request's (shorter) reply.
+        assert!(!results_match(&sig, code::OK, &[r(a, 0)]));
+        // Wrong op in a position.
+        assert!(!results_match(&sig, code::OK, &[r(b, 0), r(b, 0)]));
+        // Failure stops at the failing op.
+        assert!(results_match(&sig, 2, &[r(a, 2)]));
+        assert!(!results_match(&sig, 2, &[r(a, 0)]));
+        // Whole COMPOUND rejected.
+        assert!(results_match(&sig, 10021, &[]));
+        // More results than ops.
+        assert!(!results_match(&sig, code::OK, &[r(a, 0), r(b, 0), r(b, 0)]));
     }
 }
 
