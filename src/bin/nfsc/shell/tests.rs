@@ -378,7 +378,9 @@ fn help_lists_the_commands_and_exit_ends_the_script() {
     assert!(help.contains("help <cmd>"), "{help}");
     let get = ok(&mut s, "help get");
     assert!(
-        get.starts_with("get [-rckn] remote [local]\n") && get.contains("-c  resume"),
+        get.starts_with("get [-rcknV] remote... [local]\n")
+            && get.contains("-c  resume")
+            && get.contains("-V  verify"),
         "{get}"
     );
     assert_eq!(ok(&mut s, "help quit"), ok(&mut s, "help exit"));
@@ -398,7 +400,7 @@ fn unknown_commands_and_bad_options_are_reported() {
     assert_eq!(fails(&mut s, "ls -z"), "nfsc: ls: invalid option -- 'z'");
     assert_eq!(
         fails(&mut s, "get"),
-        "nfsc: get: usage: get [-rckn] remote [local]"
+        "nfsc: get: usage: get [-rcknV] remote... [local]"
     );
 }
 
@@ -577,7 +579,7 @@ fn get_with_globs_takes_several_files_into_a_directory() {
 
     assert_eq!(
         fails(&mut s, "get *.tmp nowhere"),
-        "nfsc: get: *.tmp: several files need a local directory as destination"
+        "nfsc: get: nowhere: several files need a local directory as destination"
     );
     let r = run(&mut s, "get *.tmp");
     assert!(r.failure.is_none(), "{:?}", r.failure);
@@ -790,6 +792,9 @@ struct Tripwire {
     /// Reads of this file at or past this offset fail with an I/O error, as
     /// if the server or the network broke down mid-transfer.
     fail_reads: Option<(FileHandle, u64)>,
+    /// The byte at this offset of this file comes back flipped in the next
+    /// `n` reads that cover it, as if data were damaged on the way.
+    corrupt_reads: Option<(FileHandle, u64, usize)>,
 }
 
 impl Tripwire {
@@ -800,6 +805,21 @@ impl Tripwire {
             calls: 0,
             trip_after,
             fail_reads: None,
+            corrupt_reads: None,
+        }
+    }
+
+    /// A backend that damages the byte at `offset` of `path` in the next
+    /// `times` reads covering it.
+    fn corrupting(fs: Rc<RefCell<MemFs>>, path: &str, offset: u64, times: usize) -> Self {
+        let fh = {
+            let mut inner = fs.borrow_mut();
+            let root = inner.root();
+            inner.lookup(&root, path.as_bytes()).unwrap().0
+        };
+        Tripwire {
+            corrupt_reads: Some((fh, offset, times)),
+            ..Self::new(fs, Arc::new(AtomicBool::new(false)), usize::MAX)
         }
     }
 
@@ -863,7 +883,17 @@ impl Filesystem for Tripwire {
         {
             return Err(nfsc::Error::Nfs(nfsc::fs::Status::Io));
         }
-        self.fs.borrow_mut().read(fh, offset, count)
+        let (mut data, eof) = self.fs.borrow_mut().read(fh, offset, count)?;
+        if let Some((bad, at, left)) = &mut self.corrupt_reads
+            && bad == fh
+            && *left > 0
+            && *at >= offset
+            && *at < offset + data.len() as u64
+        {
+            data[(*at - offset) as usize] ^= 0xFF;
+            *left -= 1;
+        }
+        Ok((data, eof))
     }
     fn write(&mut self, fh: &FileHandle, offset: u64, data: &[u8]) -> nfsc::Result<u32> {
         self.tick();
@@ -1045,11 +1075,17 @@ fn flags_complete_after_a_dash() {
     assert_eq!(
         complete(&s, "get -"),
         vec![
+            pair("-V", "-V"),
             pair("-c", "-c"),
             pair("-k", "-k"),
             pair("-n", "-n"),
             pair("-r", "-r")
         ]
+    );
+    assert_eq!(complete(&s, "rm -"), vec![pair("-r", "-r ")]);
+    assert_eq!(
+        complete(&s, "du -"),
+        vec![pair("-h", "-h"), pair("-s", "-s")]
     );
     assert_eq!(complete(&s, "ln -"), vec![pair("-s", "-s ")]);
 }
@@ -1229,7 +1265,14 @@ fn get_c_past_four_gib_fetches_only_the_tail() {
     const FOUR_GIB: u64 = 1 << 32;
     let dir = scratch("sparse_get");
     let local = dir.join("huge.bin");
-    File::create(&local).unwrap().set_len(FOUR_GIB).unwrap();
+    {
+        // Sparse up to 4 GiB; the last MiB matches the server, so the resume
+        // check passes.
+        let mut f = File::create(&local).unwrap();
+        f.set_len(FOUR_GIB).unwrap();
+        f.seek(SeekFrom::Start(FOUR_GIB - (1 << 20))).unwrap();
+        f.write_all(&vec![0xAB; 1 << 20]).unwrap();
+    }
     let mut backend = MemFs::new();
     backend.clock = NOW;
     backend
@@ -1672,4 +1715,297 @@ fn a_closed_stdout_pipe_ends_cat_and_get_quietly() {
             "{line}: nothing printed"
         );
     }
+}
+
+// ---- Integrity, multi-argument transfers, rm -r, du -------------------------
+
+/// SHA-256 of `data` as hex.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = super::checksum::Algo::Sha256.hasher();
+    h.update(data);
+    h.hex()
+}
+
+#[test]
+fn sum_prints_sha256sum_lines() {
+    let mut s = session(fixture());
+    assert_eq!(
+        ok(&mut s, "sum b.txt"),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  b.txt\n"
+    );
+    let out = ok(&mut s, "sum -a sha512 b.txt a/*.txt");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].starts_with("9b71d224bd62f3785d96d46ad3ea3d73") && lines[0].ends_with("  b.txt"),
+        "{out}"
+    );
+    assert!(lines[1].ends_with("  a/inner.txt"), "{out}");
+    assert_eq!(
+        fails(&mut s, "sum -a md4 b.txt"),
+        "nfsc: sum: unknown algorithm 'md4' (use sha256, sha512)"
+    );
+    // A bad path is reported; the others are still summed and the command fails.
+    let r = run(&mut s, "sum a nothere b.txt");
+    assert!(r.out.ends_with("  b.txt\n"), "{}", r.out);
+    assert!(r.err.contains("nfsc: sum: a: "), "{}", r.err);
+    assert!(r.failure.unwrap().contains("2 items failed"));
+}
+
+#[test]
+fn get_verify_passes_and_reports_the_digest() {
+    let dir = scratch("get_verify");
+    let data = pattern(8192);
+    let mut backend = MemFs::new();
+    backend.clock = NOW;
+    backend.max_read = 512;
+    backend.add_file("big.bin", &data).unwrap();
+    let mut s = session(backend);
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get --verify big.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(
+        r.err
+            .contains(&format!("verified sha256 {}", sha256_hex(&data))),
+        "{}",
+        r.err
+    );
+    assert_eq!(fs::read(dir.join("big.bin")).unwrap(), data);
+
+    // A resume hashes the kept prefix too.
+    fs::write(dir.join("big.bin.nfsc-part"), &data[..3000]).unwrap();
+    fs::remove_file(dir.join("big.bin")).unwrap();
+    let r = run(&mut s, "get -cV big.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 3000"), "{}", r.err);
+    assert!(r.err.contains("verified sha256"), "{}", r.err);
+    assert_eq!(fs::read(dir.join("big.bin")).unwrap(), data);
+
+    assert!(fails(&mut s, "get -V big.bin -").contains("-V needs a local file"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_verify_detects_data_damaged_in_transit() {
+    let dir = scratch("get_verify_bad");
+    let data = pattern(8192);
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.max_read = 512;
+    inner.add_file("big.bin", &data).unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let mut s = session_with(
+        Box::new(Tripwire::corrupting(backend.clone(), "big.bin", 5000, 1)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    lcd(&mut s, &dir);
+    fs::write(dir.join("big.bin"), b"good old copy").unwrap();
+    let r = run(&mut s, "get -V big.bin");
+    let msg = r.failure.expect("the mismatch fails the get");
+    assert!(msg.contains("verification failed"), "{msg}");
+    assert!(r.err.contains("removed"), "{}", r.err);
+    assert!(
+        !dir.join("big.bin.nfsc-part").exists(),
+        "damaged data removed"
+    );
+    assert_eq!(
+        fs::read(dir.join("big.bin")).unwrap(),
+        b"good old copy",
+        "the existing file is not replaced by damaged data"
+    );
+
+    // Without -V the same damage goes unnoticed, which is why -V exists.
+    let mut s = session_with(
+        Box::new(Tripwire::corrupting(backend, "big.bin", 5000, 1)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    lcd(&mut s, &dir);
+    ok(&mut s, "get big.bin");
+    assert_ne!(fs::read(dir.join("big.bin")).unwrap(), data);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_c_refuses_when_the_local_tail_differs_from_the_server() {
+    let dir = scratch("resume_tail");
+    let data = pattern(8192);
+    let mut backend = MemFs::new();
+    backend.clock = NOW;
+    backend.add_file("big.bin", &data).unwrap();
+    let mut s = session(backend);
+    lcd(&mut s, &dir);
+    let mut part = data[..3000].to_vec();
+    part[2990] ^= 1;
+    fs::write(dir.join("big.bin.nfsc-part"), &part).unwrap();
+    let msg = fails(&mut s, "get -c big.bin");
+    assert!(
+        msg.contains("does not match the remote file in the 3000 bytes before offset 3000"),
+        "{msg}"
+    );
+    assert!(msg.contains("without -c"), "{msg}");
+    assert_eq!(
+        fs::read(dir.join("big.bin.nfsc-part")).unwrap(),
+        part,
+        "the part file is left as it was"
+    );
+    assert!(!dir.join("big.bin").exists());
+
+    // An in-place partial file is checked the same way.
+    fs::remove_file(dir.join("big.bin.nfsc-part")).unwrap();
+    fs::write(dir.join("big.bin"), b"something else entirely").unwrap();
+    assert!(fails(&mut s, "get -c big.bin").contains("does not match"));
+    ok(&mut s, "get big.bin");
+    assert_eq!(fs::read(dir.join("big.bin")).unwrap(), data);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_takes_several_remote_arguments_into_a_local_directory() {
+    let dir = scratch("get_multi");
+    let mut fs_ = fixture();
+    fs_.add_file("x.tmp", b"x").unwrap();
+    fs_.add_file("y.tmp", b"y").unwrap();
+    let mut s = session(fs_);
+    lcd(&mut s, &dir);
+    fs::create_dir(dir.join("dl")).unwrap();
+    let r = run(&mut s, "get b.txt a/inner.txt *.tmp dl");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    for (name, body) in [
+        ("b.txt", &b"hello"[..]),
+        ("inner.txt", b"inner data"),
+        ("x.tmp", b"x"),
+        ("y.tmp", b"y"),
+    ] {
+        assert_eq!(fs::read(dir.join("dl").join(name)).unwrap(), body, "{name}");
+    }
+    assert_eq!(
+        fails(&mut s, "get b.txt a/inner.txt nowhere"),
+        "nfsc: get: nowhere: several files need a local directory as destination"
+    );
+    assert_eq!(
+        fails(&mut s, "get b.txt missing/"),
+        "nfsc: get: missing/: no such local directory"
+    );
+    // Two arguments keep their meaning: remote, then local name.
+    ok(&mut s, "get b.txt renamed.txt");
+    assert_eq!(fs::read(dir.join("renamed.txt")).unwrap(), b"hello");
+    ok(&mut s, "get b.txt dl/");
+    // -k carries on past a missing remote.
+    let r = run(&mut s, "get -k nothere b.txt dl");
+    assert!(r.failure.unwrap().contains("1 item failed"));
+    assert!(r.err.contains("nothere"), "{}", r.err);
+    assert!(fails(&mut s, "get b.txt x.tmp -").contains("only one file"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_expands_local_globs_and_honors_n_and_k() {
+    let dir = scratch("put_glob");
+    fs::write(dir.join("x.iso"), b"x-local").unwrap();
+    fs::write(dir.join("y.iso"), b"y-local").unwrap();
+    fs::write(dir.join("z.txt"), b"z-local").unwrap();
+    fs::create_dir(dir.join("sub")).unwrap();
+    fs::write(dir.join("sub/w.tar"), b"w-local").unwrap();
+    let backend = Rc::new(RefCell::new(fixture()));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+
+    ok(&mut s, "put *.iso");
+    assert_eq!(backend.borrow().read_file("x.iso").unwrap(), b"x-local");
+    assert_eq!(backend.borrow().read_file("y.iso").unwrap(), b"y-local");
+    assert!(backend.borrow().read_file("z.txt").is_none());
+
+    ok(&mut s, "put sub/*.tar z.txt a");
+    assert_eq!(backend.borrow().read_file("a/w.tar").unwrap(), b"w-local");
+    assert_eq!(backend.borrow().read_file("a/z.txt").unwrap(), b"z-local");
+    assert!(
+        fails(&mut s, "put x.iso y.iso nowhere").contains("several files need a remote directory")
+    );
+    assert!(fails(&mut s, "put *.nope").contains("no match"));
+
+    // -n leaves existing remote files alone.
+    fs::write(dir.join("x.iso"), b"x-changed").unwrap();
+    let r = run(&mut s, "put -n *.iso");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(
+        r.err.contains("skipping x.iso: it exists on the server"),
+        "{}",
+        r.err
+    );
+    assert_eq!(backend.borrow().read_file("x.iso").unwrap(), b"x-local");
+    ok(&mut s, "put --no-clobber -r sub");
+    assert_eq!(backend.borrow().read_file("sub/w.tar").unwrap(), b"w-local");
+
+    // -k: the missing file is reported, the rest still go up, the command fails.
+    let r = run(&mut s, "put -k missing.bin x.iso z.txt a");
+    let msg = r.failure.expect("put -k still fails");
+    assert!(msg.contains("1 item failed"), "{msg}");
+    assert!(r.err.contains("missing.bin"), "{}", r.err);
+    assert_eq!(backend.borrow().read_file("a/x.iso").unwrap(), b"x-changed");
+    // Without -k the first failure stops the put.
+    assert!(run(&mut s, "put missing.bin y.iso a").failure.is_some());
+    assert!(backend.borrow().read_file("a/y.iso").is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rm_r_removes_a_tree_without_following_links() {
+    let mut fs_ = fixture();
+    fs_.add_dir("t/sub/deeper").unwrap();
+    fs_.add_file("t/f.txt", b"f").unwrap();
+    fs_.add_file("t/sub/g.txt", b"g").unwrap();
+    fs_.add_file("t/sub/deeper/h.txt", b"h").unwrap();
+    fs_.add_symlink("t/to_a", "../a").unwrap();
+    let mut s = session(fs_);
+    assert!(
+        run(&mut s, "rm t").failure.is_some(),
+        "rm without -r keeps trees"
+    );
+    ok(&mut s, "rm -r t");
+    assert!(fails(&mut s, "stat t").contains("t"));
+    assert_eq!(
+        ok(&mut s, "cat a/inner.txt"),
+        "inner data",
+        "link target kept"
+    );
+    // A plain file works with -r too.
+    ok(&mut s, "rm -r b.txt");
+    assert!(run(&mut s, "stat b.txt").failure.is_some());
+    // The working directory cannot be removed from under the session.
+    ok(&mut s, "cd a");
+    assert!(fails(&mut s, "rm -r /a").contains("refusing to remove the current directory"));
+    assert!(fails(&mut s, "rm -r ..").contains("invalid name"));
+}
+
+#[test]
+fn rm_r_does_not_loop_through_a_directory_linked_into_its_tree() {
+    let mut fs_ = hostile_fixture("/tmp/nfsc-review-unused-abs");
+    fs_.add_raw_child("t/sub", b"again", "t").unwrap();
+    let mut s = session(fs_);
+    let r = run(&mut s, "rm -r t");
+    assert!(
+        r.err.contains("skipping directory loop t/sub/again"),
+        "{}",
+        r.err
+    );
+    assert!(
+        r.failure.is_some(),
+        "the loop keeps t/sub from being emptied"
+    );
+}
+
+#[test]
+fn du_sums_file_sizes_per_directory() {
+    let mut fs_ = fixture();
+    fs_.add_file("a/sub/more.bin", &pattern(3000)).unwrap();
+    let mut s = session(fs_);
+    assert_eq!(ok(&mut s, "du"), "3000\t./a/sub\n3010\t./a\n3015\t.\n");
+    assert_eq!(ok(&mut s, "du -s a/"), "3010\ta\n");
+    assert_eq!(ok(&mut s, "du -sh"), "3.0K\t.\n");
+    assert_eq!(ok(&mut s, "du b.txt"), "5\tb.txt\n");
+    assert!(run(&mut s, "du nothere").failure.is_some());
 }

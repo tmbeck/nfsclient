@@ -29,6 +29,8 @@ Global options (before or after the command):
   --proto tcp|udp                transport [tcp]; NFSv4 is TCP only
   --timeout SECS                 per-reply timeout [10]
   --nfs-port P, --mount-port P   skip portmap lookups
+Each also reads NFSC_<NAME> from the environment (NFSC_UID, NFSC_TIMEOUT,
+NFSC_PORT_MODE, ...); the command line wins.
 
 Permission denied on 'secure' exports: the server wants a source port <1024.
   sudo setcap cap_net_bind_service=+ep \"$(command -v nfsc)\"   (once per install)
@@ -46,11 +48,11 @@ pub struct Cli {
 #[derive(Args, Debug, Clone)]
 pub struct Globals {
     /// AUTH_SYS uid (default: the current user)
-    #[arg(long, global = true, hide = true, value_name = "UID")]
+    #[arg(long, global = true, hide = true, value_name = "UID", env = "NFSC_UID")]
     pub uid: Option<u32>,
 
     /// AUTH_SYS gid (default: the current user's primary group)
-    #[arg(long, global = true, hide = true, value_name = "GID")]
+    #[arg(long, global = true, hide = true, value_name = "GID", env = "NFSC_GID")]
     pub gid: Option<u32>,
 
     /// AUTH_SYS supplementary gids, comma separated (default: the current user's groups)
@@ -59,7 +61,8 @@ pub struct Globals {
         global = true,
         hide = true,
         value_name = "GID,...",
-        value_delimiter = ','
+        value_delimiter = ',',
+        env = "NFSC_GIDS"
     )]
     pub gids: Option<Vec<u32>>,
 
@@ -70,7 +73,8 @@ pub struct Globals {
         hide = true,
         value_enum,
         value_name = "MODE",
-        default_value = "auto"
+        default_value = "auto",
+        env = "NFSC_PORT_MODE"
     )]
     pub port_mode: PortModeArg,
 
@@ -81,20 +85,21 @@ pub struct Globals {
         hide = true,
         value_enum,
         value_name = "PROTO",
-        default_value = "tcp"
+        default_value = "tcp",
+        env = "NFSC_PROTO"
     )]
     pub proto: ProtoArg,
 
     /// Seconds to wait for each reply (UDP: across all retransmits)
-    #[arg(long, global = true, hide = true, value_name = "SECS", default_value = "10", value_parser = parse_timeout)]
+    #[arg(long, global = true, hide = true, value_name = "SECS", default_value = "10", value_parser = parse_timeout, env = "NFSC_TIMEOUT")]
     pub timeout: Duration,
 
     /// NFS server port; skips portmap for NFS (a port in an nfs:// target wins if equal)
-    #[arg(long, global = true, hide = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, global = true, hide = true, value_name = "PORT", env = "NFSC_NFS_PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub nfs_port: Option<u16>,
 
     /// MOUNT server port; skips portmap for MOUNT (used by `exports` and `shell`)
-    #[arg(long, global = true, hide = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, global = true, hide = true, value_name = "PORT", env = "NFSC_MOUNT_PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub mount_port: Option<u16>,
 }
 
@@ -127,7 +132,9 @@ pub struct ShellArgs {
         value_enum,
         value_name = "VERS",
         default_value = "auto",
-        hide_possible_values = true
+        env = "NFSC_VERS",
+        hide_possible_values = true,
+        hide_env_values = true
     )]
     pub nfs_version: NfsVersionArg,
 }
@@ -424,6 +431,60 @@ mod tests {
         );
         let too_many: Vec<u32> = (0..17).collect();
         assert!(apply_overrides(base, None, None, Some(&too_many)).is_err());
+    }
+
+    /// Child half of [`env_vars_set_globals`]: only does work when the parent
+    /// started it with the NFSC_* variables set.
+    #[test]
+    fn env_child() {
+        if std::env::var_os("NFSC_CLI_ENV_CHILD").is_none() {
+            return;
+        }
+        let cli = parse(&["rpcinfo", "nas"]).unwrap();
+        assert_eq!(cli.global.uid, Some(4242));
+        assert_eq!(cli.global.gids, Some(vec![5, 6]));
+        assert_eq!(cli.global.timeout, Duration::from_millis(2500));
+        assert_eq!(cli.global.proto, ProtoArg::Udp);
+        // The command line wins over the environment.
+        let cli = parse(&["--uid", "7", "--timeout", "3", "rpcinfo", "nas"]).unwrap();
+        assert_eq!(cli.global.uid, Some(7));
+        assert_eq!(cli.global.timeout, Duration::from_secs(3));
+        let cli = parse(&["shell", "nas:/x"]).unwrap();
+        assert!(matches!(cli.command, Command::Shell(s) if s.nfs_version == NfsVersionArg::V3));
+    }
+
+    /// NFSC_* variables provide defaults. Setting them in this process would
+    /// race with the other tests, so the check runs in a child test process.
+    #[test]
+    fn env_vars_set_globals() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "cli::tests::env_child", "--nocapture"])
+            .env("NFSC_CLI_ENV_CHILD", "1")
+            .env("NFSC_UID", "4242")
+            .env("NFSC_GIDS", "5,6")
+            .env("NFSC_TIMEOUT", "2.5")
+            .env("NFSC_PROTO", "udp")
+            .env("NFSC_VERS", "3")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains("1 passed"), "the child test ran: {text}");
+
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "cli::tests::env_child"])
+            .env("NFSC_CLI_ENV_CHILD", "1")
+            .env("NFSC_UID", "4242")
+            .env("NFSC_TIMEOUT", "0")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "a bad NFSC_TIMEOUT is rejected");
     }
 
     #[test]

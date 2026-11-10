@@ -1,4 +1,4 @@
-//! Command bodies for everything except get/put (see `transfer`).
+//! Command bodies for everything except get/put/sum (see `transfer`).
 //! Each takes the arguments after the command name.
 
 use std::io::Write;
@@ -7,11 +7,13 @@ use nfsc::Error;
 use nfsc::fs::{Attr, DirEntry, FileHandle, FileType, Filesystem, SetAttr, Status};
 
 use super::format::{self, LongEntry};
+use super::interrupt;
 use super::line::parse_args;
 use super::session::{
-    CmdFailure, CmdResult, Ctx, Node, Session, io_fail, io_text, last_node, usage,
+    CmdFailure, CmdResult, Ctx, Node, Session, io_fail, io_text, is_plain_name, last_node, usage,
 };
-use crate::text::display_name;
+use super::transfer::{MAX_TREE_DEPTH, Walk};
+use crate::text::{display_name, display_str};
 
 /// One entry of a listing. `attr` is only filled for `ls -l`.
 struct Row {
@@ -84,11 +86,11 @@ const DETAILS: &[(&[&str], &str)] = &[
     (&["cat"], "cat path\n  Write a remote file to stdout."),
     (
         &["get"],
-        "get [-rckn] remote [local]\n  Download. local defaults to the local directory; - writes to stdout.\n  Data goes to NAME.nfsc-part and is renamed to NAME when complete, so a\n  failed download never replaces an existing file.\n  -r  download a directory tree (symlinks and special files are skipped)\n  -c  resume NAME.nfsc-part (or a partial NAME) from its current size;\n      on failure the partial file is kept for the next get -c\n  -k  with -r or several files: report errors, continue, list them at the\n      end, and fail the command (--keep-going)\n  -n  skip files that already exist locally\n  Keeps the remote mtime and mode (without setuid/setgid/sticky), also for\n  directories under -r. Without -c a failed or interrupted download is removed.",
+        "get [-rcknV] remote... [local]\n  Download. local defaults to the local directory; - writes to stdout.\n  With several remotes (or a glob), local must be an existing directory;\n  a local ending in / must be a directory too.\n  Data goes to NAME.nfsc-part and is renamed to NAME when complete, so a\n  failed download never replaces an existing file.\n  -r  download a directory tree (symlinks and special files are skipped)\n  -c  resume NAME.nfsc-part (or a partial NAME) from its current size;\n      on failure the partial file is kept for the next get -c. The last\n      1 MiB before the resume point is compared with the server first; if\n      it differs, get refuses (the remote file changed: drop -c)\n  -V  verify (--verify): hash the data as it is written (and the kept\n      part when resuming), then read the remote file again and compare\n      SHA-256 digests before renaming into place; a mismatch removes the\n      part file and fails. Costs a second full read of the remote file\n  -k  with -r or several files: report errors, continue, list them at the\n      end, and fail the command (--keep-going)\n  -n  skip files that already exist locally\n  Keeps the remote mtime and mode (without setuid/setgid/sticky), also for\n  directories under -r. Without -c a failed or interrupted download is removed.",
     ),
     (
         &["put"],
-        "put [-r] [-c] local [remote]\n  Upload. remote defaults to the local file name in the remote directory.\n  -r  upload a directory tree\n  -c  resume a partial remote file from its current size\n  Ctrl-C leaves the partial remote file; put -c continues it.",
+        "put [-rckn] local... [remote]\n  Upload. remote defaults to the local file name in the remote directory.\n  * and ? in the last component of a local path match local files; with\n  several files, remote must be an existing directory.\n  -r  upload a directory tree\n  -c  resume a partial remote file from its current size (sizes only)\n  -k  report errors, continue, list them at the end, and fail (--keep-going)\n  -n  skip names that already exist on the server (--no-clobber)\n  Ctrl-C leaves the partial remote file; put -c continues it.",
     ),
     (
         &["mkdir"],
@@ -96,9 +98,17 @@ const DETAILS: &[(&[&str], &str)] = &[
     ),
     (
         &["rm"],
-        "rm path...\n  Remove files and symbolic links (not directories; see rmdir).",
+        "rm [-r] path...\n  Remove files and symbolic links. -r also removes directories with\n  everything in them (symbolic links are removed, not followed; directory\n  loops are not entered; at most 256 levels). The current directory and\n  those above it are refused.",
     ),
     (&["rmdir"], "rmdir path...\n  Remove empty directories."),
+    (
+        &["sum"],
+        "sum [-a sha256|sha512] path...\n  Read remote files and print their checksums as sha256sum does\n  (HEX  path), so the output works with sha256sum -c. Default sha256.",
+    ),
+    (
+        &["du"],
+        "du [-s] [-h] [path...]\n  Apparent size (sum of file sizes) of each directory in a remote tree,\n  in bytes. -s: one total per path; -h: human units (K, M, G).\n  Skips loops and the same names as get -r.",
+    ),
     (
         &["mv"],
         "mv src dst\n  Rename or move; into dst if dst is a directory.",
@@ -357,15 +367,148 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn cmd_rm(&mut self, args: &[String]) -> CmdResult<()> {
+    pub(super) fn cmd_rm(&mut self, args: &[String], err: &mut dyn Write) -> CmdResult<()> {
         const CMD: &str = "rm";
-        if args.is_empty() {
-            return Err(usage(CMD, "usage: rm path..."));
+        let flags = parse_args(args, "r").map_err(|m| usage(CMD, m))?;
+        if flags.positional.is_empty() {
+            return Err(usage(CMD, "usage: rm [-r] path..."));
         }
-        for arg in args {
+        let recursive = flags.has('r');
+        for arg in &flags.positional {
             for path in self.expand(CMD, arg)? {
                 let (dir, name) = self.resolve_parent(&path).ctx(CMD, &path)?;
+                if recursive {
+                    // Not following a symbolic link: rm -r link removes the link.
+                    let (fh, attr) = self.fs.lookup(&dir, &name).ctx(CMD, &path)?;
+                    if attr.ftype == FileType::Directory {
+                        let key = (attr.fsid, attr.fileid);
+                        if self
+                            .cwd
+                            .iter()
+                            .any(|n| (n.attr.fsid, n.attr.fileid) == key && key.1 != 0)
+                        {
+                            return Err(CmdFailure::new(
+                                CMD,
+                                Some(&path),
+                                "refusing to remove the current directory or one above it",
+                            ));
+                        }
+                        self.remove_tree(&fh, key, &path, err, &mut Vec::new())
+                            .ctx(CMD, &path)?;
+                        self.fs.rmdir(&dir, &name).ctx(CMD, &path)?;
+                        continue;
+                    }
+                }
                 self.fs.remove(&dir, &name).ctx(CMD, &path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Empties the directory `fh` (shown as `path`), depth first. Symbolic
+    /// links are removed, never followed. A directory that is one of its own
+    /// ancestors (a loop, by fsid/fileid) is not entered, and the walk stops
+    /// below [`MAX_TREE_DEPTH`] levels; the directories above then stay.
+    fn remove_tree(
+        &mut self,
+        fh: &FileHandle,
+        key: (u64, u64),
+        path: &str,
+        err: &mut dyn Write,
+        ancestors: &mut Vec<(u64, u64)>,
+    ) -> nfsc::Result<()> {
+        if ancestors.len() >= MAX_TREE_DEPTH {
+            return Err(Error::Invalid(format!(
+                "{path}: directory tree is too deep (over {MAX_TREE_DEPTH} levels)"
+            )));
+        }
+        ancestors.push(key);
+        let result = self.remove_entries(fh, path, err, ancestors);
+        ancestors.pop();
+        result
+    }
+
+    fn remove_entries(
+        &mut self,
+        fh: &FileHandle,
+        path: &str,
+        err: &mut dyn Write,
+        ancestors: &mut Vec<(u64, u64)>,
+    ) -> nfsc::Result<()> {
+        let note = |e: std::io::Error| Error::Invalid(io_text(&e));
+        for entry in self.fs.readdir(fh)? {
+            interrupt::check(&self.interrupt)?;
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            let child = format!("{path}/{}", display_name(&entry.name));
+            if !is_plain_name(&entry.name) {
+                writeln!(err, "nfsc: rm: skipping unsafe name {child}").map_err(note)?;
+                continue;
+            }
+            let (cfh, attr) = match (entry.handle, entry.attr) {
+                (Some(h), Some(a)) => (h, a),
+                _ => self.fs.lookup(fh, &entry.name)?,
+            };
+            if attr.ftype == FileType::Directory {
+                let key = (attr.fsid, attr.fileid);
+                if key.1 != 0 && ancestors.contains(&key) {
+                    writeln!(err, "nfsc: rm: skipping directory loop {child}").map_err(note)?;
+                    continue;
+                }
+                self.remove_tree(&cfh, key, &child, err, ancestors)?;
+                self.fs.rmdir(fh, &entry.name)
+            } else {
+                self.fs.remove(fh, &entry.name)
+            }
+            .map_err(|e| Error::Invalid(format!("{child}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// `du [-s] [-h] [path...]`: apparent sizes (the sum of file sizes) of
+    /// remote trees, with the same skip rules as `get -r`.
+    pub(super) fn cmd_du(&mut self, args: &[String], out: &mut dyn Write) -> CmdResult<()> {
+        const CMD: &str = "du";
+        let flags = parse_args(args, "sh").map_err(|m| usage(CMD, m))?;
+        let (summary, human) = (flags.has('s'), flags.has('h'));
+        let show = |n: u64| {
+            if human {
+                format::human(n)
+            } else {
+                n.to_string()
+            }
+        };
+        let args = if flags.positional.is_empty() {
+            vec![".".to_string()]
+        } else {
+            flags.positional.clone()
+        };
+        for arg in &args {
+            for path in self.expand(CMD, arg)? {
+                let stack = self.resolve(&path, true).ctx(CMD, &path)?;
+                let node = last_node(&stack).clone();
+                let label = match path.trim_end_matches('/') {
+                    "" => path.clone(),
+                    p => p.to_string(),
+                };
+                let rows = if node.attr.ftype == FileType::Directory {
+                    let mut walk = Walk {
+                        cache: false,
+                        dirs: (!summary).then(Vec::new),
+                    };
+                    let key = (node.attr.fsid, node.attr.fileid);
+                    let (_, bytes) = self
+                        .scan_remote_tree(&node.fh, key, &mut Vec::new(), &label, &mut walk)
+                        .ctx(CMD, &path)?;
+                    walk.dirs.unwrap_or_else(|| vec![(label, bytes)])
+                } else {
+                    vec![(label, node.attr.size)]
+                };
+                for (p, n) in rows {
+                    writeln!(out, "{}\t{}", show(n), display_str(&p))
+                        .map_err(|e| io_fail(CMD, e))?;
+                }
             }
         }
         Ok(())

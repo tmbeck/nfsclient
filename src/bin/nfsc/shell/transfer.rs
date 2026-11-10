@@ -1,4 +1,4 @@
-//! get and put, and the transfer loops behind them.
+//! get, put and sum, and the transfer loops behind them.
 //!
 //! Downloads and uploads go through the backend's `read_stream` and
 //! `write_stream`, so backends that pipeline keep several transfers in flight.
@@ -13,8 +13,16 @@
 //!
 //! Resume (`-c`): `get -c` continues `NAME.nfsc-part` (or, for files from
 //! older versions, a partial `NAME` in place) from its current size, and
-//! `put -c` continues a remote file from its current size. Only sizes are
-//! compared; contents are not checked.
+//! `put -c` continues a remote file from its current size. Before `get -c`
+//! appends, the last [`TAIL_CHECK`] bytes of the local file are compared with
+//! the same range on the server; a mismatch (the remote file was replaced, or
+//! the local file is something else) refuses the resume.
+//!
+//! Verify (`get -V`): the bytes are hashed (SHA-256) as they are written,
+//! after hashing the local prefix that a resume keeps. Once the file is
+//! complete, the remote file is read a second time and hashed; the `.nfsc-part`
+//! is renamed into place only when both digests agree. This costs a second
+//! full read, so it is off by default.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
@@ -30,6 +38,7 @@ use nfsc::fs::{
 };
 use nfsc::{Error, Result};
 
+use super::checksum::{Algo, Hasher};
 use super::format;
 use super::interrupt;
 use super::line::parse_args;
@@ -42,7 +51,7 @@ use crate::text::{display_name, display_path, display_str};
 
 /// Directory levels a recursive get descends. Deeper subtrees are skipped with a
 /// note, so a server cannot make the recursion (or local paths) unbounded.
-const MAX_TREE_DEPTH: usize = 256;
+pub(super) const MAX_TREE_DEPTH: usize = 256;
 
 /// Suffix of the file a download is written to before it is renamed into place.
 pub(super) const PART_SUFFIX: &str = ".nfsc-part";
@@ -54,7 +63,14 @@ const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const O_NOFOLLOW: i32 = 0x0100;
 
-const GET_USAGE: &str = "usage: get [-rckn] remote [local]";
+/// Bytes before the resume offset that `get -c` compares with the server.
+const TAIL_CHECK: u64 = 1 << 20;
+
+/// Read size when hashing a local file.
+const LOCAL_CHUNK: usize = 1 << 20;
+
+const GET_USAGE: &str = "usage: get [-rcknV] remote... [local]";
+const PUT_USAGE: &str = "usage: put [-rckn] local... [remote]";
 
 fn local_err(e: std::io::Error) -> Error {
     Error::Invalid(io_text(&e))
@@ -90,6 +106,64 @@ fn resumed_note(start: u64, size: u64) -> String {
     }
 }
 
+/// A failure's text without the `nfsc: CMD: ` prefix, for the end summary.
+fn failure_text(cmd: &str, f: &CmdFailure) -> String {
+    let text = f.to_string();
+    let prefix = format!("nfsc: {cmd}: ");
+    text.strip_prefix(&prefix).unwrap_or(&text).to_string()
+}
+
+/// Ends a `-k` run: lists the failures and fails the command, or succeeds
+/// when there were none.
+fn fail_summary(cmd: &str, failures: &[String], err: &mut dyn Write) -> CmdResult<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    writeln!(err, "nfsc: {cmd}: failed:").map_err(|e| io_fail(cmd, e))?;
+    for f in failures {
+        writeln!(err, "  {}", display_str(f)).map_err(|e| io_fail(cmd, e))?;
+    }
+    let n = failures.len();
+    Err(CmdFailure::new(
+        cmd,
+        None,
+        format!(
+            "{n} {} failed (listed above)",
+            if n == 1 { "item" } else { "items" }
+        ),
+    ))
+}
+
+/// Reads `file` from offset 0 up to `len` bytes into `hasher`.
+fn hash_local(
+    file: &mut File,
+    path: &Path,
+    len: u64,
+    hasher: &mut Hasher,
+    flag: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| local_io("read", path, &e))?;
+    let mut buf = vec![0u8; LOCAL_CHUNK];
+    let mut left = len;
+    while left > 0 {
+        interrupt::check(flag)?;
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = file
+            .read(&mut buf[..want])
+            .map_err(|e| local_io("read", path, &e))?;
+        if n == 0 {
+            return Err(Error::Invalid(format!(
+                "{} became shorter while it was read",
+                display_path(path)
+            )));
+        }
+        hasher.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(())
+}
+
 /// A file's remote mtime as a local time, or `None` if it is out of range.
 fn system_time(t: Time) -> Option<SystemTime> {
     let base = if t.seconds >= 0 {
@@ -116,6 +190,7 @@ fn part_path(path: &Path) -> Result<PathBuf> {
 /// comes from the open descriptor, so it cannot change under us.
 fn open_local(path: &Path, resume: bool) -> Result<(File, u64)> {
     let file = fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
         .truncate(!resume)
@@ -207,6 +282,37 @@ struct GetOpts {
     no_clobber: bool,
     /// `-k`: report errors and continue; fail at the end.
     keep_going: bool,
+    /// `-V`: hash while writing, then compare with a second read of the server.
+    verify: bool,
+}
+
+/// Why a download did not complete.
+enum Failed {
+    /// Reading, writing or interrupt: a partial file may be resumed.
+    Transfer(Error),
+    /// `-V` found different data on disk than on the server.
+    Mismatch(Error),
+}
+
+/// What [`Session::scan_remote_tree`] records besides its totals.
+pub(super) struct Walk {
+    /// Keep the listings in `scan_cache` for the download that follows.
+    pub cache: bool,
+    /// Per-directory byte totals, children before parents.
+    pub dirs: Option<Vec<(String, u64)>>,
+}
+
+/// Options of one `put`.
+#[derive(Debug, Clone, Copy, Default)]
+struct PutOpts {
+    /// `-r`: upload directory trees.
+    recursive: bool,
+    /// `-c`: continue partial remote files.
+    resume: bool,
+    /// `-n`: skip names that exist on the server.
+    no_clobber: bool,
+    /// `-k`: report errors and continue; fail at the end.
+    keep_going: bool,
 }
 
 /// What one `get` was asked to do, shared by its sources.
@@ -232,6 +338,7 @@ fn long_options(args: &[String]) -> Vec<String> {
                     a.clone()
                 }
                 "--keep-going" => "-k".to_string(),
+                "--verify" => "-V".to_string(),
                 "--no-clobber" => "-n".to_string(),
                 "--continue" => "-c".to_string(),
                 "--recursive" => "-r".to_string(),
@@ -250,39 +357,60 @@ impl Session {
     ) -> CmdResult<()> {
         const CMD: &str = "get";
         let args = long_options(args);
-        let flags = parse_args(&args, "rcnk").map_err(|m| usage(CMD, m))?;
+        let flags = parse_args(&args, "rcnkV").map_err(|m| usage(CMD, m))?;
         let opts = GetOpts {
             resume: flags.has('c'),
             no_clobber: flags.has('n'),
             keep_going: flags.has('k'),
+            verify: flags.has('V'),
         };
-        let (remote, local) = match flags.positional.as_slice() {
-            [r] => (r.as_str(), None),
-            [r, l] => (r.as_str(), Some(l.as_str())),
-            _ => return Err(usage(CMD, GET_USAGE)),
+        let (remotes, local) = match flags.positional.as_slice() {
+            [] => return Err(usage(CMD, GET_USAGE)),
+            [r] => (std::slice::from_ref(r), None),
+            [rs @ .., l] => (rs, Some(l.as_str())),
         };
         let recursive = flags.has('r');
-        let sources = self.expand(CMD, remote)?;
-        let several = sources.len() > 1 || super::line::is_pattern(remote);
         let to_stdout = local == Some("-");
-        if to_stdout && (recursive || several) {
-            return Err(CmdFailure::new(
-                CMD,
-                Some(remote),
-                "only one file can be written to stdout",
-            ));
+        let patterns = remotes.iter().any(|r| super::line::is_pattern(r));
+        if to_stdout && (recursive || remotes.len() > 1 || patterns) {
+            return Err(usage(CMD, "only one file can be written to stdout"));
         }
         if to_stdout && opts.resume {
             return Err(usage(CMD, "-c needs a local file, not stdout"));
+        }
+        if to_stdout && opts.verify {
+            return Err(usage(CMD, "-V needs a local file, not stdout"));
         }
         let explicit = match local {
             Some("-") | None => None,
             Some(l) => Some(self.local_path(l)),
         };
+        // A trailing '/' says the destination is a directory; it must exist,
+        // except for `get -r dir new/`, which creates it.
+        if let (Some(l), Some(p)) = (local, &explicit)
+            && l.ends_with('/')
+            && !p.is_dir()
+            && !(recursive && remotes.len() == 1 && !patterns)
+        {
+            return Err(CmdFailure::new(CMD, Some(l), "no such local directory"));
+        }
+        let mut sources = Vec::new();
+        let mut failures = Vec::new();
+        for remote in remotes {
+            match self.expand(CMD, remote) {
+                Ok(found) => sources.extend(found),
+                Err(f) if opts.keep_going && !f.is_interrupted() => {
+                    writeln!(err, "{f}").map_err(|e| io_fail(CMD, e))?;
+                    failures.push(failure_text(CMD, &f));
+                }
+                Err(f) => return Err(f),
+            }
+        }
+        let several = sources.len() > 1 || remotes.len() > 1 || patterns;
         if several && explicit.as_ref().is_some_and(|p| !p.is_dir()) {
             return Err(CmdFailure::new(
                 CMD,
-                Some(remote),
+                local,
                 "several files need a local directory as destination",
             ));
         }
@@ -293,35 +421,17 @@ impl Session {
             recursive,
             opts,
         };
-        let mut failures = Vec::new();
         for src in &sources {
             match self.get_source(&plan, src, out, err, &mut failures) {
                 Ok(()) => {}
                 Err(f) if opts.keep_going && !f.is_interrupted() && !f.is_pipe_closed() => {
                     writeln!(err, "{f}").map_err(|e| io_fail(CMD, e))?;
-                    let text = f.to_string();
-                    let text = text.strip_prefix("nfsc: get: ").unwrap_or(&text);
-                    failures.push(text.to_string());
+                    failures.push(failure_text(CMD, &f));
                 }
                 Err(f) => return Err(f),
             }
         }
-        if failures.is_empty() {
-            return Ok(());
-        }
-        writeln!(err, "nfsc: get: failed:").map_err(|e| io_fail(CMD, e))?;
-        for f in &failures {
-            writeln!(err, "  {}", display_str(f)).map_err(|e| io_fail(CMD, e))?;
-        }
-        let n = failures.len();
-        Err(CmdFailure::new(
-            CMD,
-            None,
-            format!(
-                "{n} {} failed (listed above)",
-                if n == 1 { "item" } else { "items" }
-            ),
-        ))
+        fail_summary(CMD, &failures, err)
     }
 
     /// One source of a get: a file, a tree, or a file to stdout. With
@@ -385,7 +495,11 @@ impl Session {
         }
         let key = (node.attr.fsid, node.attr.fileid);
         let totals = if self.progress {
-            match self.scan_remote_tree(&node.fh, key, &mut Vec::new()) {
+            let mut walk = Walk {
+                cache: true,
+                dirs: None,
+            };
+            match self.scan_remote_tree(&node.fh, key, &mut Vec::new(), "", &mut walk) {
                 Ok(t) => Some(t),
                 // The download reports the problem where it occurs.
                 Err(e) if opts.keep_going && !interrupt::is_interrupt(&e) => {
@@ -422,13 +536,101 @@ impl Session {
 
     pub(super) fn cmd_put(&mut self, args: &[String], err: &mut dyn Write) -> CmdResult<()> {
         const CMD: &str = "put";
-        let flags = parse_args(args, "rc").map_err(|m| usage(CMD, m))?;
-        let (recursive, resume) = (flags.has('r'), flags.has('c'));
-        let (local, remote) = match flags.positional.as_slice() {
-            [l] => (l.as_str(), None),
-            [l, r] => (l.as_str(), Some(r.as_str())),
-            _ => return Err(usage(CMD, "usage: put [-r] [-c] local [remote]")),
+        let args = long_options(args);
+        let flags = parse_args(&args, "rcnk").map_err(|m| usage(CMD, m))?;
+        let opts = PutOpts {
+            recursive: flags.has('r'),
+            resume: flags.has('c'),
+            no_clobber: flags.has('n'),
+            keep_going: flags.has('k'),
         };
+        let (locals, remote) = match flags.positional.as_slice() {
+            [] => return Err(usage(CMD, PUT_USAGE)),
+            [l] => (std::slice::from_ref(l), None),
+            [ls @ .., r] => (ls, Some(r.as_str())),
+        };
+        let patterns = locals.iter().any(|l| super::line::is_pattern(l));
+        let mut sources = Vec::new();
+        let mut failures = Vec::new();
+        for local in locals {
+            match self.expand_local(CMD, local) {
+                Ok(found) => sources.extend(found),
+                Err(f) if opts.keep_going => {
+                    writeln!(err, "{f}").map_err(|e| io_fail(CMD, e))?;
+                    failures.push(failure_text(CMD, &f));
+                }
+                Err(f) => return Err(f),
+            }
+        }
+        let several = sources.len() > 1 || locals.len() > 1 || patterns;
+        if several
+            && let Some(r) = remote
+            && !self
+                .resolve(r, true)
+                .is_ok_and(|s| last_node(&s).attr.ftype == FileType::Directory)
+        {
+            return Err(CmdFailure::new(
+                CMD,
+                Some(r),
+                "several files need a remote directory as destination",
+            ));
+        }
+        for src in &sources {
+            match self.put_source(src, remote, opts, err, &mut failures) {
+                Ok(()) => {}
+                Err(f) if opts.keep_going && !f.is_interrupted() => {
+                    writeln!(err, "{f}").map_err(|e| io_fail(CMD, e))?;
+                    failures.push(failure_text(CMD, &f));
+                }
+                Err(f) => return Err(f),
+            }
+        }
+        fail_summary(CMD, &failures, err)
+    }
+
+    /// Expands `*` and `?` in the last component of a local path into the
+    /// matching names (sorted), as [`Session::expand`] does for remote paths.
+    fn expand_local(&self, cmd: &str, pattern: &str) -> CmdResult<Vec<String>> {
+        use super::line::{glob_match, is_pattern};
+        if !is_pattern(pattern) {
+            return Ok(vec![pattern.to_string()]);
+        }
+        let (dir, pat) = match pattern.rfind('/') {
+            Some(i) => (&pattern[..=i], &pattern[i + 1..]),
+            None => ("", pattern),
+        };
+        if is_pattern(dir) {
+            return Err(CmdFailure::new(
+                cmd,
+                Some(pattern),
+                "wildcards are only supported in the last path component",
+            ));
+        }
+        let path = self.local_path(if dir.is_empty() { "." } else { dir });
+        let rd =
+            fs::read_dir(&path).map_err(|e| CmdFailure::new(cmd, Some(pattern), io_text(&e)))?;
+        let mut names: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| glob_match(pat, n))
+            .collect();
+        if names.is_empty() {
+            return Err(CmdFailure::new(cmd, Some(pattern), "no match"));
+        }
+        names.sort();
+        Ok(names.into_iter().map(|n| format!("{dir}{n}")).collect())
+    }
+
+    /// One local source of a put: a file or (with -r) a tree.
+    fn put_source(
+        &mut self,
+        local: &str,
+        remote: Option<&str>,
+        opts: PutOpts,
+        err: &mut dyn Write,
+        failures: &mut Vec<String>,
+    ) -> CmdResult<()> {
+        const CMD: &str = "put";
         let path = self.local_path(local);
         let meta =
             fs::metadata(&path).map_err(|e| CmdFailure::new(CMD, Some(local), io_text(&e)))?;
@@ -442,26 +644,108 @@ impl Session {
         let dst = remote.unwrap_or(base);
         let (dir, name) = self.destination(dst, local).ctx(CMD, local)?;
         if meta.is_dir() {
-            if !recursive {
+            if !opts.recursive {
                 return Err(CmdFailure::new(CMD, Some(local), "is a directory (use -r)"));
             }
             let totals = self.progress.then(|| scan_local_tree(&path, 0));
             let tree = TreeProgress::new(totals);
             let mut lines = LineWriter::new(err, tree.multi());
             self.tree = Some(tree);
-            let result = self.put_tree(&path, &dir, &name, resume, &mut lines);
+            let result = self.put_tree(&path, &dir, &name, opts, &mut lines, failures, 0);
             drop(lines);
             let tree = self.tree.take();
             let summary = tree.map(|t| t.finish("put"));
             result.ctx(CMD, local)?;
             if let Some(line) = summary {
-                writeln!(err, "{line}").map_err(|e| CmdFailure::new(CMD, None, e.to_string()))?;
+                writeln!(err, "{line}").map_err(|e| io_fail(CMD, e))?;
             }
             Ok(())
         } else {
-            self.put_file(&path, &meta, &dir, &name, resume, err)
+            self.put_file(&path, &meta, &dir, &name, opts, err)
                 .ctx(CMD, local)
         }
+    }
+
+    /// `sum [-a ALGO] path...`: prints `HEX  path` for each remote file, like
+    /// sha256sum. Errors are reported and the rest are still summed.
+    pub(super) fn cmd_sum(
+        &mut self,
+        args: &[String],
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> CmdResult<()> {
+        const CMD: &str = "sum";
+        const USAGE: &str = "usage: sum [-a sha256|sha512] path...";
+        let mut algo = Algo::default();
+        let mut paths = Vec::new();
+        let mut it = args.iter();
+        let mut options_done = false;
+        while let Some(a) = it.next() {
+            let value = if options_done {
+                None
+            } else if a == "--" {
+                options_done = true;
+                continue;
+            } else if a == "-a" || a == "--algorithm" {
+                Some(it.next().ok_or_else(|| usage(CMD, USAGE))?.as_str())
+            } else if let Some(v) = a.strip_prefix("--algorithm=") {
+                Some(v)
+            } else if let Some(v) = a.strip_prefix("-a").filter(|v| !v.is_empty()) {
+                Some(v)
+            } else if a.starts_with('-') && a != "-" {
+                return Err(usage(CMD, format!("invalid option '{a}'")));
+            } else {
+                None
+            };
+            match value {
+                Some(v) => {
+                    algo = Algo::parse(v).ok_or_else(|| {
+                        usage(
+                            CMD,
+                            format!("unknown algorithm '{v}' (use {})", Algo::NAMES),
+                        )
+                    })?;
+                }
+                None => paths.push(a.clone()),
+            }
+        }
+        if paths.is_empty() {
+            return Err(usage(CMD, USAGE));
+        }
+        let mut failures = Vec::new();
+        for arg in &paths {
+            let result = self.expand(CMD, arg).and_then(|found| {
+                for path in found {
+                    let hex = self.sum_one(&path, algo)?;
+                    writeln!(out, "{hex}  {}", display_str(&path)).map_err(|e| io_fail(CMD, e))?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => {}
+                Err(f) if !f.is_interrupted() && !f.is_pipe_closed() => {
+                    writeln!(err, "{f}").map_err(|e| io_fail(CMD, e))?;
+                    failures.push(failure_text(CMD, &f));
+                }
+                Err(f) => return Err(f),
+            }
+        }
+        fail_summary(CMD, &failures, err)
+    }
+
+    fn sum_one(&mut self, path: &str, algo: Algo) -> CmdResult<String> {
+        const CMD: &str = "sum";
+        let stack = self.resolve(path, true).ctx(CMD, path)?;
+        let node = last_node(&stack).clone();
+        match node.attr.ftype {
+            FileType::Regular => {}
+            FileType::Directory => {
+                return Err(CmdFailure::from_error(CMD, path, Error::Nfs(Status::IsDir)));
+            }
+            _ => return Err(CmdFailure::new(CMD, Some(path), "not a regular file")),
+        }
+        self.remote_digest(&display_str(path), &node.fh, node.attr.size, None, algo)
+            .ctx(CMD, path)
     }
 
     /// Streams `fh` from `start` for `len` bytes (or to EOF when `None`),
@@ -570,10 +854,24 @@ impl Session {
                 display_path(target)
             )));
         }
+        if opts.resume && start > 0 {
+            self.check_tail(fh, &mut file, target, start)?;
+        }
         let started = Instant::now();
-        let delivered = match self.receive(label, fh, &mut file, target, start, size) {
-            Ok(n) => n,
-            Err(e) => {
+        let received = self.receive_verified(label, fh, &mut file, target, start, size, opts);
+        let (delivered, verified) = match received {
+            Ok(r) => r,
+            Err(Failed::Mismatch(e)) => {
+                drop(file);
+                // The data on disk is not what the server holds: never keep
+                // it for a later -c. A partial file the user had under the
+                // final name is left alone.
+                if !in_place && fs::remove_file(target).is_ok() {
+                    let _ = writeln!(err, "nfsc: get: removed {}", display_path(target));
+                }
+                return Err(e);
+            }
+            Err(Failed::Transfer(e)) => {
                 drop(file);
                 if opts.resume {
                     let _ = writeln!(
@@ -620,9 +918,12 @@ impl Session {
             }
             sync_parent(&dest);
         }
+        let verified = verified
+            .map(|hex| format!(", verified {} {hex}", Algo::Sha256.name()))
+            .unwrap_or_default();
         writeln!(
             err,
-            "getting file {label} of size {size} as {} ({}{})",
+            "getting file {label} of size {size} as {} ({}{}{verified})",
             display_path(path),
             rate(delivered, started.elapsed()),
             resumed_note(start, size)
@@ -630,8 +931,119 @@ impl Session {
         .map_err(local_err)
     }
 
+    /// Refuses a resume when the last bytes before `start` in the local file
+    /// differ from the same range on the server: the remote file was replaced
+    /// or the local file is another one, and appending would corrupt it.
+    fn check_tail(
+        &mut self,
+        fh: &FileHandle,
+        file: &mut File,
+        target: &Path,
+        start: u64,
+    ) -> Result<()> {
+        let n = start.min(TAIL_CHECK);
+        let from = start - n;
+        let mut local = vec![0u8; n as usize];
+        file.seek(SeekFrom::Start(from))
+            .and_then(|_| file.read_exact(&mut local))
+            .map_err(|e| local_io("read", target, &e))?;
+        let mut remote = Vec::with_capacity(local.len());
+        self.download(fh, from, Some(n), &mut |chunk: &[u8]| -> Result<()> {
+            remote.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        if remote != local {
+            return Err(Error::Invalid(format!(
+                "{} does not match the remote file in the {n} bytes before offset {start}; \
+                 not resuming (the remote file may have changed; get without -c downloads it again)",
+                display_path(target)
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::receive`], hashing the data when `opts.verify` is set and then
+    /// comparing it with a second read of the server. Returns the bytes
+    /// received and, after a successful check, the hex digest.
+    #[allow(clippy::too_many_arguments)]
+    fn receive_verified(
+        &mut self,
+        label: &str,
+        fh: &FileHandle,
+        file: &mut File,
+        target: &Path,
+        start: u64,
+        size: u64,
+        opts: GetOpts,
+    ) -> std::result::Result<(u64, Option<String>), Failed> {
+        if !opts.verify {
+            let n = self
+                .receive(label, fh, file, target, start, size, None)
+                .map_err(Failed::Transfer)?;
+            return Ok((n, None));
+        }
+        let mut local = Algo::Sha256.hasher();
+        if start > 0 {
+            hash_local(file, target, start, &mut local, &self.interrupt)
+                .map_err(Failed::Transfer)?;
+        }
+        let n = self
+            .receive(label, fh, file, target, start, size, Some(&mut local))
+            .map_err(Failed::Transfer)?;
+        let local = local.hex();
+        let remote = self
+            .remote_digest(
+                &format!("{label} (verify)"),
+                fh,
+                size,
+                Some(size),
+                Algo::Sha256,
+            )
+            .map_err(Failed::Transfer)?;
+        if remote != local {
+            return Err(Failed::Mismatch(Error::Invalid(format!(
+                "verification failed: the downloaded data (sha256 {local}) differs from \
+                 a second read of the server (sha256 {remote})"
+            ))));
+        }
+        Ok((n, Some(local)))
+    }
+
+    /// Hashes the first `len` bytes of a remote file (all of it when `len`
+    /// is `None`), with a progress meter sized for `size` bytes. Not booked
+    /// into tree totals.
+    fn remote_digest(
+        &mut self,
+        label: &str,
+        fh: &FileHandle,
+        size: u64,
+        len: Option<u64>,
+        algo: Algo,
+    ) -> Result<String> {
+        let mut hasher = algo.hasher();
+        let mut meter = Meter::new(self.progress, label, size, 0, None);
+        let mut done = 0u64;
+        let result = self.download(fh, 0, len, &mut |chunk: &[u8]| -> Result<()> {
+            hasher.update(chunk);
+            done += chunk.len() as u64;
+            meter.tick(done);
+            Ok(())
+        });
+        meter.finish(result.is_ok());
+        let n = result?;
+        if let Some(len) = len
+            && n < len
+        {
+            return Err(Error::Invalid(format!(
+                "read of {label} stopped at {n} of {len} bytes"
+            )));
+        }
+        Ok(hasher.hex())
+    }
+
     /// Fills `file` (opened at `target`) from `start` up to `size` bytes and
     /// syncs it. Returns the bytes received.
+    #[allow(clippy::too_many_arguments)]
     fn receive(
         &mut self,
         label: &str,
@@ -640,6 +1052,7 @@ impl Session {
         target: &Path,
         start: u64,
         size: u64,
+        mut hasher: Option<&mut Hasher>,
     ) -> Result<u64> {
         let mut tree = self.tree.take();
         let mut meter = Meter::new(self.progress, label, size, start, tree.as_mut());
@@ -656,6 +1069,9 @@ impl Session {
                 &mut |chunk: &[u8]| -> Result<()> {
                     file.write_all(chunk)
                         .map_err(|e| local_io("write", target, &e))?;
+                    if let Some(h) = hasher.as_deref_mut() {
+                        h.update(chunk);
+                    }
                     done += chunk.len() as u64;
                     meter.tick(done);
                     Ok(())
@@ -678,14 +1094,19 @@ impl Session {
 
     /// Counts the regular files and bytes that [`Self::get_tree`] would
     /// download, applying the same skip rules (unsafe names, loops, depth).
-    /// Listings (with handles and attributes filled in) are kept in
-    /// `scan_cache` so the download does not list each directory twice.
-    fn scan_remote_tree(
+    /// With `walk.cache`, listings (with handles and attributes filled in) are
+    /// kept in `scan_cache` so the download does not list each directory
+    /// twice. With `walk.dirs`, each directory's byte total is recorded under
+    /// `path` (children before their parent), for `du`.
+    pub(super) fn scan_remote_tree(
         &mut self,
         fh: &FileHandle,
         key: (u64, u64),
         ancestors: &mut Vec<(u64, u64)>,
+        path: &str,
+        walk: &mut Walk,
     ) -> Result<(u64, u64)> {
+        interrupt::check(&self.interrupt)?;
         ancestors.push(key);
         let mut entries = self.fs.readdir(fh)?;
         let (mut files, mut bytes) = (0u64, 0u64);
@@ -708,19 +1129,29 @@ impl Session {
                 FileType::Directory => {
                     let k = (attr.fsid, attr.fileid);
                     if !(k.1 != 0 && ancestors.contains(&k)) && ancestors.len() < MAX_TREE_DEPTH {
-                        subdirs.push((entry.handle.clone().expect("filled above"), k));
+                        let child = if walk.dirs.is_some() {
+                            format!("{path}/{}", display_name(&entry.name))
+                        } else {
+                            String::new()
+                        };
+                        subdirs.push((entry.handle.clone().expect("filled above"), k, child));
                     }
                 }
                 _ => {}
             }
         }
-        self.scan_cache.insert(fh.clone(), entries);
-        for (h, k) in subdirs {
-            let (f, b) = self.scan_remote_tree(&h, k, ancestors)?;
+        if walk.cache {
+            self.scan_cache.insert(fh.clone(), entries);
+        }
+        for (h, k, child) in subdirs {
+            let (f, b) = self.scan_remote_tree(&h, k, ancestors, &child, walk)?;
             files += f;
             bytes = bytes.saturating_add(b);
         }
         ancestors.pop();
+        if let Some(dirs) = &mut walk.dirs {
+            dirs.push((path.to_string(), bytes));
+        }
         Ok((files, bytes))
     }
 
@@ -837,16 +1268,17 @@ impl Session {
 
     /// Uploads one local file as `name` in `dir`, replacing any existing file
     /// unless `resume` is set, in which case the remote file is continued from
-    /// its current size.
+    /// its current size. With `no_clobber` an existing remote name is skipped.
     fn put_file(
         &mut self,
         local: &Path,
         meta: &Metadata,
         dir: &FileHandle,
         name: &[u8],
-        resume: bool,
+        opts: PutOpts,
         err: &mut dyn Write,
     ) -> Result<()> {
+        let resume = opts.resume;
         let mut file = File::open(local).map_err(local_err)?;
         let size = meta.len();
         let mode = meta.permissions().mode() & 0o7777;
@@ -856,6 +1288,13 @@ impl Session {
             Err(Error::Nfs(Status::NoEnt)) => None,
             Err(e) => return Err(e),
         };
+        if opts.no_clobber && existing.is_some() {
+            return writeln!(
+                err,
+                "nfsc: put: skipping {label}: it exists on the server (-n)"
+            )
+            .map_err(local_err);
+        }
         let (fh, start, attrs) = match existing {
             Some((fh, attr)) => {
                 if attr.ftype == FileType::Directory {
@@ -936,14 +1375,19 @@ impl Session {
         .map_err(local_err)
     }
 
-    /// Uploads a local directory tree. Symlinks and special files are skipped.
+    /// Uploads a local directory tree. Symlinks and special files are skipped,
+    /// as are directories deeper than [`MAX_TREE_DEPTH`]. With `keep_going`, a
+    /// failed entry is reported, added to `failures`, and the walk continues.
+    #[allow(clippy::too_many_arguments)]
     fn put_tree(
         &mut self,
         local: &Path,
         dir: &FileHandle,
         name: &[u8],
-        resume: bool,
+        opts: PutOpts,
         err: &mut dyn Write,
+        failures: &mut Vec<String>,
+        depth: usize,
     ) -> Result<()> {
         let attrs = SetAttr {
             mode: Some(0o755),
@@ -968,18 +1412,45 @@ impl Session {
         for entry in entries {
             let path = entry.path();
             let child = entry.file_name();
-            let meta = entry.metadata().map_err(local_err)?;
-            if meta.is_dir() {
-                self.put_tree(&path, &dir_fh, child.as_bytes(), resume, err)?;
-            } else if meta.is_file() {
-                self.put_file(&path, &meta, &dir_fh, child.as_bytes(), resume, err)?;
-            } else {
-                writeln!(
+            let result = match entry.metadata().map_err(local_err) {
+                Err(e) => Err(e),
+                Ok(meta) if meta.is_dir() => {
+                    if depth + 1 >= MAX_TREE_DEPTH {
+                        writeln!(
+                            err,
+                            "nfsc: put: skipping {}: directory tree is too deep",
+                            display_path(&path)
+                        )
+                        .map_err(local_err)
+                    } else {
+                        self.put_tree(
+                            &path,
+                            &dir_fh,
+                            child.as_bytes(),
+                            opts,
+                            err,
+                            failures,
+                            depth + 1,
+                        )
+                    }
+                }
+                Ok(meta) if meta.is_file() => {
+                    self.put_file(&path, &meta, &dir_fh, child.as_bytes(), opts, err)
+                }
+                Ok(_) => writeln!(
                     err,
                     "nfsc: put: skipping {} (not a regular file or directory)",
                     display_path(&path)
                 )
-                .map_err(local_err)?;
+                .map_err(local_err),
+            };
+            if let Err(e) = result {
+                if !opts.keep_going || interrupt::is_interrupt(&e) {
+                    return Err(e);
+                }
+                let what = format!("{}: {}", display_path(&path), display_str(&e.to_string()));
+                writeln!(err, "nfsc: put: {what}").map_err(local_err)?;
+                failures.push(what);
             }
         }
         Ok(())
