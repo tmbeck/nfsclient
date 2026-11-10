@@ -173,3 +173,31 @@ fn rng_xid(b: &[u8]) -> u32 {
     }
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
+
+/// A type far larger in memory (256 KiB) than its 4 bytes on the wire.
+/// Decodes from a zero word; any other word is an error.
+struct Big(#[allow(dead_code)] [u8; 1 << 18]);
+
+impl Unpack for Big {
+    fn unpack(d: &mut nfsc::xdr::Decoder<'_>) -> nfsc::error::Result<Self> {
+        match d.get_u32()? {
+            0 => Ok(Big([0; 1 << 18])),
+            w => Err(nfsc::error::Error::Xdr(format!("bad word {w}"))),
+        }
+    }
+}
+
+#[test]
+fn hostile_array_count_does_not_preallocate_per_element_memory() {
+    // 4M elements claimed with 16 MiB of data behind the count, so the count
+    // passes the "4 bytes per element" check. Reserving capacity for all of
+    // them would ask for 1 TiB and abort; the decoder must instead fail
+    // cleanly at element 3.
+    let n: u32 = 4 << 20;
+    let mut buf = vec![0u8; 4 + 4 * n as usize];
+    buf[..4].copy_from_slice(&n.to_be_bytes());
+    buf[4 + 3 * 4..4 + 4 * 4].copy_from_slice(&1u32.to_be_bytes());
+    let mut d = nfsc::xdr::Decoder::new(&buf);
+    let r = d.get_array::<Big>();
+    assert!(matches!(r, Err(nfsc::error::Error::Xdr(_))));
+}

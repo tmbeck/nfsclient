@@ -10,6 +10,17 @@ use crate::error::{Error, Result};
 /// hostile length prefix from making us allocate gigabytes.
 pub const MAX_ITEM_LEN: usize = 64 * 1024 * 1024;
 
+/// Most memory reserved up front for a decoded array. The element count comes
+/// from the peer and is only bounded by the bytes left (4 per element), while
+/// a decoded element can be far larger in memory than on the wire; past this
+/// the vector grows as elements actually decode.
+const MAX_ARRAY_PREALLOC: usize = 64 * 1024;
+
+/// Initial capacity for an array of `n` elements of `T`.
+fn array_prealloc<T>(n: usize) -> usize {
+    n.min(MAX_ARRAY_PREALLOC / std::mem::size_of::<T>().max(1))
+}
+
 #[inline]
 fn pad_len(n: usize) -> usize {
     (4 - (n % 4)) % 4
@@ -238,7 +249,7 @@ impl<'a> Decoder<'a> {
                 "array count {n} exceeds remaining data"
             )));
         }
-        let mut v = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(array_prealloc::<T>(n));
         for _ in 0..n {
             v.push(T::unpack(self)?);
         }
@@ -380,6 +391,15 @@ tuple!(A, B, C, D);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_prealloc_is_bounded_in_bytes() {
+        assert_eq!(array_prealloc::<u32>(10), 10);
+        assert_eq!(array_prealloc::<u32>(usize::MAX), MAX_ARRAY_PREALLOC / 4);
+        assert_eq!(array_prealloc::<[u8; 4096]>(1 << 20), 16);
+        assert_eq!(array_prealloc::<[u8; 1 << 20]>(1 << 20), 0);
+        assert_eq!(array_prealloc::<()>(7), 7);
+    }
 
     #[test]
     fn ints_big_endian() {

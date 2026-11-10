@@ -116,7 +116,6 @@ pub struct RpcClient {
     vers: u32,
     auth: Auth,
     next_xid: u32,
-    privileged: bool,
     timeout: Duration,
     /// Xids sent over TCP whose replies have not been read yet.
     pending: HashSet<u32>,
@@ -129,14 +128,13 @@ impl RpcClient {
     /// Honors `opts.port_mode`; when `Auto` falls back, a warning is printed to stderr
     /// once per process.
     pub fn connect(addr: SocketAddr, prog: u32, vers: u32, opts: &RpcOptions) -> Result<Self> {
-        let (inner, privileged) = transport::Transport::connect(addr, opts)?;
+        let (inner, _privileged) = transport::Transport::connect(addr, opts)?;
         Ok(Self {
             inner,
             prog,
             vers,
             auth: opts.auth.clone(),
             next_xid: transport::initial_xid(),
-            privileged,
             timeout: opts.timeout,
             pending: HashSet::new(),
             ready: HashMap::new(),
@@ -168,7 +166,7 @@ impl RpcClient {
             }
             Proto::Tcp => {
                 if let Err(e) = self.inner.send_record(&msg) {
-                    self.discard_outstanding();
+                    self.lose_pending();
                     return Err(e);
                 }
                 self.pending.insert(xid);
@@ -196,6 +194,13 @@ impl RpcClient {
         self.ready.clear();
     }
 
+    /// The connection failed: calls still waiting for a reply are lost and
+    /// their `recv_reply` fails, but replies that already arrived (buffered in
+    /// `ready`) are complete and stay claimable by their own `recv_reply`.
+    fn lose_pending(&mut self) {
+        self.pending.clear();
+    }
+
     /// Number of calls sent whose replies have not been received yet.
     pub fn outstanding(&self) -> usize {
         self.pending.len()
@@ -220,13 +225,13 @@ impl RpcClient {
             let record = match self.inner.recv_record(deadline) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.discard_outstanding();
+                    self.lose_pending();
                     return Err(e);
                 }
             };
             if record.len() < 4 {
                 self.inner.reset();
-                self.discard_outstanding();
+                self.lose_pending();
                 return Err(Error::Protocol(format!(
                     "reply record of {} bytes",
                     record.len()
@@ -249,9 +254,10 @@ impl RpcClient {
         self.call(0, &())
     }
 
-    /// Whether the local source port is reserved (<1024).
+    /// Whether the local source port is reserved (<1024). After a silent TCP
+    /// reconnect this describes the new connection.
     pub fn is_privileged(&self) -> bool {
-        self.privileged
+        self.inner.is_privileged()
     }
 
     pub fn program(&self) -> (u32, u32) {
