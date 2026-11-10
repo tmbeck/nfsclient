@@ -95,6 +95,63 @@ testenv/up.sh ganesha
 testenv/run-live.sh "$NFSC_TESTENV"
 ```
 
+## Chaos and soak tests (`just soak`)
+
+`tests/soak_live.rs` proves that long transfers survive network faults and
+server restarts against the real servers, and never return short or wrong
+data. It is skipped unless `NFSC_TEST_SOAK=1` and `NFSC_TEST_RW_<SRV>` are
+set; `just soak [MiB] [FILTER]` does both from the env file and runs a release
+build with one test at a time:
+
+```
+just testenv-up
+just soak                 # 1024 MiB, every soak test
+just soak 4096 soak_read  # 4 GiB, read test only
+NFSC_TEST_SOAK_RESTART=1 just soak 1024 soak_server_restart
+```
+
+Each test writes a file with deterministic content (byte `o` is a function of
+a per-file seed and `o`, so every chunk is checked on arrival) directly to the
+RW export, in a `nfsc-soak-<random>` directory that is removed afterwards.
+Transfers then go through `tests/support/chaos_proxy.rs`, a TCP proxy on
+127.0.0.1 that injects, on a seeded random schedule triggered by bytes
+forwarded: connection reset, half-close, stall (longer than the RPC timeout),
+added latency, bandwidth cap, and "server down" (listener closed, connects
+refused). For NFSv3 the client is pointed at 127.0.0.1 with `nfs_port` set to
+the NFS proxy and `mount_port` to a second, fault-free proxy in front of
+mountd; NFSv4 only needs the NFS proxy.
+
+| test                          | what it checks |
+|-------------------------------|----------------|
+| `soak_read_through_chaos`     | `read_stream` to EOF under faults, v3 and v4.0/4.1/4.2 (versions the server lacks are skipped): exact length and content, retries observed, no give-up, within the time budget |
+| `soak_write_through_chaos`    | `write_stream` under faults (v3, v4.1), then a clean direct read verifies size and content |
+| `soak_server_restart`         | readers for every version, throttled to ~30 s, in parallel; one `sudo -n podman restart nfsc-ganesha` a quarter of the way in; all reads complete and verify. Readers go through fault-free proxies, because podman may give the restarted container a **new IP address**; the proxies are pointed at it, like a stable server name. Afterwards run `just testenv-up` to rewrite the env file. Needs `NFSC_TEST_SOAK_RESTART=1`. knfsd is skipped: its export is tmpfs, so a restart loses the file |
+| `soak_cli_get_through_chaos`  | the `nfsc` binary: `shell -c 'get -cV ...'` through the proxy exits 0, and the local file is exact |
+| `soak_cli_interrupt_resume`   | a bandwidth-capped `get -cV` gets SIGINT at ~30% (exit 130, `.nfsc-part` kept and correct), then `get -cV` under faults resumes ("resumed at"), verifies and exits 0 |
+
+A transfer passes when it returns exactly the file (length and every byte),
+within `NFSC_TEST_SOAK_BUDGET_SECS`, with no operation giving up, and with
+evidence of recovery: a retry event (`RetryPolicy::on_retry`) or a reconnect
+seen by the proxy. Pipelined transfers often recover by reconnecting and
+resending without a retry event, so both count.
+
+The knfsd RW export is a 512 MiB tmpfs: when an export has too little free
+space (FSSTAT), the file is shrunk to fit and the test says so.
+
+`soak_live.rs` also has short regression tests (64 MiB, one scripted fault):
+`v3_read_survives_reset_and_down` runs whenever `NFSC_TEST_RW_<SRV>` is set;
+the `bug_v4*` tests are `#[ignore]`d until the NFSv4 recovery bugs they
+describe are fixed (`cargo test --test soak_live bug_ -- --ignored`).
+
+The fault seed is printed; `NFSC_TEST_SOAK_SEED=N` replays it. Other knobs
+(see the top of `tests/soak_live.rs`): `NFSC_TEST_SOAK_VERS`,
+`NFSC_TEST_SOAK_WRITE_VERS`, `NFSC_TEST_SOAK_CLI_VERS`,
+`NFSC_TEST_SOAK_FAULTS` (per transfer, default 8),
+`NFSC_TEST_SOAK_BUDGET_SECS` (default 900), `NFSC_TEST_SOAK_TMPDIR` (local
+downloads), `NFSC_TEST_SOAK_KEEP=1`, `NFSC_TEST_CHAOS_VERBOSE=1` (log each
+fault). The proxy's own self-tests in the same file need no server and run
+with `cargo test`.
+
 ## Caveats
 
 - knfsd needs the host `nfsd` module (`up.sh` loads it). Kernel nfsd here has
