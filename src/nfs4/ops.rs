@@ -348,7 +348,7 @@ pub enum Res {
     Stateid(StateId),
     Open { stateid: StateId, rflags: u32, deleg: Option<StateId> },
     Fh(Vec<u8>),
-    Attr(AttrSet),
+    Attr(Box<AttrSet>),
     Read { eof: bool, data: Vec<u8> },
     Write { count: u32, committed: u32 },
     Verf([u8; 8]),
@@ -451,7 +451,7 @@ impl Unpack for ResOp {
                 skip_change_info(d)?;
                 Res::Empty
             }
-            OP_GETATTR => Res::Attr(d.get()?),
+            OP_GETATTR => Res::Attr(Box::new(d.get()?)),
             OP_GETFH => Res::Fh(d.get_opaque_vec()?),
             OP_READ => {
                 let eof = d.get_bool()?;

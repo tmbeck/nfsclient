@@ -186,10 +186,8 @@ impl Nfs4Backend {
             if !results.is_empty() {
                 results.remove(0);
             }
-            if seq_ok {
-                if let Some(s) = self.session.as_mut() {
-                    s.seq = s.seq.wrapping_add(1);
-                }
+            if let Some(s) = self.session.as_mut().filter(|_| seq_ok) {
+                s.seq = s.seq.wrapping_add(1);
             }
         }
         for r in &results {
@@ -335,9 +333,9 @@ impl Nfs4Backend {
         };
         let srv_read = a.maxread.map(|v| v.min(u64::from(u32::MAX)) as u32).unwrap_or(MAX_IO);
         let srv_write = a.maxwrite.map(|v| v.min(u64::from(u32::MAX)) as u32).unwrap_or(MAX_IO);
-        self.max_read = srv_read.min(MAX_IO).min(chan_resp.saturating_sub(CHAN_OVERHEAD)).max(512);
-        self.max_write = srv_write.min(MAX_IO).min(chan_req.saturating_sub(CHAN_OVERHEAD)).max(512);
-        self.readdir_max = chan_resp.saturating_sub(4096).min(32 * 1024).max(1024);
+        self.max_read = srv_read.min(chan_resp.saturating_sub(CHAN_OVERHEAD)).clamp(512, MAX_IO);
+        self.max_write = srv_write.min(chan_req.saturating_sub(CHAN_OVERHEAD)).clamp(512, MAX_IO);
+        self.readdir_max = chan_resp.saturating_sub(4096).clamp(1024, 32 * 1024);
         self.root = cur;
         Ok(())
     }
@@ -381,12 +379,14 @@ impl Nfs4Backend {
             // Never got as far as establishing client state.
             return;
         }
-        for sid in self.opens.drain() {
-            let _ = self.send(vec![Op::Close { seqid: self.open_seqid, stateid: sid }], true);
+        for (fh, sid) in self.opens.drain() {
+            let seqid = self.open_seqid;
+            let _ = self.send(vec![Op::Putfh(fh.0.clone()), Op::Close { seqid, stateid: sid }], true);
         }
         if self.minor >= 1 {
-            if let Some(s) = self.session.take() {
-                let _ = self.send(vec![Op::DestroySession(s.id)], true);
+            if let Some(id) = self.session.as_ref().map(|s| s.id) {
+                let _ = self.send(vec![Op::DestroySession(id)], true);
+                self.session = None;
             }
             let _ = self.send(vec![Op::DestroyClientid(self.clientid)], false);
         }
