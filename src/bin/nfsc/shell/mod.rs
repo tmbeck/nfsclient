@@ -18,11 +18,12 @@ macro_rules! shell_summary {
         "  ls [-l] [path]               list (alias dir); * ? match in the last component
   cd [path] | pwd | lcd [path] remote cwd (/ is the export root) | local cwd
   stat path.. | cat path       attributes | file to stdout
-  get [-rckn] remote [local]   download (-r tree, -c resume, -k keep going,
-                               -n no clobber; local - is stdout)
-  put [-r] [-c] local [remote] upload (-r tree, -c resume)
-  mkdir rm rmdir mv ln [-s]    change the tree (rm: files only)
-  chmod mode path.. | chown uid[:gid] path.. | df [path]
+  get [-rcknV] remote.. [loc]  download (-r tree, -c resume, -k keep going,
+                               -n no clobber, -V verify; local - is stdout)
+  put [-rckn] local.. [remote] upload (flags as get; local globs expand)
+  sum [-a alg] path..          sha256 (or sha512) checksums, like sha256sum
+  mkdir rm rmdir mv ln [-s]    change the tree (rm -r: a whole tree)
+  chmod mode path.. | chown uid[:gid] path.. | df [path] | du [-sh] [path..]
   help [cmd] | exit"
     };
 }
@@ -38,6 +39,7 @@ pub const CLI_HELP: &str = concat!(
      More: 'help <cmd>' in the shell; global options: nfsc --help"
 );
 
+mod checksum;
 mod complete;
 mod format;
 mod interrupt;
