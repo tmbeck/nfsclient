@@ -357,6 +357,68 @@ pub trait Filesystem {
 
     /// Release server state (UMNT, CLOSE/DESTROY_SESSION, ...). Best effort.
     fn disconnect(&mut self) -> Result<()>;
+
+    /// Bulk read: deliver bytes from `offset` to EOF (or `len` bytes, whichever
+    /// comes first) to `sink`, in order, in chunks of any size. Returns the
+    /// number of bytes delivered. An error from `sink` aborts the transfer and
+    /// is returned. Backends may override this to keep several READs in flight.
+    fn read_stream(
+        &mut self,
+        fh: &FileHandle,
+        offset: u64,
+        len: Option<u64>,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        let mut pos = offset;
+        let end = len.map(|l| offset.saturating_add(l));
+        loop {
+            let want = match end {
+                Some(e) if pos >= e => break,
+                Some(e) => (e - pos).min(self.max_read() as u64) as u32,
+                None => self.max_read(),
+            };
+            let (data, eof) = self.read(fh, pos, want)?;
+            if !data.is_empty() {
+                sink(&data)?;
+                pos += data.len() as u64;
+            }
+            if eof || data.is_empty() {
+                break;
+            }
+        }
+        Ok(pos - offset)
+    }
+
+    /// Bulk write: repeatedly call `source` to fill a buffer and write it at
+    /// increasing offsets starting at `offset`, until `source` returns 0.
+    /// Returns bytes written. Data must be durable when this returns Ok
+    /// (backends may use UNSTABLE writes plus a final COMMIT, and may keep
+    /// several WRITEs in flight).
+    fn write_stream(
+        &mut self,
+        fh: &FileHandle,
+        offset: u64,
+        source: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+    ) -> Result<u64> {
+        let mut buf = vec![0u8; self.max_write() as usize];
+        let mut pos = offset;
+        loop {
+            let n = source(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let mut done = 0;
+            while done < n {
+                let w = self.write(fh, pos, &buf[done..n])? as usize;
+                if w == 0 {
+                    return Err(crate::error::Error::Protocol("server accepted a 0-byte write".into()));
+                }
+                done += w;
+                pos += w as u64;
+            }
+        }
+        Ok(pos - offset)
+    }
 }
 
 /// Options for connecting a backend.
