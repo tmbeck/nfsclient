@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+### Changed
+
+### Fixed
+
 ## [1.0.0] - 2026-11-09
 
 First release.
@@ -58,3 +66,8 @@ First release.
 - UDP and NFSv2 transfers are not pipelined.
 - Downloaded file modes are taken from the server (minus setuid/setgid/sticky)
   without applying the local umask.
+
+<!-- TODO: once a remote exists, replace REPO_URL and uncomment:
+[Unreleased]: REPO_URL/compare/v1.0.0...HEAD
+[1.0.0]: REPO_URL/releases/tag/v1.0.0
+-->

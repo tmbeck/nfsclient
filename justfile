@@ -29,8 +29,17 @@ lint:
 fmt:
     cargo fmt
 
-# Everything CI runs
-ci: lint test
+# Rustdoc with warnings denied
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# Build and test with the minimum supported Rust version (needs rustup)
+msrv:
+    cargo +1.85 build --locked --all-targets
+    cargo +1.85 test --locked
+
+# Everything CI runs (except msrv and cargo-deny)
+ci: lint doc test
 
 # Install nfsc into ~/.cargo/bin
 install:

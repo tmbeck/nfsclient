@@ -58,7 +58,11 @@ The test environment is described in [`testenv/README.md`](testenv/README.md).
 
 ## Install
 
-Requires Rust 1.85 or newer (edition 2024).
+Prebuilt Linux binaries (x86_64 glibc and musl, aarch64 musl) with SHA-256
+checksums are attached to each release.
+
+Once published to crates.io, `cargo install nfsc` works too. To build from a
+checkout (requires Rust 1.85 or newer, edition 2024):
 
 ```sh
 cargo install --path .
