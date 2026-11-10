@@ -46,6 +46,55 @@ v4.2 (`nolock`, under `$TMPDIR`), verifies the RO manifest, confirms the RO
 mount refuses writes, and writes and deletes a file on the RW mount. A version
 the server does not offer is reported as SKIP.
 
+## Live test suites (`run-live.sh`)
+
+`run-live.sh` runs every live suite against the servers in an env file:
+
+```
+testenv/run-live.sh [--sudo] [--no-lease] [ENV_FILE]
+```
+
+`ENV_FILE` defaults to `$NFSC_TESTENV`. The script parses the file (it does
+not source it) and maps the keys onto each suite's variables:
+
+| env file key                   | used as                                                        |
+|--------------------------------|----------------------------------------------------------------|
+| `NFSC_TEST_RW_<SRV>`           | `NFSC_TEST_RW` for `nfs3_live_rw`, one run per server; `NFSC_TEST_RW_KNFSD` / `_GANESHA` for `nfs4_live_rw` |
+| `NFSC_TEST_RO_<SRV>`           | `NFSC_TEST_RO` for `mount_live`, `nfs3_live_ro`, `nfs4_live_ro`, one run per server |
+| `NFSC_TEST_FIXTURES_SHA256`    | `NFSC_TEST_RO_MANIFEST`, for local servers only                |
+| `NFSC_TEST_ADDR_<SRV>`         | `NFSC_TEST_HOST` for `portmap_live`, `rpc_live`, `cli_rpcinfo_live` |
+
+The server names come from the `NFSC_TEST_ADDR_<SRV>` keys. Variables that can
+also be given in the environment (environment wins):
+
+- `NFSC_TEST_RO_EXTERNAL=host:/export`: one extra read-only export, such as a
+  NAS. Only the read-only suites and the portmapper suites run against it. The
+  fixture manifest is not checked, because that tree is not ours.
+- `NFSC_TEST_RO_SECURE=host:/export`: an export that requires reserved source
+  ports. Checked only with `--sudo`.
+- `NFSC_TEST_HOST`: one more portmapper host.
+- `NFSC_TEST_RO_UDP=1`, `NFSC_TEST_RW_UDP=1`: also run the UDP checks.
+
+Other options:
+
+- `--sudo`: build all test binaries first (`cargo test --no-run`), then run
+  `ro_secure_export_port_policy` as root with `sudo`. Everything else runs as
+  the current user. Without `--sudo`, that test is skipped. Reserved ports
+  need root or `CAP_NET_BIND_SERVICE`.
+- `--no-lease`: skip the NFSv4.0 lease test (`lease_renewal_after_idle`),
+  which sleeps for 50 seconds. The default runs it, against the first
+  read-write target.
+
+Each suite is listed with its target. The script exits 0 only if every suite
+passes, and prints a summary at the end.
+
+Example, against the local containers:
+
+```
+testenv/up.sh ganesha
+testenv/run-live.sh "$NFSC_TESTENV"
+```
+
 ## Caveats
 
 - knfsd needs the host `nfsd` module (`up.sh` loads it). Kernel nfsd here has

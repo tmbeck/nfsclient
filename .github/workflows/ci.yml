@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Build library without CLI dependencies
+        run: cargo build --no-default-features
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Live suites are skipped unless NFSC_TEST_* variables are set, which
+      # they are not in CI.
+      - name: Tests (offline)
+        run: cargo test
