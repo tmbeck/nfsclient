@@ -63,6 +63,51 @@ impl Error {
     }
 }
 
+/// NFS4ERR_GRACE: the server is in its grace period after a restart.
+const NFS4ERR_GRACE: u32 = 10013;
+
+impl Error {
+    /// True when the same request may succeed if it is sent again later,
+    /// unchanged: the failure is about the connection or the server's
+    /// momentary state, not about the request.
+    ///
+    /// Retryable:
+    /// - [`Error::Timeout`] (no reply in time);
+    /// - [`Error::Io`] for a lost or refused connection: `ConnectionReset`,
+    ///   `ConnectionRefused`, `ConnectionAborted`, `BrokenPipe`,
+    ///   `NotConnected`, `UnexpectedEof` (peer closed mid-record), `TimedOut`,
+    ///   `WouldBlock` and `Interrupted`;
+    /// - [`Error::Nfs`] with [`Status::Jukebox`](crate::fs::Status::Jukebox)
+    ///   (NFS3ERR_JUKEBOX, NFS4ERR_DELAY) or NFS4ERR_GRACE.
+    ///
+    /// Everything else (NFS statuses such as `NoEnt` or `Stale`, RPC rejects,
+    /// decode and protocol errors, bad input) is permanent for that request.
+    /// Note that a retried non-idempotent call (CREATE, REMOVE, RENAME, ...)
+    /// can report an error caused by its own first attempt; callers decide
+    /// whether a retry is safe.
+    pub fn is_retryable(&self) -> bool {
+        use crate::fs::{NfsVersion, Status};
+        match self {
+            Error::Timeout => true,
+            Error::Io(e) => matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::Interrupted
+            ),
+            Error::Nfs(Status::Jukebox) => true,
+            Error::Nfs(Status::Other(NfsVersion::V4(_), NFS4ERR_GRACE)) => true,
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl fmt::Display for Error {
@@ -125,5 +170,42 @@ impl std::error::Error for Error {
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::{NfsVersion, Status};
+
+    #[test]
+    fn retryable_classification() {
+        let io = |k| Error::Io(io::Error::from(k));
+        for e in [
+            Error::Timeout,
+            io(io::ErrorKind::ConnectionReset),
+            io(io::ErrorKind::ConnectionRefused),
+            io(io::ErrorKind::ConnectionAborted),
+            io(io::ErrorKind::BrokenPipe),
+            io(io::ErrorKind::UnexpectedEof),
+            Error::Nfs(Status::Jukebox),
+            Error::Nfs(Status::Other(NfsVersion::V4(1), 10013)),
+        ] {
+            assert!(e.is_retryable(), "{e:?}");
+        }
+        for e in [
+            io(io::ErrorKind::PermissionDenied),
+            io(io::ErrorKind::NotFound),
+            Error::Nfs(Status::Stale),
+            Error::Nfs(Status::NoEnt),
+            Error::Nfs(Status::Other(NfsVersion::V3, 10013)),
+            Error::Protocol("x".into()),
+            Error::Xdr("x".into()),
+            Error::Rejected(RejectReason::AuthError(5)),
+            Error::Accept(AcceptError::GarbageArgs),
+            Error::Invalid("x".into()),
+        ] {
+            assert!(!e.is_retryable(), "{e:?}");
+        }
     }
 }
