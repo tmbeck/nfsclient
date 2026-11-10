@@ -241,6 +241,7 @@ pub fn rpc_options(g: &Globals, auth: Auth) -> RpcOptions {
         port_mode: g.port_mode.into(),
         timeout: g.timeout,
         auth,
+        ..RpcOptions::default()
     }
 }
 

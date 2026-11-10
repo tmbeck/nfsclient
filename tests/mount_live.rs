@@ -36,6 +36,7 @@ fn opts(proto: Proto) -> RpcOptions {
         port_mode: PortMode::Auto,
         timeout: Duration::from_secs(10),
         auth: Auth::sys_from_process(),
+        ..RpcOptions::default()
     }
 }
 

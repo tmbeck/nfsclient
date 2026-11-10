@@ -88,6 +88,13 @@ pub struct RpcOptions {
     /// Total time to wait for a reply to one call (UDP: across all retransmits).
     pub timeout: Duration,
     pub auth: Auth,
+    /// How the NFS backends retry calls that fail with a retryable error
+    /// (timeouts, dropped or refused connections, NFS3ERR_JUKEBOX /
+    /// NFS4ERR_DELAY, NFS4ERR_GRACE). Plain [`RpcClient::call`] never
+    /// retries; see [`RpcClient::call_retrying`]. Connection setup (portmap,
+    /// MOUNT, the first connect) is not retried either, so a server that is
+    /// down at connect time is reported at once.
+    pub retry: RetryPolicy,
 }
 
 impl Default for RpcOptions {
@@ -97,6 +104,7 @@ impl Default for RpcOptions {
             port_mode: PortMode::Auto,
             timeout: Duration::from_secs(10),
             auth: Auth::None,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -121,6 +129,7 @@ pub struct RpcClient {
     pending: HashSet<u32>,
     /// Replies read ahead of their caller (out of order), keyed by xid.
     ready: HashMap<u32, Vec<u8>>,
+    retry: RetryPolicy,
 }
 
 impl RpcClient {
@@ -138,7 +147,64 @@ impl RpcClient {
             timeout: opts.timeout,
             pending: HashSet::new(),
             ready: HashMap::new(),
+            retry: opts.retry.clone(),
         })
+    }
+
+    /// The retry policy this client was connected with.
+    pub fn retry_policy(&self) -> &RetryPolicy {
+        &self.retry
+    }
+
+    /// Replace the retry policy used by [`RpcClient::call_retrying`].
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.retry = policy;
+    }
+
+    /// [`RpcClient::call`] under the client's [`RetryPolicy`]. `op` names the
+    /// procedure in retry events and in [`Error::GaveUp`].
+    ///
+    /// What is retried, with backoff, until the budget runs out:
+    /// - any retryable error ([`Error::is_retryable`]) when `idempotent`;
+    ///   a lost TCP connection is re-established on the next attempt, and a
+    ///   timed-out call is sent again (with a new xid) on a new connection;
+    /// - for a non-idempotent call, only failures where the server
+    ///   certainly did not execute it: the connection could not be
+    ///   (re)established before sending, or the server answered
+    ///   NFS3ERR_JUKEBOX. A timeout or a connection lost after sending is
+    ///   returned as is, since a resend could repeat an executed
+    ///   CREATE / REMOVE / RENAME and report a misleading error.
+    ///
+    /// Permanent errors are returned at once.
+    pub fn call_retrying<A: Pack + ?Sized, R: Unpack>(
+        &mut self,
+        procedure: u32,
+        args: &A,
+        op: &'static str,
+        idempotent: bool,
+    ) -> Result<R> {
+        let policy = self.retry.clone();
+        let mut retrier = retry::Retrier::new(&policy, op);
+        loop {
+            let (result, sent) = match self.inner.ensure_connected() {
+                Err(e) => (Err(e), false),
+                Ok(()) => (self.call(procedure, args), true),
+            };
+            match result {
+                Ok(v) => {
+                    retrier.succeeded();
+                    return Ok(v);
+                }
+                Err(e) => {
+                    let safe =
+                        idempotent || !sent || matches!(e, Error::Nfs(crate::fs::Status::Jukebox));
+                    if !(safe && e.is_retryable()) {
+                        return Err(e);
+                    }
+                    retrier.backoff(e)?;
+                }
+            }
+        }
     }
 
     /// Perform one call: encode `args`, send, wait for the matching xid, check
@@ -293,4 +359,7 @@ pub const PRIVILEGED_PORT_HINT: &str = "the server may require a reserved source
 pub mod auth;
 pub mod message;
 pub(crate) mod pipeline;
+pub mod retry;
 pub mod transport;
+
+pub use retry::{RetryEvent, RetryHook, RetryPolicy};

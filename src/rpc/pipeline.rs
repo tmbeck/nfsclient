@@ -16,10 +16,17 @@
 //!   backend's retry and session recovery). After a few blocking reads succeed
 //!   the pipeline is tried again; each further failure doubles that count. If
 //!   a blocking read fails too, the transfer ends with an error.
-//! - A failed WRITE request ends the transfer with its error (there is no
-//!   blocking fallback for writes).
-//! - With a length given, READ never returns a silently short result: fewer
-//!   bytes than asked means the server reported EOF, otherwise it is an error.
+//! - A WRITE request that fails with a retryable error (timeout, lost
+//!   connection, JUKEBOX) pauses the pipeline: outstanding replies are
+//!   drained, the failed and drained requests are sent again as blocking
+//!   writes (which carry the backend's retry policy), and pipelining resumes.
+//!   Writes at a fixed offset are idempotent, and the COMMIT verifier check
+//!   still catches data a restarted server lost. Other WRITE errors, or a
+//!   blocking write that fails too, end the transfer with the error.
+//! - READ never returns a silently short result: fewer bytes than asked
+//!   means the server reported EOF. A reply with no data and no EOF is
+//!   retried with blocking reads and is otherwise an error, with or without
+//!   a length.
 
 use std::collections::VecDeque;
 
@@ -46,8 +53,35 @@ pub(crate) trait ReadIo {
     /// Wait for the reply to `tag`: returns (data, eof).
     fn complete(&mut self, tag: Self::Tag) -> Result<(Vec<u8>, bool)>;
 
-    /// A blocking READ with the backend's usual retry and recovery.
+    /// A blocking READ with the backend's usual retry and recovery. It
+    /// should not return an empty reply without EOF (see
+    /// [`read_with_progress`]); the engine treats one as an error.
     fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)>;
+}
+
+/// Run a blocking READ of `count` bytes at `offset` until it makes progress:
+/// a reply with no data and no EOF is retried under `policy` like a
+/// retryable error, and once the budget is spent it fails ([`Error::GaveUp`]
+/// wrapping a protocol error), so callers never mistake it for the end of
+/// the file. Other errors are returned as `read` reports them (it does its
+/// own retrying).
+pub(crate) fn read_with_progress(
+    policy: &crate::rpc::RetryPolicy,
+    offset: u64,
+    count: u32,
+    mut read: impl FnMut() -> Result<(Vec<u8>, bool)>,
+) -> Result<(Vec<u8>, bool)> {
+    let mut retry = crate::rpc::retry::Retrier::new(policy, "READ");
+    loop {
+        let (data, eof) = read()?;
+        if !data.is_empty() || eof || count == 0 {
+            retry.succeeded();
+            return Ok((data, eof));
+        }
+        retry.backoff(Error::Protocol(format!(
+            "READ at {offset} returned no data and no EOF"
+        )))?;
+    }
 }
 
 /// One WRITE pipeline on a backend. Writes are UNSTABLE.
@@ -63,6 +97,14 @@ pub(crate) trait WriteIo {
     /// COMMIT the byte range `offset..offset+count` (count 0 means to the end
     /// of the file). Returns the server's write verifier.
     fn commit(&mut self, offset: u64, count: u32) -> Result<[u8; 8]>;
+
+    /// A blocking UNSTABLE WRITE, used to resend data after a pipelined
+    /// request failed. Backends override it to add their retry policy; the
+    /// default is one plain attempt.
+    fn write_sync(&mut self, offset: u64, data: &[u8]) -> Result<WriteAck> {
+        let tag = self.issue(offset, data)?;
+        self.complete(tag)
+    }
 }
 
 /// The part of a WRITE reply the engine needs.
@@ -174,16 +216,22 @@ pub(crate) fn read_pipelined<I: ReadIo>(
             break;
         }
         if data.is_empty() {
-            // No data and no EOF: the server makes no progress here.
+            // No data and no EOF: the server makes no progress here. Stopping
+            // would hand back a silently short result, with or without a
+            // length. A pipelined reply falls back to blocking reads, which
+            // retry it under the backend's policy; a blocking read that still
+            // makes no progress is an error.
             drain_reads(io, &mut inflight);
-            if let Some(l) = len {
-                // Stopping would hand back a silently short result.
-                return Err(Error::Protocol(format!(
-                    "READ at {off} returned no data before EOF ({} of {l} bytes read)",
-                    delivered - offset
-                )));
+            let err = Error::Protocol(format!(
+                "READ at {off} returned no data before EOF ({} bytes read{})",
+                delivered - offset,
+                len.map(|l| format!(" of {l}")).unwrap_or_default()
+            ));
+            if synced {
+                return Err(err);
             }
-            break;
+            fb.enter(err);
+            continue;
         }
         if synced {
             if fb.sync_succeeded() {
@@ -246,9 +294,14 @@ impl Fallback {
     /// says more: the blocking read's when it is definitive (not retryable, so
     /// the backend's retries did not help and the server gave a real answer),
     /// otherwise the pipelined error that started it all.
+    ///
+    /// A blocking read that gave up after retrying ([`Error::GaveUp`]) or
+    /// was interrupted is definitive too: it says why the transfer ended.
     fn final_error(&mut self, sync: Error) -> Error {
+        let interrupted =
+            matches!(&sync, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted);
         match self.err.take() {
-            Some(first) if sync.is_retryable() => first,
+            Some(first) if sync.is_retryable() && !interrupted => first,
             _ => sync,
         }
     }
@@ -331,8 +384,16 @@ pub(crate) fn write_pipelined<I: WriteIo>(
                     });
                 }
                 Err(e) => {
-                    drain_writes(io, &mut inflight);
-                    return Err(e);
+                    recover_writes(
+                        io,
+                        e,
+                        vec![(off, data)],
+                        &mut inflight,
+                        &mut inflight_bytes,
+                        &mut retained,
+                        &mut retained_bytes,
+                    )?;
+                    continue;
                 }
             }
         }
@@ -362,8 +423,16 @@ pub(crate) fn write_pipelined<I: WriteIo>(
         let ack = match io.complete(flight.tag) {
             Ok(ack) => ack,
             Err(e) => {
-                drain_writes(io, &mut inflight);
-                return Err(e);
+                recover_writes(
+                    io,
+                    e,
+                    vec![(flight.offset, flight.data)],
+                    &mut inflight,
+                    &mut inflight_bytes,
+                    &mut retained,
+                    &mut retained_bytes,
+                )?;
+                continue;
             }
         };
         let n = ack.count as usize;
@@ -390,6 +459,68 @@ pub(crate) fn write_pipelined<I: WriteIo>(
         }
     }
     Ok(pos - offset)
+}
+
+/// A pipelined WRITE failed with `e`. Drain the other outstanding writes
+/// (their replies are discarded), then, if `e` is retryable, send the failed
+/// and drained chunks again as blocking writes, which carry the backend's
+/// retry policy. Rewriting the same bytes at the same offsets is harmless,
+/// and unstable acks are retained for the COMMIT verifier check as usual.
+/// Returns `e` (after draining) when it is not retryable, or the blocking
+/// write's error when that fails too.
+fn recover_writes<I: WriteIo>(
+    io: &mut I,
+    e: Error,
+    mut lost: Vec<(u64, Vec<u8>)>,
+    inflight: &mut VecDeque<Flight<I::Tag>>,
+    inflight_bytes: &mut u64,
+    retained: &mut Vec<Retained>,
+    retained_bytes: &mut u64,
+) -> Result<()> {
+    while let Some(f) = inflight.pop_front() {
+        let _ = io.complete(f.tag);
+        lost.push((f.offset, f.data));
+    }
+    *inflight_bytes = 0;
+    if !e.is_retryable() {
+        return Err(e);
+    }
+    for (off, data) in lost {
+        write_blocking(io, off, data, retained, retained_bytes)?;
+    }
+    Ok(())
+}
+
+/// Write all of `data` at `off` with blocking writes, following short writes.
+fn write_blocking<I: WriteIo>(
+    io: &mut I,
+    mut off: u64,
+    mut data: Vec<u8>,
+    retained: &mut Vec<Retained>,
+    retained_bytes: &mut u64,
+) -> Result<()> {
+    while !data.is_empty() {
+        let ack = io.write_sync(off, &data)?;
+        let n = ack.count as usize;
+        if n == 0 || n > data.len() {
+            return Err(Error::Protocol(format!(
+                "server accepted {n} of {} bytes at offset {off}",
+                data.len()
+            )));
+        }
+        let rest = data.split_off(n);
+        if !ack.durable {
+            *retained_bytes += n as u64;
+            retained.push(Retained {
+                offset: off,
+                data,
+                verf: ack.verf,
+            });
+        }
+        off += n as u64;
+        data = rest;
+    }
+    Ok(())
 }
 
 /// Fill `buf` from `source` until it is full or the source reports end (0).
@@ -464,6 +595,8 @@ mod tests {
         sync_err: Option<fn() -> Error>,
         /// A READ at this offset returns no data and no EOF.
         stall_at: Option<u64>,
+        /// How many READs at `stall_at` stall (0 = all of them).
+        stall_times: usize,
         /// Requests issued (pipelined) after the first blocking read.
         issued_after_sync: usize,
     }
@@ -485,6 +618,7 @@ mod tests {
                 pipe_err: || Error::Timeout,
                 sync_err: None,
                 stall_at: None,
+                stall_times: 0,
                 issued_after_sync: 0,
             }
         }
@@ -492,6 +626,10 @@ mod tests {
         fn serve(&mut self, offset: u64, count: u32) -> (Vec<u8>, bool) {
             self.served += 1;
             if self.stall_at == Some(offset) {
+                if self.stall_times == 1 {
+                    self.stall_at = None;
+                }
+                self.stall_times = self.stall_times.saturating_sub(1);
                 return (Vec::new(), false);
             }
             let size = self.data.len() as u64;
@@ -754,11 +892,59 @@ mod tests {
             assert_eq!(out, data[..4000], "window {window}");
             assert!(fake.pending.is_empty());
         }
-        // Without a length the stream just ends there (unchanged behaviour).
-        let mut fake = FakeReads::new(data.clone());
-        fake.stall_at = Some(4000);
-        let (r, _) = run_read(&mut fake, 0, None, 1000, 8);
-        assert_eq!(r.unwrap(), 4000);
+        // Without a length it is an error too, never a silently short Ok.
+        for window in [1usize, 8] {
+            let mut fake = FakeReads::new(data.clone());
+            fake.stall_at = Some(4000);
+            let (r, out) = run_read(&mut fake, 0, None, 1000, window);
+            assert!(
+                matches!(r, Err(Error::Protocol(_))),
+                "window {window}: {r:?}"
+            );
+            assert_eq!(out, data[..4000], "window {window}");
+            assert!(fake.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_reply_is_retried_by_blocking_reads() {
+        let data = pattern(10_000);
+        for len in [None, Some(10_000)] {
+            let mut fake = FakeReads::new(data.clone());
+            fake.stall_at = Some(4000);
+            fake.stall_times = 1;
+            let (r, out) = run_read(&mut fake, 0, len, 1000, 8);
+            assert_eq!(r.unwrap(), 10_000, "len {len:?}");
+            assert_eq!(out, data);
+        }
+    }
+
+    #[test]
+    fn read_with_progress_retries_then_gives_up() {
+        let policy = crate::rpc::RetryPolicy {
+            budget: std::time::Duration::from_millis(200),
+            initial_backoff: std::time::Duration::from_millis(10),
+            ..crate::rpc::RetryPolicy::default()
+        };
+        let mut n = 0;
+        let r = read_with_progress(&policy, 7, 100, || {
+            n += 1;
+            Ok(if n < 3 {
+                (Vec::new(), false)
+            } else {
+                (vec![1], false)
+            })
+        });
+        assert_eq!(r.unwrap(), (vec![1], false));
+        assert_eq!(n, 3);
+        let r = read_with_progress(&policy, 7, 100, || Ok((Vec::new(), false)));
+        match r {
+            Err(Error::GaveUp { last, .. }) => assert!(matches!(*last, Error::Protocol(_))),
+            other => panic!("expected GaveUp, got {other:?}"),
+        }
+        // EOF with no data is a normal end, not a stall.
+        let r = read_with_progress(&policy, 7, 100, || Ok((Vec::new(), true)));
+        assert_eq!(r.unwrap(), (Vec::new(), true));
     }
 
     /// READ over a real RPC client against a loopback TCP server that drops
@@ -882,6 +1068,7 @@ mod tests {
                 port_mode: PortMode::Unprivileged,
                 timeout: Duration::from_secs(5),
                 auth: Auth::None,
+                ..RpcOptions::default()
             };
             let mut io = RpcReads(RpcClient::connect(addr, PROG, 1, &opts).unwrap());
             let mut out = Vec::new();
@@ -948,6 +1135,10 @@ mod tests {
         pending: VecDeque<usize>,
         datas: Vec<Vec<u8>>,
         max_outstanding: usize,
+        /// Requests (by tag) whose reply is this error instead of an ack.
+        fail_tags: Vec<(usize, fn() -> Error)>,
+        /// Inside `write_sync`: injected failures apply to pipelined writes only.
+        in_sync: bool,
     }
 
     impl FakeWrites {
@@ -965,6 +1156,8 @@ mod tests {
                 pending: VecDeque::new(),
                 datas: Vec::new(),
                 max_outstanding: 0,
+                fail_tags: Vec::new(),
+                in_sync: false,
             }
         }
 
@@ -989,7 +1182,13 @@ mod tests {
         fn complete(&mut self, tag: usize) -> Result<WriteAck> {
             let offset = self.pending.pop_front().expect("reply without request") as u64;
             // Replies in request order: tags were issued in order, so the front matches.
-            let _ = tag;
+            if let Some((_, err)) = self
+                .fail_tags
+                .iter()
+                .find(|(t, _)| *t == tag && !self.in_sync)
+            {
+                return Err(err());
+            }
             let mut data = self.datas[tag].clone();
             if self.short_every > 0 && (tag + 1).is_multiple_of(self.short_every) && data.len() > 1
             {
@@ -1017,6 +1216,13 @@ mod tests {
             self.commits += 1;
             self.flush_cache();
             Ok(self.verf)
+        }
+
+        fn write_sync(&mut self, offset: u64, data: &[u8]) -> Result<WriteAck> {
+            self.in_sync = true;
+            let r = self.issue(offset, data).and_then(|t| self.complete(t));
+            self.in_sync = false;
+            r
         }
     }
 
@@ -1109,6 +1315,35 @@ mod tests {
         run_write(&mut fake, 0, &data, 1000, 4).unwrap();
         assert_eq!(fake.disk, data);
         assert_eq!(fake.commits, 0);
+    }
+
+    #[test]
+    fn failed_writes_are_resent_with_blocking_writes() {
+        let data = pattern(20_000);
+        for window in [1usize, 4, 8] {
+            let mut fake = FakeWrites::new();
+            fake.fail_tags = vec![
+                (3, || Error::Timeout),
+                (4, || Error::Nfs(crate::fs::Status::Jukebox)),
+                (9, || Error::Io(std::io::ErrorKind::ConnectionReset.into())),
+            ];
+            let n = run_write(&mut fake, 0, &data, 1000, window).unwrap();
+            assert_eq!(n, data.len() as u64);
+            assert_eq!(fake.disk, data, "window {window}");
+            assert!(fake.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn permanent_write_error_ends_the_transfer() {
+        let mut fake = FakeWrites::new();
+        fake.fail_tags = vec![(3, || Error::Nfs(crate::fs::Status::NoSpc))];
+        let r = run_write(&mut fake, 0, &pattern(20_000), 1000, 4);
+        assert!(
+            matches!(r, Err(Error::Nfs(crate::fs::Status::NoSpc))),
+            "{r:?}"
+        );
+        assert!(fake.pending.is_empty(), "outstanding writes were drained");
     }
 
     #[test]

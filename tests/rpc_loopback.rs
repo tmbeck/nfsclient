@@ -125,6 +125,7 @@ fn opts(proto: Proto, timeout: Duration) -> RpcOptions {
         port_mode: PortMode::Unprivileged,
         timeout,
         auth: Auth::None,
+        ..RpcOptions::default()
     }
 }
 

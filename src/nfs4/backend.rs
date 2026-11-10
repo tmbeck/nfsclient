@@ -11,6 +11,7 @@ use crate::fs::{
     Attr, ConnectOptions, Connected, CreateMode, DirEntry, FileHandle, FileType, Filesystem,
     FsStat, NfsVersion, SetAttr,
 };
+use crate::rpc::retry::Retrier;
 use crate::rpc::{RpcClient, RpcOptions};
 
 use super::compound::{CompoundArgs, CompoundRes, PROC_COMPOUND};
@@ -194,6 +195,88 @@ pub(super) fn seqid_advances(status: u32) -> bool {
             | code::NOFILEHANDLE
             | code::MOVED
     )
+}
+
+/// Recovery step [`Nfs4Backend::exec`] must take before its next attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fix {
+    None,
+    /// Open a new TCP connection and re-establish client state.
+    Reconnect,
+    /// Re-establish the client ID and session on the current connection.
+    Recover,
+    /// New session on the existing client ID, else a full recovery.
+    RecoverSession,
+}
+
+/// Failures that mean the connection (not the request) is broken: the next
+/// attempt needs a new connection.
+fn broken_connection(e: &Error) -> bool {
+    matches!(e, Error::Io(_) | Error::Timeout | Error::Protocol(_))
+}
+
+/// Whether resending `ops` has the same effect as sending them once: only
+/// lookups, attribute reads, READ, READDIR, READLINK, and WRITE / COMMIT
+/// (the same bytes at the same offset; COMMIT verifiers catch lost unstable
+/// data). OPEN, CLOSE, SETATTR and the namespace operations are not.
+pub(super) fn idempotent(ops: &[Op]) -> bool {
+    ops.iter().all(|op| {
+        matches!(
+            op,
+            Op::Sequence { .. }
+                | Op::Putrootfh
+                | Op::Putfh(_)
+                | Op::Getfh
+                | Op::Savefh
+                | Op::Lookup(_)
+                | Op::Lookupp
+                | Op::Getattr(_)
+                | Op::Readlink
+                | Op::Read { .. }
+                | Op::Write { .. }
+                | Op::Commit { .. }
+                | Op::Readdir { .. }
+                | Op::Renew(_)
+        )
+    })
+}
+
+/// A name for the compound in retry events and errors: its first operation
+/// other than the file handle plumbing (PUTFH, GETFH, ...).
+pub(super) fn compound_name(ops: &[Op]) -> &'static str {
+    ops.iter()
+        .find_map(|op| {
+            Some(match op {
+                Op::Putrootfh | Op::Putfh(_) | Op::Getfh | Op::Savefh => return None,
+                Op::Sequence { .. } => "SEQUENCE",
+                Op::ExchangeId { .. } => "EXCHANGE_ID",
+                Op::CreateSession { .. } => "CREATE_SESSION",
+                Op::DestroySession(_) => "DESTROY_SESSION",
+                Op::DestroyClientid(_) => "DESTROY_CLIENTID",
+                Op::ReclaimComplete => "RECLAIM_COMPLETE",
+                Op::Setclientid { .. } => "SETCLIENTID",
+                Op::SetclientidConfirm { .. } => "SETCLIENTID_CONFIRM",
+                Op::Renew(_) => "RENEW",
+                Op::Lookup(_) => "LOOKUP",
+                Op::Lookupp => "LOOKUPP",
+                Op::Getattr(_) => "GETATTR",
+                Op::Setattr { .. } => "SETATTR",
+                Op::Readlink => "READLINK",
+                Op::Read { .. } => "READ",
+                Op::Write { .. } => "WRITE",
+                Op::Commit { .. } => "COMMIT",
+                Op::Open(_) => "OPEN",
+                Op::OpenConfirm { .. } => "OPEN_CONFIRM",
+                Op::Close { .. } => "CLOSE",
+                Op::DelegReturn(_) => "DELEGRETURN",
+                Op::Create { .. } => "CREATE",
+                Op::Remove(_) => "REMOVE",
+                Op::Rename { .. } => "RENAME",
+                Op::Link(_) => "LINK",
+                Op::Readdir { .. } => "READDIR",
+            })
+        })
+        .unwrap_or("COMPOUND")
 }
 
 /// Whether an NFSv4.0 COMPOUND renews the client's lease when it succeeds:
@@ -397,14 +480,28 @@ impl Nfs4Backend {
         }
     }
 
-    /// Run a sequenced compound with retry and recovery:
-    /// - NFS4ERR_DELAY and NFS4ERR_GRACE: back off and retry (GRACE for a bounded time).
+    /// Run a sequenced compound with retry and recovery, under the
+    /// connection's [`RetryPolicy`](crate::rpc::RetryPolicy) (one time budget
+    /// and backoff for the whole operation, recovery included):
+    /// - NFS4ERR_DELAY and NFS4ERR_GRACE: back off and retry (the server did
+    ///   not execute the failing operation, so this is safe for any compound).
     /// - NFS4ERR_BADSESSION / DEADSESSION: create a new session on the existing
     ///   client ID (so the server keeps our opens), or fully re-establish if
-    ///   that fails; then retry once.
-    /// - Other session / client / lease errors, or a broken connection:
-    ///   reconnect and re-establish the client and session, then retry once.
+    ///   that fails; then retry.
+    /// - Other session / client / lease errors: re-establish the client and
+    ///   session, then retry.
+    /// - A broken connection (I/O error, timeout, garbled reply): reconnect
+    ///   and re-establish, then resend. Compounds that only read (see
+    ///   [`idempotent`]) are resent until the budget runs out; others (OPEN,
+    ///   CREATE, REMOVE, RENAME, SETATTR, ...) are resent at most once,
+    ///   since a repeat of an executed one can fail misleadingly.
     /// - NFS4ERR_BAD_SEQID (4.0): switch to a fresh open-owner and retry once.
+    ///
+    /// The first session / client recovery happens at once, even with
+    /// retries disabled (it is protocol recovery, not a retry); later ones
+    /// back off. Reconnecting and recovery may fail repeatedly while a server
+    /// reboots; those failures are retried under the same budget. When the
+    /// budget runs out the error is [`Error::GaveUp`].
     ///
     /// Local conditions (no free session slot) fail without touching the connection.
     ///
@@ -415,15 +512,41 @@ impl Nfs4Backend {
         F: Fn(&Nfs4Backend) -> Vec<Op>,
     {
         self.maybe_renew();
-        let started = Instant::now();
-        let mut delays = 0u32;
-        let mut recovered = false;
+        let policy = self.opts.retry.clone();
+        let mut retry = Retrier::new(&policy, "COMPOUND");
+        let mut fix = Fix::None;
+        // Session / client recoveries so far; the first one does not back off.
+        let mut recoveries = 0u32;
+        // A non-idempotent compound was already resent after a transport failure.
+        let mut resent = false;
+        let mut new_owner = false;
         loop {
+            if fix != Fix::None {
+                let r = match fix {
+                    Fix::Reconnect => self.reconnect(),
+                    Fix::Recover => self.recover(),
+                    Fix::RecoverSession => self.recover_session(),
+                    Fix::None => Ok(()),
+                };
+                match r {
+                    Ok(()) => fix = Fix::None,
+                    Err(e) if broken_connection(&e) => {
+                        retry.backoff(e)?;
+                        fix = Fix::Reconnect;
+                        continue;
+                    }
+                    Err(e) if e.is_retryable() => {
+                        retry.backoff(e)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             if self.minor >= 1 {
                 match &self.session {
-                    None if !recovered => {
-                        recovered = true;
-                        self.recover()?;
+                    None if recoveries == 0 => {
+                        recoveries += 1;
+                        fix = Fix::Recover;
                         continue;
                     }
                     None => {
@@ -438,49 +561,50 @@ impl Nfs4Backend {
                 }
             }
             let ops = build(&*self);
+            let idem = idempotent(&ops);
+            retry.set_op(compound_name(&ops));
             let res = match self.send(ops, true) {
                 Ok(r) => r,
-                Err(Error::Io(_) | Error::Timeout | Error::Protocol(_)) if !recovered => {
-                    recovered = true;
-                    self.reconnect()?;
+                Err(e) if broken_connection(&e) => {
+                    if !idem {
+                        if resent {
+                            return Err(e);
+                        }
+                        resent = true;
+                    }
+                    retry.backoff(e)?;
+                    fix = Fix::Reconnect;
                     continue;
                 }
                 Err(e) => return Err(e),
             };
             if res.status == code::OK {
+                retry.succeeded();
                 return Ok(res.results);
             }
             match res.status {
-                code::DELAY => {
-                    delays += 1;
-                    if delays > 40 {
-                        return Err(self.status_err(res.status));
-                    }
-                    std::thread::sleep(backoff(delays));
-                }
-                code::GRACE => {
-                    if started.elapsed() > grace_wait(self.lease) {
-                        return Err(self.status_err(res.status));
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                code::BAD_SEQID if self.minor == 0 && !recovered => {
-                    recovered = true;
+                code::DELAY | code::GRACE => retry.backoff(self.status_err(res.status))?,
+                code::BAD_SEQID if self.minor == 0 && !new_owner => {
+                    new_owner = true;
                     self.new_open_owner();
                 }
-                code::BADSESSION | code::DEADSESSION if !recovered => {
-                    recovered = true;
-                    self.recover_session()?;
+                code::BADSESSION | code::DEADSESSION => {
+                    if recoveries > 0 {
+                        retry.backoff(self.status_err(res.status))?;
+                    }
+                    recoveries += 1;
+                    fix = Fix::RecoverSession;
                 }
                 code::STALE_CLIENTID
                 | code::EXPIRED
                 | code::BADSLOT
                 | code::SEQ_MISORDERED
-                | code::BAD_HIGH_SLOT
-                    if !recovered =>
-                {
-                    recovered = true;
-                    self.recover()?;
+                | code::BAD_HIGH_SLOT => {
+                    if recoveries > 0 {
+                        retry.backoff(self.status_err(res.status))?;
+                    }
+                    recoveries += 1;
+                    fix = Fix::Recover;
                 }
                 other => return Err(self.status_err(other)),
             }
@@ -748,7 +872,14 @@ impl ReadIo for V4Reads<'_, '_> {
     }
 
     fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
-        self.be.read(self.fh, offset, count)
+        let policy = self.be.opts.retry.clone();
+        let r = pipeline::read_with_progress(&policy, offset, count, || {
+            self.be.read(self.fh, offset, count)
+        });
+        // Recovery (after a server restart) may have replaced the open state;
+        // later pipelined READs must not use a stale stateid.
+        self.stateid = self.be.stateid_for_io(self.fh, false);
+        r
     }
 }
 
@@ -778,6 +909,35 @@ impl WriteIo for V4Writes<'_, '_> {
     fn complete(&mut self, p: Pending) -> Result<WriteAck> {
         let res = self.be.complete_compound(p)?;
         match body(&res, 1)? {
+            Res::Write {
+                count,
+                committed,
+                verf,
+            } => Ok(WriteAck {
+                count: *count,
+                durable: *committed == FILE_SYNC4,
+                verf: *verf,
+            }),
+            _ => Err(xdr_err("WRITE")),
+        }
+    }
+
+    fn write_sync(&mut self, offset: u64, data: &[u8]) -> Result<WriteAck> {
+        let fh = self.fh;
+        let res = self.be.exec_stateid(fh, true, |sid| {
+            vec![
+                Op::Putfh(fh.0.clone()),
+                Op::Write {
+                    stateid: sid,
+                    offset,
+                    data: data.to_vec(),
+                    stable: UNSTABLE4,
+                },
+            ]
+        });
+        // As for reads: pick up open state re-established by recovery.
+        self.stateid = self.be.stateid_for_io(fh, true);
+        match body(&res?, 1)? {
             Res::Write {
                 count,
                 committed,
@@ -1684,6 +1844,241 @@ mod tests {
             "CLOSE sent after failed OPEN_CONFIRM"
         );
         assert!(be.opens.get(&fh, false).is_none());
+    }
+
+    fn fast_retry(budget: Duration) -> crate::rpc::RetryPolicy {
+        crate::rpc::RetryPolicy {
+            budget,
+            initial_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(100),
+            ..crate::rpc::RetryPolicy::default()
+        }
+    }
+
+    fn with_retry(mut be: Nfs4Backend, policy: crate::rpc::RetryPolicy) -> Nfs4Backend {
+        be.opts.retry = policy.clone();
+        be.rpc.set_retry_policy(policy);
+        be
+    }
+
+    #[test]
+    fn delay_is_retried_until_the_server_answers() {
+        let delay = || compound(code::DELAY, &[(OP_PUTROOTFH, code::DELAY, Vec::new())]);
+        let (addr, calls) = fake_server(vec![
+            delay(),
+            delay(),
+            delay(),
+            compound(code::OK, &[(OP_PUTROOTFH, code::OK, Vec::new())]),
+        ]);
+        let retries = Arc::new(Mutex::new(0u32));
+        let seen = retries.clone();
+        let mut policy = fast_retry(Duration::from_secs(10));
+        policy.on_retry = Some(Arc::new(move |e: &crate::rpc::RetryEvent<'_>| {
+            if let crate::rpc::RetryEvent::Retrying { error, .. } = e {
+                assert!(matches!(error, Error::Nfs(crate::fs::Status::Jukebox)));
+                *seen.lock().unwrap() += 1;
+            }
+        }));
+        let mut be = with_retry(backend(addr, 0), policy);
+        be.exec(|_| vec![Op::Putrootfh]).unwrap();
+        assert_eq!(*calls.lock().unwrap(), 4);
+        assert_eq!(*retries.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn endless_delay_gives_up_when_the_budget_runs_out() {
+        let replies = (0..200)
+            .map(|_| compound(code::DELAY, &[(OP_PUTROOTFH, code::DELAY, Vec::new())]))
+            .collect();
+        let (addr, _) = fake_server(replies);
+        let mut be = with_retry(backend(addr, 0), fast_retry(Duration::from_millis(300)));
+        let started = Instant::now();
+        match be.exec(|_| vec![Op::Putrootfh]) {
+            Err(Error::GaveUp { last, attempts, .. }) => {
+                assert!(matches!(*last, Error::Nfs(crate::fs::Status::Jukebox)));
+                assert!(attempts >= 2);
+            }
+            other => panic!("expected GaveUp, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn zero_budget_returns_delay_at_once() {
+        let (addr, calls) = fake_server(vec![compound(
+            code::DELAY,
+            &[(OP_PUTROOTFH, code::DELAY, Vec::new())],
+        )]);
+        let mut be = with_retry(backend(addr, 0), crate::rpc::RetryPolicy::none());
+        let r = be.exec(|_| vec![Op::Putrootfh]);
+        assert!(
+            matches!(r, Err(Error::Nfs(crate::fs::Status::Jukebox))),
+            "{r:?}"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// Opcode of the first operation in a COMPOUND call message.
+    fn first_opcode(call: &[u8]) -> u32 {
+        let at = |o: usize| u32::from_be_bytes(call[o..o + 4].try_into().unwrap());
+        let mut off = 24;
+        for _ in 0..2 {
+            off += 8 + (at(off + 4) as usize).div_ceil(4) * 4; // cred, verf
+        }
+        off += 4 + (at(off) as usize).div_ceil(4) * 4; // tag
+        at(off + 8) // after minorversion and the op count
+    }
+
+    /// Fake server driven by `handle(first opcode)`: `Some(body)` answers,
+    /// `None` drops the connection and refuses connections for `outage`.
+    /// Returns the address and the first opcode of every call received.
+    fn outage_server(
+        outage: Duration,
+        mut handle: impl FnMut(u32) -> Option<Vec<u8>> + Send + 'static,
+    ) -> (SocketAddr, Arc<Mutex<Vec<u32>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let mut listener = Some(l);
+            loop {
+                let l = match &listener {
+                    Some(l) => l,
+                    None => match TcpListener::bind(addr) {
+                        Ok(l) => listener.insert(l),
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                    },
+                };
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut dropped = false;
+                while let Some(call) = read_record(&mut s) {
+                    let op = first_opcode(&call);
+                    seen.lock().unwrap().push(op);
+                    let Some(body) = handle(op) else {
+                        dropped = true;
+                        break;
+                    };
+                    let mut msg = call[0..4].to_vec();
+                    msg.extend(w(&[1, 0, 0, 0, 0]));
+                    msg.extend(body);
+                    let mut rec = (0x8000_0000u32 | msg.len() as u32).to_be_bytes().to_vec();
+                    rec.extend(msg);
+                    if s.write_all(&rec).is_err() {
+                        break;
+                    }
+                }
+                drop(s);
+                if dropped {
+                    listener = None;
+                    std::thread::sleep(outage);
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    /// SETCLIENTID / SETCLIENTID_CONFIRM replies for a v4.0 recovery.
+    fn setclientid_reply(op: u32) -> Option<Vec<u8>> {
+        match op {
+            OP_SETCLIENTID => {
+                let mut sc = w(&[0, 0x42]);
+                sc.extend_from_slice(&[7; 8]);
+                Some(compound(code::OK, &[(OP_SETCLIENTID, code::OK, sc)]))
+            }
+            OP_SETCLIENTID_CONFIRM => Some(compound(
+                code::OK,
+                &[(OP_SETCLIENTID_CONFIRM, code::OK, Vec::new())],
+            )),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reconnect_is_retried_while_the_server_is_down() {
+        let mut first = true;
+        let (addr, log) = outage_server(Duration::from_millis(700), move |op| {
+            if op == OP_PUTROOTFH {
+                if std::mem::take(&mut first) {
+                    return None;
+                }
+                return Some(compound(code::OK, &[(OP_PUTROOTFH, code::OK, Vec::new())]));
+            }
+            setclientid_reply(op)
+        });
+        let mut be = with_retry(backend(addr, 0), fast_retry(Duration::from_secs(10)));
+        be.clientid = 9;
+        let started = Instant::now();
+        be.exec(|_| vec![Op::Putrootfh])
+            .expect("recovers once the server is back");
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert_eq!(be.clientid, 0x42, "client state re-established");
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                OP_PUTROOTFH,
+                OP_SETCLIENTID,
+                OP_SETCLIENTID_CONFIRM,
+                OP_PUTROOTFH
+            ]
+        );
+    }
+
+    #[test]
+    fn non_idempotent_compound_is_resent_at_most_once() {
+        const OP_REMOVE: u32 = 28;
+        let (addr, log) = outage_server(Duration::from_millis(100), setclientid_reply);
+        let mut be = with_retry(backend(addr, 0), fast_retry(Duration::from_secs(10)));
+        be.clientid = 9;
+        let started = Instant::now();
+        let r = be.exec(|_| vec![Op::Remove(b"x".to_vec())]);
+        assert!(r.is_err(), "{r:?}");
+        assert!(!matches!(r, Err(Error::GaveUp { .. })), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let removes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&o| o == OP_REMOVE)
+            .count();
+        assert_eq!(removes, 2, "original plus one resend");
+    }
+
+    #[test]
+    fn compound_classification() {
+        assert!(idempotent(&[
+            Op::Putfh(vec![1]),
+            Op::Lookup(b"a".to_vec()),
+            Op::Getfh
+        ]));
+        assert!(idempotent(&[
+            Op::Putfh(vec![1]),
+            Op::Read {
+                stateid: ANON_STATEID,
+                offset: 0,
+                count: 1
+            }
+        ]));
+        assert!(!idempotent(&[
+            Op::Putfh(vec![1]),
+            Op::Remove(b"a".to_vec())
+        ]));
+        assert!(!idempotent(&[
+            Op::Putfh(vec![1]),
+            Op::Lookup(b"a".to_vec()),
+            Op::Close {
+                seqid: 1,
+                stateid: ANON_STATEID
+            }
+        ]));
+        assert_eq!(
+            compound_name(&[Op::Putfh(vec![1]), Op::Getattr(vec![1])]),
+            "GETATTR"
+        );
+        assert_eq!(compound_name(&[Op::Putrootfh]), "COMPOUND");
     }
 
     #[test]

@@ -56,13 +56,59 @@ impl Nfs2 {
         })
     }
 
+    /// One call under the connection's retry policy. Only the idempotent
+    /// procedures (see [`idempotent`]) are resent after a timeout or a lost
+    /// connection; the others are retried only when no connection could be
+    /// made to send them on. NFSv2 has no JUKEBOX status.
     fn call<A, R>(&mut self, procedure: u32, args: &A) -> Result<R>
     where
         A: crate::xdr::Pack + ?Sized,
         R: crate::xdr::Unpack,
     {
-        self.rpc.call(procedure, args)
+        self.rpc
+            .call_retrying(procedure, args, proc_name(procedure), idempotent(procedure))
     }
+}
+
+/// Procedure name for retry events and errors.
+fn proc_name(procedure: u32) -> &'static str {
+    match procedure {
+        proto::PROC_NULL => "NULL",
+        PROC_GETATTR => "GETATTR",
+        PROC_SETATTR => "SETATTR",
+        PROC_LOOKUP => "LOOKUP",
+        PROC_READLINK => "READLINK",
+        PROC_READ => "READ",
+        PROC_WRITE => "WRITE",
+        PROC_CREATE => "CREATE",
+        PROC_REMOVE => "REMOVE",
+        PROC_RENAME => "RENAME",
+        PROC_LINK => "LINK",
+        PROC_SYMLINK => "SYMLINK",
+        PROC_MKDIR => "MKDIR",
+        PROC_RMDIR => "RMDIR",
+        PROC_READDIR => "READDIR",
+        PROC_STATFS => "STATFS",
+        _ => "NFSv2 call",
+    }
+}
+
+/// Procedures that may be resent: reads, and WRITE (v2 writes are synchronous
+/// and store the same bytes at the same offset). SETATTR and the namespace
+/// operations are not, since a repeat of an executed one reports a
+/// misleading error.
+fn idempotent(procedure: u32) -> bool {
+    matches!(
+        procedure,
+        proto::PROC_NULL
+            | PROC_GETATTR
+            | PROC_LOOKUP
+            | PROC_READLINK
+            | PROC_READ
+            | PROC_WRITE
+            | PROC_READDIR
+            | PROC_STATFS
+    )
 }
 
 /// Check a name against MAXNAMLEN before it goes on the wire.

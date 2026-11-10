@@ -22,6 +22,7 @@ fn portmap_null_over_tcp_and_udp() {
             port_mode: PortMode::Unprivileged,
             timeout: Duration::from_secs(5),
             auth: Auth::None,
+            ..RpcOptions::default()
         };
         let mut c = RpcClient::connect(addr, 100000, 2, &opts).expect("connect");
         c.null()

@@ -47,6 +47,18 @@ pub enum Error {
     Nfs(crate::fs::Status),
     /// The server does not support the requested NFS version / minor version.
     VersionUnsupported(String),
+    /// A retryable failure persisted until the retry budget
+    /// ([`RetryPolicy::budget`](crate::rpc::RetryPolicy::budget)) ran out.
+    /// `last` is the error of the final attempt. Not itself retryable.
+    GaveUp {
+        /// The operation that was retried (an NFS procedure name such as `READ`).
+        op: &'static str,
+        /// Attempts made, including the first.
+        attempts: u32,
+        /// Time from the first failure until giving up.
+        elapsed: std::time::Duration,
+        last: Box<Error>,
+    },
 }
 
 impl Error {
@@ -76,7 +88,8 @@ impl Error {
     /// - [`Error::Io`] for a lost or refused connection: `ConnectionReset`,
     ///   `ConnectionRefused`, `ConnectionAborted`, `BrokenPipe`,
     ///   `NotConnected`, `UnexpectedEof` (peer closed mid-record), `TimedOut`,
-    ///   `WouldBlock` and `Interrupted`;
+    ///   `HostUnreachable` / `NetworkUnreachable` / `NetworkDown` (a
+    ///   rebooting NAS or a flapping link), `WouldBlock` and `Interrupted`;
     /// - [`Error::Nfs`] with [`Status::Jukebox`](crate::fs::Status::Jukebox)
     ///   (NFS3ERR_JUKEBOX, NFS4ERR_DELAY) or NFS4ERR_GRACE.
     ///
@@ -98,6 +111,9 @@ impl Error {
                     | io::ErrorKind::NotConnected
                     | io::ErrorKind::UnexpectedEof
                     | io::ErrorKind::TimedOut
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::NetworkDown
                     | io::ErrorKind::WouldBlock
                     | io::ErrorKind::Interrupted
             ),
@@ -154,6 +170,16 @@ impl fmt::Display for Error {
             Error::Invalid(m) => write!(f, "{m}"),
             Error::Nfs(st) => write!(f, "{st}"),
             Error::VersionUnsupported(m) => write!(f, "version not supported: {m}"),
+            Error::GaveUp {
+                op,
+                attempts,
+                elapsed,
+                last,
+            } => write!(
+                f,
+                "gave up on {op} after retrying for {:.1}s ({attempts} attempts): {last}",
+                elapsed.as_secs_f64()
+            ),
         }
     }
 }
@@ -162,6 +188,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
+            Error::GaveUp { last, .. } => Some(last.as_ref()),
             _ => None,
         }
     }

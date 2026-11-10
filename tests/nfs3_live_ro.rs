@@ -51,6 +51,7 @@ fn opts(proto: Proto, port_mode: PortMode) -> ConnectOptions {
             port_mode,
             timeout: Duration::from_secs(10),
             auth: Auth::sys_from_process(),
+            ..RpcOptions::default()
         },
         nfs_port: None,
         mount_port: None,
