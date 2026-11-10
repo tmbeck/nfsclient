@@ -1,0 +1,24 @@
+[package]
+name = "nfsc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Userspace NFS client: browse and transfer files on NFS exports without mounting"
+
+[lib]
+name = "nfsc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nfsc"
+path = "src/bin/nfsc/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The library itself is std-only; CLI dependencies live behind this feature.
+cli = ["dep:clap"]
+
+[dependencies]
+socket2 = "0.6"
+clap = { version = "4.6", features = ["derive"], optional = true }
