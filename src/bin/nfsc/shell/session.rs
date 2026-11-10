@@ -52,6 +52,7 @@ pub struct CmdFailure {
     path: Option<String>,
     msg: String,
     interrupted: bool,
+    pipe_closed: bool,
 }
 
 impl CmdFailure {
@@ -61,7 +62,22 @@ impl CmdFailure {
             path: path.map(str::to_string),
             msg: msg.into(),
             interrupted: false,
+            pipe_closed: false,
         }
+    }
+
+    /// The reader of our stdout went away (`get x - | head`). The shell stops
+    /// quietly, as Unix tools do on SIGPIPE.
+    pub fn pipe_closed(cmd: &str) -> Self {
+        CmdFailure {
+            pipe_closed: true,
+            ..Self::new(cmd, None, "output pipe closed")
+        }
+    }
+
+    /// True when stdout was closed by its reader; nothing should be printed.
+    pub fn is_pipe_closed(&self) -> bool {
+        self.pipe_closed
     }
 
     /// Maps a protocol or local error. An interrupt becomes an "interrupted" failure.

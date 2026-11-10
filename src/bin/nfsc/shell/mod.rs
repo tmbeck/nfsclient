@@ -8,7 +8,8 @@
 //! - `-c 'cmd; cmd'` and piped stdin: commands run in order and the process
 //!   stops at the first failure (like `set -e`), exiting with status 1. `exit`
 //!   or `quit` ends early with status 0. Unknown command names in `-c` are
-//!   rejected before connecting. Ctrl-C stops the run with status 130.
+//!   rejected before connecting. Ctrl-C stops the run with status 130; a
+//!   closed stdout pipe (`cat x | head`) stops it quietly with status 141.
 
 /// The shell command summary, as a literal so it can be `concat!`ed into
 /// `nfsc shell --help` and printed by the in-shell `help`.
@@ -17,7 +18,8 @@ macro_rules! shell_summary {
         "  ls [-l] [path]               list (alias dir); * ? match in the last component
   cd [path] | pwd | lcd [path] remote cwd (/ is the export root) | local cwd
   stat path.. | cat path       attributes | file to stdout
-  get [-r] [-c] remote [local] download (-r tree, -c resume, local - is stdout)
+  get [-rckn] remote [local]   download (-r tree, -c resume, -k keep going,
+                               -n no clobber; local - is stdout)
   put [-r] [-c] local [remote] upload (-r tree, -c resume)
   mkdir rm rmdir mv ln [-s]    change the tree (rm: files only)
   chmod mode path.. | chown uid[:gid] path.. | df [path]
@@ -31,7 +33,7 @@ pub const CLI_HELP: &str = concat!(
     shell_summary!(),
     "\n\nInteractive: Tab completes; Ctrl-C stops a transfer; Ctrl-D exits.\n\
      Permission denied? sudo setcap cap_net_bind_service=+ep \"$(command -v nfsc)\"\n\
-     Exit status: 0 ok, 1 command failed, 130 Ctrl-C.\n\
+     Exit status: 0 ok, 1 command failed, 130 Ctrl-C, 141 stdout pipe closed.\n\
      Example: nfsc shell nas:/srv -c 'cd vm; get -c disk.img'\n\
      More: 'help <cmd>' in the shell; global options: nfsc --help"
 );
@@ -63,6 +65,10 @@ use session::{Flow, Session, check_command};
 
 /// Exit status after Ctrl-C (128 + SIGINT), as shells report it.
 const EXIT_INTERRUPTED: u8 = 130;
+
+/// Exit status when stdout's reader went away (128 + SIGPIPE), as shells
+/// report it for `cat` and friends.
+const EXIT_PIPE_CLOSED: u8 = 141;
 
 pub fn run(g: &Globals, args: &ShellArgs) -> Result<(), CmdError> {
     let target = target::parse_target(&args.target).map_err(CmdError::Failed)?;
@@ -139,6 +145,9 @@ fn run_script_to(
                 }
             }
             Ok(Flow::Exit) => return Ok(Flow::Exit),
+            Err(failure) if failure.is_pipe_closed() => {
+                return Err(CmdError::Reported(EXIT_PIPE_CLOSED));
+            }
             Err(failure) => {
                 let _ = writeln!(err, "{failure}");
                 let status = if failure.is_interrupted() {
@@ -224,6 +233,7 @@ fn interactive_loop(
                     }
                 }
                 Ok(Flow::Exit) => return Ok(()),
+                Err(failure) if failure.is_pipe_closed() => break,
                 Err(failure) => {
                     eprintln!("{failure}");
                     if failure.is_interrupted() {
