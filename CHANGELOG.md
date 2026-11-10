@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-10
+
 ### Added
 
 - `put` is atomic: uploads go to `NAME.nfsc-part` on the server and are
@@ -21,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In-process fake NFSv4.0/4.1/4.2 server with fault injection (DELAY, GRACE,
   reboot with grace period, BADSESSION, STALE_CLIENTID, lease expiry, lost
   and truncated replies, knfsd-like and fully caching reply caches) and a
-  52-test backend suite; `tests/connect_retry.rs`.
+  55-test backend suite; `tests/connect_retry.rs`.
+- Chaos proxy (resets, half-closes, stalls, latency, bandwidth caps,
+  refused connections) and a live soak suite (`just soak [MiB]`): 1 GiB
+  reads and writes over NFSv3 and NFSv4.0/4.1/4.2, CLI `get -cV`, and
+  SIGINT-then-resume, verified byte for byte against kernel nfsd and
+  nfs-ganesha.
 
 ### Changed
 
@@ -47,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get -c` no longer resumes onto an all-zero tail or an older file kept in
   place, which could join two versions of a file.
 - NFSv4 setup waits for DELAY/GRACE honour Ctrl-C and `--retry-time 0`.
+- NFSv4.1: a COMPOUND reply whose results do not match the request (a
+  server replaying another request's reply) is rejected and the slot is
+  re-synchronised, instead of being taken as success; a lost reply to the
+  client's own slot probe keeps the slot uncertain.
 - testenv: kernel nfsd serves NFSv4 on Linux 7.2 (a tmpfs `fsid=0`
   pseudo-root with bind mounts, and `nfsdcld`).
 
