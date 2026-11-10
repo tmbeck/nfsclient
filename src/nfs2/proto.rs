@@ -77,7 +77,7 @@ impl Unpack for WireFh {
     }
 }
 
-/// `cookie`: opaque[4] used by READDIR.
+/// `cookie`: `opaque[4]` used by READDIR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cookie(pub [u8; 4]);
 

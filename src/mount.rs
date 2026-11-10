@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use crate::error::{Error, Result};
 use crate::fs::{FileHandle, Status};
 use crate::portmap;
-use crate::rpc::{RpcClient, RpcOptions};
+use crate::rpc::{Proto, RpcClient, RpcOptions};
 use crate::xdr::{Decoder, Encoder, Pack, Unpack};
 
 pub const PROGRAM: u32 = 100005;
@@ -99,11 +99,45 @@ fn mount_client(
     vers: u32,
     opts: &RpcOptions,
 ) -> Result<RpcClient> {
-    let port = match mount_port {
-        Some(p) => p,
-        None => portmap::getport(host, PROGRAM, vers, opts.proto, opts)?,
+    if let Some(p) = mount_port {
+        return RpcClient::connect(SocketAddr::new(host, p), PROGRAM, vers, opts);
+    }
+    let (port, opts) = match portmap::getport(host, PROGRAM, vers, opts.proto, opts) {
+        Ok(p) => (p, opts.clone()),
+        Err(Error::NotRegistered { .. }) => {
+            // mountd is often registered on one transport only: try the other.
+            let mut other = opts.clone();
+            other.proto = match opts.proto {
+                Proto::Tcp => Proto::Udp,
+                Proto::Udp => Proto::Tcp,
+            };
+            let p = portmap::getport(host, PROGRAM, vers, other.proto, &other)?;
+            (p, other)
+        }
+        Err(e) if portmap::is_unreachable(&e) => return Err(portmap_unreachable(&e)),
+        Err(e) => return Err(e),
     };
-    RpcClient::connect(SocketAddr::new(host, port), PROGRAM, vers, opts)
+    RpcClient::connect(SocketAddr::new(host, port), PROGRAM, vers, &opts)
+}
+
+/// The mountd port is only discoverable through portmap, so say what to do.
+fn portmap_unreachable(e: &Error) -> Error {
+    Error::Invalid(format!(
+        "portmap (port 111) is unreachable ({e}); mountd's port can only be found through \
+         portmap, so pass --mount-port (and --nfs-port) to skip portmap lookups"
+    ))
+}
+
+/// Canonical absolute form: single slashes, no trailing slash (except root).
+pub fn normalize_path(path: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'/'];
+    for (i, comp) in components(path).into_iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(comp);
+    }
+    out
 }
 
 fn export_version(
@@ -192,6 +226,13 @@ pub fn umnt(
 mod tests {
     use super::*;
     use crate::xdr::{from_bytes, to_bytes};
+
+    #[test]
+    fn normalize_path_forms() {
+        assert_eq!(normalize_path(b""), b"/");
+        assert_eq!(normalize_path(b"/"), b"/");
+        assert_eq!(normalize_path(b"srv//data/"), b"/srv/data");
+    }
 
     fn ex(dir: &str) -> Export {
         Export {

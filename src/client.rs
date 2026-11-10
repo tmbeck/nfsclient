@@ -19,8 +19,7 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
         VersionPref::Exact(NfsVersion::V3) => vec![Attempt::V3],
         VersionPref::Exact(NfsVersion::V2) => vec![Attempt::V2],
     };
-    let mut first_err: Option<Error> = None;
-    let mut specific_err: Option<Error> = None;
+    let mut best: Option<Error> = None;
     for a in attempts {
         let r = match a {
             Attempt::V4(minor) => crate::nfs4::connect(host, path, minor, opts),
@@ -30,15 +29,76 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
         match r {
             Ok(c) => return Ok(c),
             Err(e) => {
-                if !e.is_version_unsupported() && specific_err.is_none() {
-                    specific_err = Some(e);
-                } else if first_err.is_none() {
-                    first_err = Some(e);
+                if best.as_ref().is_none_or(|b| progress(&e) > progress(b)) {
+                    best = Some(e);
                 }
             }
         }
     }
-    Err(specific_err
-        .or(first_err)
-        .unwrap_or_else(|| Error::Invalid("no NFS version to try".into())))
+    Err(best.unwrap_or_else(|| Error::Invalid("no NFS version to try".into())))
+}
+
+/// How far a failed attempt got: a server-level answer (MNT3ERR_ACCES, auth
+/// rejection, ...) beats a transport failure, which beats "version not offered".
+/// The first error of the highest rank wins.
+fn progress(e: &Error) -> u8 {
+    if e.is_version_unsupported() {
+        0
+    } else if matches!(e, Error::Io(_) | Error::Timeout) {
+        1
+    } else {
+        2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::Status;
+
+    fn pick(errs: Vec<Error>) -> Error {
+        let mut best: Option<Error> = None;
+        for e in errs {
+            if best.as_ref().is_none_or(|b| progress(&e) > progress(b)) {
+                best = Some(e);
+            }
+        }
+        best.unwrap()
+    }
+
+    #[test]
+    fn real_mount_error_beats_connect_refusal() {
+        let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        let e = pick(vec![
+            refused,
+            Error::Nfs(Status::Access),
+            Error::NotRegistered {
+                prog: 100003,
+                vers: 2,
+            },
+        ]);
+        assert!(matches!(e, Error::Nfs(Status::Access)), "{e}");
+    }
+
+    #[test]
+    fn transport_error_beats_unsupported() {
+        let e = pick(vec![
+            Error::VersionUnsupported("v4".into()),
+            Error::Timeout,
+            Error::NotRegistered {
+                prog: 100003,
+                vers: 2,
+            },
+        ]);
+        assert!(matches!(e, Error::Timeout), "{e}");
+    }
+
+    #[test]
+    fn ties_keep_the_first() {
+        let e = pick(vec![
+            Error::VersionUnsupported("a".into()),
+            Error::NotRegistered { prog: 1, vers: 2 },
+        ]);
+        assert!(matches!(e, Error::VersionUnsupported(_)));
+    }
 }

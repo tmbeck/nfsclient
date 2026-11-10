@@ -32,7 +32,7 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
     // Contact the NFS service first so a missing v3 service leaves no mount behind.
     let port = match opts.nfs_port {
         Some(p) => p,
-        None => portmap::getport(host, PROGRAM, VERSION, opts.rpc.proto, &opts.rpc)?,
+        None => portmap::nfs_port(host, VERSION, opts.rpc.proto, &opts.rpc)?,
     };
     let client = RpcClient::connect(SocketAddr::new(host, port), PROGRAM, VERSION, &opts.rpc)?;
 
@@ -46,6 +46,15 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
             };
             return Err(Error::Invalid(format!(
                 "MOUNT of {} was refused (permission denied): {hint}",
+                String::from_utf8_lossy(&export)
+            )));
+        }
+        Err(Error::NotRegistered { .. }) => {
+            // NFS v3 is registered; only mountd v3 is missing. Don't let version
+            // negotiation read this as "no NFS v3" and fall to v2 with a misleading error.
+            return Err(Error::Invalid(format!(
+                "MOUNT v3 (mountd) is not registered with the portmapper although NFS v3 is; \
+                 cannot mount {}",
                 String::from_utf8_lossy(&export)
             )));
         }
@@ -84,23 +93,7 @@ fn choose_export(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> (Vec<u8>, 
     {
         return (e.dir.clone(), remainder);
     }
-    (normalize(path), Vec::new())
-}
-
-/// Canonical absolute form: single slashes, no trailing slash (except root).
-fn normalize(path: &[u8]) -> Vec<u8> {
-    let mut out = vec![b'/'];
-    for (i, comp) in path
-        .split(|&b| b == b'/')
-        .filter(|c| !c.is_empty())
-        .enumerate()
-    {
-        if i > 0 {
-            out.push(b'/');
-        }
-        out.extend_from_slice(comp);
-    }
-    out
+    (mount::normalize_path(path), Vec::new())
 }
 
 /// The server must accept AUTH_NONE or AUTH_SYS, the only flavors nfsc sends.
@@ -121,6 +114,7 @@ mod tests {
 
     #[test]
     fn normalize_paths() {
+        use mount::normalize_path as normalize;
         assert_eq!(normalize(b"/"), b"/");
         assert_eq!(normalize(b""), b"/");
         assert_eq!(normalize(b"//srv//data/"), b"/srv/data");
