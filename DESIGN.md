@@ -89,5 +89,5 @@ Shell commands (kept deliberately small; see README for flags):
 1. ✅ XDR + RPC (TCP/UDP, AUTH_SYS, reserved ports) + portmap → `nfsc rpcinfo`
 2. ✅ MOUNT → `nfsc exports`; Filesystem facade; shell
 3. ✅ NFSv3, NFSv2, NFSv4.x backends (read + write), container test env
-4. 1.0.0: tab completion, pipelined READ/WRITE, Ctrl-C/resume/progress, docs
+4. ✅ 1.0.0: tab completion, pipelined READ/WRITE, Ctrl-C/resume/progress, docs
 5. Later: RPCSEC_GSS, NFSv4 locking/delegation callbacks, READ_PLUS

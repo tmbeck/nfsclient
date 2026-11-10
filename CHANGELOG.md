@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-11-09
 
 First release.
 
@@ -28,6 +28,9 @@ First release.
 - Source-port selection (`--port-mode auto|priv|unpriv`) for `secure` exports.
 - AUTH_NONE and AUTH_SYS credentials, with `--uid`, `--gid` and `--gids`.
 - `--nfs-port` and `--mount-port` to skip portmap lookups.
+- Pipelined bulk READ/WRITE (`Filesystem::read_stream` / `write_stream`) for
+  NFSv3 and NFSv4.x: several requests in flight, UNSTABLE writes with COMMIT
+  and write-verifier checking, and multiple NFSv4.1+ session slots.
 - A library crate (`nfsc`): `fs::connect` with version negotiation, and the
   version-agnostic `fs::Filesystem` trait implemented for v2, v3 and v4.
 - Live test suites gated by environment variables, a podman-based test
@@ -37,8 +40,18 @@ First release.
 
 - AUTH_SYS sends the identity the client claims. Servers do not verify it.
   RPCSEC_GSS and Kerberos are not implemented.
+- Downloads treat the server as untrusted: server-supplied names that are
+  empty, `.`, `..`, or contain `/` or NUL are skipped; `get -r` detects
+  directory cycles and limits depth; local symlinks inside a downloaded tree
+  are not followed; setuid/setgid/sticky bits are stripped from downloaded
+  files; names, owners and errors from the server are escaped before printing.
+- Decoders bound every length prefix and directory listing size, and are
+  fuzz-tested against random and truncated input.
 
 ### Known limitations
 
 - No NLM or NFSv4 locking, no delegation callbacks, no pNFS.
 - NFSv2 is tested only against an in-process fake server.
+- UDP and NFSv2 transfers are not pipelined.
+- Downloaded file modes are taken from the server (minus setuid/setgid/sticky)
+  without applying the local umask.
