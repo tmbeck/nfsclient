@@ -64,6 +64,21 @@ testenv-down which="all":
 live *FLAGS:
     testenv/run-live.sh {{FLAGS}} {{testenv}}
 
+# NFSC_TEST_SOAK_* knobs pass through; NFSC_TEST_SOAK_RESTART=1 also restarts ganesha.
+# Chaos + soak suite against the test servers (release), e.g. just soak 2048 soak_read
+soak mib="1024" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    env_file={{testenv}}
+    if [ ! -r "$env_file" ]; then echo "no env file $env_file; run 'just testenv-up' first" >&2; exit 2; fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            NFSC_TEST_RW_*=*) k=${line%%=*}; [ -n "${!k:-}" ] || export "$line" ;;
+        esac
+    done < "$env_file"
+    export NFSC_TEST_SOAK=1 NFSC_TEST_SOAK_MIB={{mib}}
+    cargo test --release --test soak_live -- --nocapture --test-threads=1 {{ARGS}}
+
 # Read benchmark of a large file, e.g. just bench host:/export/dir/file 3,4.2 2048
 bench file vers="3,4.2" mib="2048":
     NFSC_PERF_RO_FILE={{file}} NFSC_PERF_RO_VERS={{vers}} NFSC_PERF_RO_MIB={{mib}} \
