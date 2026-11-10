@@ -27,7 +27,9 @@ impl Encoder {
     }
 
     pub fn with_capacity(n: usize) -> Self {
-        Self { buf: Vec::with_capacity(n) }
+        Self {
+            buf: Vec::with_capacity(n),
+        }
     }
 
     pub fn into_inner(self) -> Vec<u8> {
@@ -232,7 +234,9 @@ impl<'a> Decoder<'a> {
         let n = self.get_u32()? as usize;
         // Each element is at least 4 bytes on the wire; reject impossible counts early.
         if n > self.remaining() / 4 + 1 {
-            return Err(Error::Xdr(format!("array count {n} exceeds remaining data")));
+            return Err(Error::Xdr(format!(
+                "array count {n} exceeds remaining data"
+            )));
         }
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
@@ -243,7 +247,11 @@ impl<'a> Decoder<'a> {
 
     /// Optional-data (`*T`).
     pub fn get_option<T: Unpack>(&mut self) -> Result<Option<T>> {
-        if self.get_bool()? { Ok(Some(T::unpack(self)?)) } else { Ok(None) }
+        if self.get_bool()? {
+            Ok(Some(T::unpack(self)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// XDR linked list idiom (`struct entry { ...; entry *next; }` preceded by a
@@ -376,10 +384,15 @@ mod tests {
     #[test]
     fn ints_big_endian() {
         let mut e = Encoder::new();
-        e.put_u32(0x01020304).put_i32(-1).put_u64(0x0102030405060708).put_bool(true);
+        e.put_u32(0x01020304)
+            .put_i32(-1)
+            .put_u64(0x0102030405060708)
+            .put_bool(true);
         assert_eq!(
             e.as_bytes(),
-            &[1, 2, 3, 4, 0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1]
+            &[
+                1, 2, 3, 4, 0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1
+            ]
         );
         let mut d = Decoder::new(e.as_bytes());
         assert_eq!(d.get_u32().unwrap(), 0x01020304);
@@ -419,9 +432,15 @@ mod tests {
     #[test]
     fn arrays_options_lists() {
         let mut e = Encoder::new();
-        e.put_array(&[1u32, 2, 3]).put_option(Some(&7u32)).put_option::<u32>(None);
+        e.put_array(&[1u32, 2, 3])
+            .put_option(Some(&7u32))
+            .put_option::<u32>(None);
         // list of two u32s: 1,a,1,b,0
-        e.put_bool(true).put_u32(10).put_bool(true).put_u32(20).put_bool(false);
+        e.put_bool(true)
+            .put_u32(10)
+            .put_bool(true)
+            .put_u32(20)
+            .put_bool(false);
         let mut d = Decoder::new(e.as_bytes());
         assert_eq!(d.get_array::<u32>().unwrap(), vec![1, 2, 3]);
         assert_eq!(d.get_option::<u32>().unwrap(), Some(7));

@@ -4,10 +4,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::proto::{
-    self, Cookie, DirList, Fattr, Res, Sattr, StatfsOk, TimeVal, WireFh, WriteArgs, MAXDATA,
-    MAXNAMLEN, MAXPATHLEN, NFBLK, NFCHR, NFDIR, NFLNK, NFNON, NFREG, PROC_CREATE, PROC_GETATTR,
-    PROC_LINK, PROC_LOOKUP, PROC_MKDIR, PROC_READ, PROC_READDIR, PROC_READLINK, PROC_REMOVE,
-    PROC_RENAME, PROC_RMDIR, PROC_SETATTR, PROC_STATFS, PROC_SYMLINK, PROC_WRITE, UNSET,
+    self, Cookie, DirList, Fattr, MAXDATA, MAXNAMLEN, MAXPATHLEN, NFBLK, NFCHR, NFDIR, NFLNK,
+    NFNON, NFREG, PROC_CREATE, PROC_GETATTR, PROC_LINK, PROC_LOOKUP, PROC_MKDIR, PROC_READ,
+    PROC_READDIR, PROC_READLINK, PROC_REMOVE, PROC_RENAME, PROC_RMDIR, PROC_SETATTR, PROC_STATFS,
+    PROC_SYMLINK, PROC_WRITE, Res, Sattr, StatfsOk, TimeVal, UNSET, WireFh, WriteArgs,
 };
 use super::{PROGRAM, VERSION};
 use crate::error::{Error, Result};
@@ -88,7 +88,9 @@ fn wire_offset(offset: u64) -> Result<u32> {
 }
 
 fn now_timeval() -> TimeVal {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     TimeVal {
         seconds: d.as_secs() as u32,
         useconds: d.subsec_micros(),
@@ -461,13 +463,31 @@ mod tests {
     #[test]
     fn times_convert_usec_to_nsec() {
         let f = Fattr {
-            atime: TimeVal { seconds: 10, useconds: 250_000 },
-            mtime: TimeVal { seconds: 11, useconds: 999_999 },
+            atime: TimeVal {
+                seconds: 10,
+                useconds: 250_000,
+            },
+            mtime: TimeVal {
+                seconds: 11,
+                useconds: 999_999,
+            },
             ..Fattr::default()
         };
         let a = to_attr(f);
-        assert_eq!(a.atime, Time { seconds: 10, nseconds: 250_000_000 });
-        assert_eq!(a.mtime, Time { seconds: 11, nseconds: 999_999_000 });
+        assert_eq!(
+            a.atime,
+            Time {
+                seconds: 10,
+                nseconds: 250_000_000
+            }
+        );
+        assert_eq!(
+            a.mtime,
+            Time {
+                seconds: 11,
+                nseconds: 999_999_000
+            }
+        );
     }
 
     #[test]
@@ -487,7 +507,10 @@ mod tests {
         let s = to_sattr(&SetAttr {
             mode: Some(0o600),
             size: Some(5),
-            mtime: Some(SetTime::Client(Time { seconds: 42, nseconds: 7_000_000 })),
+            mtime: Some(SetTime::Client(Time {
+                seconds: 42,
+                nseconds: 7_000_000,
+            })),
             ..SetAttr::default()
         })
         .unwrap();
@@ -496,7 +519,13 @@ mod tests {
         assert_eq!(s.gid, UNSET);
         assert_eq!(s.size, 5);
         assert_eq!(s.atime, TimeVal::UNSET);
-        assert_eq!(s.mtime, TimeVal { seconds: 42, useconds: 7000 });
+        assert_eq!(
+            s.mtime,
+            TimeVal {
+                seconds: 42,
+                useconds: 7000
+            }
+        );
     }
 
     #[test]
@@ -523,7 +552,10 @@ mod tests {
     #[test]
     fn negative_time_is_invalid() {
         let err = to_sattr(&SetAttr {
-            atime: Some(SetTime::Client(Time { seconds: -1, nseconds: 0 })),
+            atime: Some(SetTime::Client(Time {
+                seconds: -1,
+                nseconds: 0,
+            })),
             ..SetAttr::default()
         })
         .unwrap_err();

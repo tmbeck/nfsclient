@@ -142,7 +142,9 @@ pub(crate) fn read_pipelined<I: ReadIo>(
         }
         if off != delivered {
             drain_reads(io, &mut inflight);
-            return Err(Error::Protocol(format!("READ reply for offset {off}, expected {delivered}")));
+            return Err(Error::Protocol(format!(
+                "READ reply for offset {off}, expected {delivered}"
+            )));
         }
         if !data.is_empty() {
             if let Err(e) = sink(&data) {
@@ -239,7 +241,11 @@ pub(crate) fn write_pipelined<I: WriteIo>(
             match io.issue(off, &data) {
                 Ok(tag) => {
                     inflight_bytes += data.len() as u64;
-                    inflight.push_back(Flight { tag, offset: off, data });
+                    inflight.push_back(Flight {
+                        tag,
+                        offset: off,
+                        data,
+                    });
                 }
                 Err(e) => {
                     drain_writes(io, &mut inflight);
@@ -254,11 +260,13 @@ pub(crate) fn write_pipelined<I: WriteIo>(
             }
             if source_done || retained_bytes >= COMMIT_INTERVAL || !resend.is_empty() {
                 if !retained.is_empty() {
-                    let mismatched = commit_round(io, &mut retained, &mut retained_bytes, &mut resend)?;
+                    let mismatched =
+                        commit_round(io, &mut retained, &mut retained_bytes, &mut resend)?;
                     commit_rounds = if mismatched { commit_rounds + 1 } else { 0 };
                     if commit_rounds > MAX_COMMIT_ROUNDS {
                         return Err(Error::Protocol(
-                            "server write verifier kept changing; giving up on unstable writes".into(),
+                            "server write verifier kept changing; giving up on unstable writes"
+                                .into(),
                         ));
                     }
                 }
@@ -291,7 +299,11 @@ pub(crate) fn write_pipelined<I: WriteIo>(
         }
         if !ack.durable {
             retained_bytes += n as u64;
-            retained.push(Retained { offset: flight.offset, data, verf: ack.verf });
+            retained.push(Retained {
+                offset: flight.offset,
+                data,
+                verf: ack.verf,
+            });
         }
     }
     Ok(pos - offset)
@@ -319,7 +331,11 @@ fn commit_round<I: WriteIo>(
     resend: &mut VecDeque<(u64, Vec<u8>)>,
 ) -> Result<bool> {
     let lo = retained.iter().map(|r| r.offset).min().unwrap_or(0);
-    let hi = retained.iter().map(|r| r.offset + r.data.len() as u64).max().unwrap_or(lo);
+    let hi = retained
+        .iter()
+        .map(|r| r.offset + r.data.len() as u64)
+        .max()
+        .unwrap_or(lo);
     // COMMIT count 0 means "to end of file", which covers the range too.
     let count = u32::try_from(hi - lo).unwrap_or(0);
     let verf = io.commit(lo, count)?;
@@ -444,7 +460,12 @@ mod tests {
         for &size in &[0usize, 1, 99, 100, 101, 999, 1000] {
             for &window in &[1usize, 3, 8] {
                 for &chunk in &[1u32, 100, 1000, 4096] {
-                    for &(offset, len) in &[(0u64, None), (0, Some(size as u64)), (7, None), (13, Some(50))] {
+                    for &(offset, len) in &[
+                        (0u64, None),
+                        (0, Some(size as u64)),
+                        (7, None),
+                        (13, Some(50)),
+                    ] {
                         let mut fake = FakeReads::new(data[..size].to_vec());
                         let (r, out) = run_read(&mut fake, offset, len, chunk, window);
                         let start = offset.min(size as u64);
@@ -454,8 +475,15 @@ mod tests {
                         }
                         .max(start);
                         let expect: Vec<u8> = data[start as usize..end as usize].to_vec();
-                        assert_eq!(r.unwrap(), expect.len() as u64, "size {size} w{window} c{chunk} off {offset} len {len:?}");
-                        assert_eq!(out, expect, "size {size} w{window} c{chunk} off {offset} len {len:?}");
+                        assert_eq!(
+                            r.unwrap(),
+                            expect.len() as u64,
+                            "size {size} w{window} c{chunk} off {offset} len {len:?}"
+                        );
+                        assert_eq!(
+                            out, expect,
+                            "size {size} w{window} c{chunk} off {offset} len {len:?}"
+                        );
                         assert_eq!(fake.pending.len(), 0, "all replies consumed");
                         assert!(fake.max_outstanding <= window);
                     }
@@ -594,7 +622,8 @@ mod tests {
             // Replies in request order: tags were issued in order, so the front matches.
             let _ = tag;
             let mut data = self.datas[tag].clone();
-            if self.short_every > 0 && (tag + 1).is_multiple_of(self.short_every) && data.len() > 1 {
+            if self.short_every > 0 && (tag + 1).is_multiple_of(self.short_every) && data.len() > 1
+            {
                 data.truncate(data.len() / 2);
             }
             let n = data.len();
@@ -634,7 +663,13 @@ mod tests {
         }
     }
 
-    fn run_write(fake: &mut FakeWrites, offset: u64, data: &[u8], chunk: usize, window: usize) -> Result<u64> {
+    fn run_write(
+        fake: &mut FakeWrites,
+        offset: u64,
+        data: &[u8],
+        chunk: usize,
+        window: usize,
+    ) -> Result<u64> {
         let mut rest = data;
         write_pipelined(fake, offset, chunk, window, &mut |buf: &mut [u8]| {
             let n = buf.len().min(rest.len());
@@ -691,7 +726,10 @@ mod tests {
         assert_eq!(n, data.len() as u64);
         assert_eq!(fake.reboots, 1);
         assert_eq!(fake.disk, data, "lost unstable data was resent");
-        assert!(fake.commits >= 2, "a second COMMIT confirmed the resent data");
+        assert!(
+            fake.commits >= 2,
+            "a second COMMIT confirmed the resent data"
+        );
     }
 
     #[test]

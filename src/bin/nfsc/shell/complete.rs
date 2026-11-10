@@ -169,7 +169,9 @@ struct Item {
 /// Whether a name can be typed back in and read by the line parser.
 fn usable(name: &str, quote: Option<char>) -> bool {
     !name.contains(['*', '?'])
-        && !name.chars().any(|c| c.is_control() || crate::text::is_spoofing_format_char(c))
+        && !name
+            .chars()
+            .any(|c| c.is_control() || crate::text::is_spoofing_format_char(c))
         && !(quote == Some('\'') && name.contains('\''))
 }
 
@@ -439,7 +441,10 @@ mod tests {
         assert!(!usable("it's", Some('\'')));
         assert!(usable("it's", None), "unquoted names escape their quotes");
         assert!(!usable("tab\there", None));
-        assert!(!usable("a\u{202e}gpj", None), "bidi overrides are not offered as completions");
+        assert!(
+            !usable("a\u{202e}gpj", None),
+            "bidi overrides are not offered as completions"
+        );
     }
 
     #[test]

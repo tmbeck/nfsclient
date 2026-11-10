@@ -1,7 +1,7 @@
 //! RPC call/reply message encoding (RFC 5531 section 9). (rpc agent owns this file.)
 
-use super::auth::{encode_cred, MAX_AUTH_BODY};
 use super::Auth;
+use super::auth::{MAX_AUTH_BODY, encode_cred};
 use crate::error::{AcceptError, Error, RejectReason, Result};
 use crate::xdr::{Decoder, Encoder, Pack};
 
@@ -60,7 +60,11 @@ pub fn decode_reply(xid: u32, reply: &[u8]) -> Result<&[u8]> {
     }
     match d.get_u32()? {
         MSG_REPLY => {}
-        other => return Err(Error::Protocol(format!("expected REPLY, got msg_type {other}"))),
+        other => {
+            return Err(Error::Protocol(format!(
+                "expected REPLY, got msg_type {other}"
+            )));
+        }
     }
     match d.get_u32()? {
         MSG_ACCEPTED => {
@@ -151,17 +155,17 @@ mod tests {
             &[0, 0, 0, 2],
             &[0, 0x01, 0x86, 0xA0],
             &[0, 0, 0, 2],
-            &[0, 0, 0, 1],                 // proc 1
-            &[0, 0, 0, 1],                 // cred flavor AUTH_SYS
-            &[0, 0, 0, 0x20],              // body length 32
-            &[1, 2, 3, 4],                 // stamp
-            &[0, 0, 0, 1, b'h', 0, 0, 0],  // machinename "h" padded
-            &[0, 0, 0x03, 0xE8],           // uid 1000
-            &[0, 0, 0, 0x64],              // gid 100
-            &[0, 0, 0, 2],                 // gids count
-            &[0, 0, 0, 4, 0, 0, 0, 0x18],  // gids 4, 24
-            &[0, 0, 0, 0, 0, 0, 0, 0],     // verf AUTH_NONE
-            &[0, 0, 0, 7],                 // args
+            &[0, 0, 0, 1],                // proc 1
+            &[0, 0, 0, 1],                // cred flavor AUTH_SYS
+            &[0, 0, 0, 0x20],             // body length 32
+            &[1, 2, 3, 4],                // stamp
+            &[0, 0, 0, 1, b'h', 0, 0, 0], // machinename "h" padded
+            &[0, 0, 0x03, 0xE8],          // uid 1000
+            &[0, 0, 0, 0x64],             // gid 100
+            &[0, 0, 0, 2],                // gids count
+            &[0, 0, 0, 4, 0, 0, 0, 0x18], // gids 4, 24
+            &[0, 0, 0, 0, 0, 0, 0, 0],    // verf AUTH_NONE
+            &[0, 0, 0, 7],                // args
         ]
         .concat();
         assert_eq!(msg, want);
@@ -264,7 +268,10 @@ mod tests {
         v.extend_from_slice(&2u32.to_be_bytes());
         assert!(matches!(
             decode_reply(7, &v),
-            Err(Error::Rejected(RejectReason::RpcMismatch { low: 2, high: 2 }))
+            Err(Error::Rejected(RejectReason::RpcMismatch {
+                low: 2,
+                high: 2
+            }))
         ));
 
         // MSG_DENIED, AUTH_ERROR AUTH_TOOWEAK (5)

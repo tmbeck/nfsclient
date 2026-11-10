@@ -550,7 +550,10 @@ mod failure_text_tests {
     fn failure_messages_escape_server_supplied_text() {
         let f = CmdFailure::new("get", Some("dir/ev\u{1b}[31m"), "bad \u{1b}]0;x\u{7}");
         let shown = f.to_string();
-        assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'), "{shown:?}");
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+            "{shown:?}"
+        );
         assert!(shown.contains("dir/ev\\x1b[31m"), "{shown:?}");
     }
 }

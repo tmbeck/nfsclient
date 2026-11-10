@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nfsc::error::Error;
 use nfsc::fs::{
-    self, Attr, ConnectOptions, Connected, CreateMode, FileHandle, FileType, Filesystem, NfsVersion, SetAttr,
-    SetTime, Status, Time, VersionPref,
+    self, Attr, ConnectOptions, Connected, CreateMode, FileHandle, FileType, Filesystem,
+    NfsVersion, SetAttr, SetTime, Status, Time, VersionPref,
 };
 use nfsc::rpc::{Auth, PortMode, Proto, RpcOptions};
 
@@ -30,7 +30,9 @@ fn resolve(host: &str) -> IpAddr {
 
 fn target() -> Option<(IpAddr, Vec<u8>)> {
     let spec = std::env::var("NFSC_TEST_RW").ok()?;
-    let (host, path) = spec.split_once(':').expect("NFSC_TEST_RW must be host:/export");
+    let (host, path) = spec
+        .split_once(':')
+        .expect("NFSC_TEST_RW must be host:/export");
     Some((resolve(host), path.as_bytes().to_vec()))
 }
 
@@ -49,11 +51,15 @@ fn opts(proto: Proto) -> ConnectOptions {
 }
 
 fn connect(ip: IpAddr, path: &[u8], proto: Proto) -> Connected {
-    fs::connect(ip, path, &opts(proto)).unwrap_or_else(|e| panic!("connect over {}: {e}", proto.name()))
+    fs::connect(ip, path, &opts(proto))
+        .unwrap_or_else(|e| panic!("connect over {}: {e}", proto.name()))
 }
 
 fn random_suffix() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos() as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64;
     format!("{:016x}", nanos ^ (u64::from(std::process::id()) << 40))
 }
 
@@ -80,7 +86,9 @@ fn in_workdir(test: &str, body: impl FnOnce(&mut dyn Filesystem, &FileHandle)) {
         eprintln!("NFSC_TEST_RW not set; skipping {test}");
         return;
     };
-    let Connected { mut fs, remainder, .. } = connect(ip, &path, Proto::Tcp);
+    let Connected {
+        mut fs, remainder, ..
+    } = connect(ip, &path, Proto::Tcp);
     let mut base = fs.root();
     for c in &remainder {
         base = fs.lookup(&base, c).expect("lookup remainder").0;
@@ -119,7 +127,9 @@ fn pattern(len: usize, seed: u32) -> Vec<u8> {
 fn write_all(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, data: &[u8]) {
     let mut done = 0usize;
     while done < data.len() {
-        let n = fs.write(fh, offset + done as u64, &data[done..]).expect("write") as usize;
+        let n = fs
+            .write(fh, offset + done as u64, &data[done..])
+            .expect("write") as usize;
         assert!(n > 0, "server accepted zero bytes");
         done += n;
     }
@@ -138,8 +148,13 @@ fn read_all(fs: &mut dyn Filesystem, fh: &FileHandle) -> Vec<u8> {
 }
 
 fn create_file(fs: &mut dyn Filesystem, dir: &FileHandle, name: &str) -> (FileHandle, Attr) {
-    fs.create(dir, name.as_bytes(), CreateMode::Guarded, &SetAttr::default())
-        .expect("create file")
+    fs.create(
+        dir,
+        name.as_bytes(),
+        CreateMode::Guarded,
+        &SetAttr::default(),
+    )
+    .expect("create file")
 }
 
 #[test]
@@ -206,7 +221,10 @@ fn rw_create_modes() {
         let (u, _) = fs
             .create(work, b"g", CreateMode::Unchecked, &SetAttr::default())
             .expect("UNCHECKED create of existing name succeeds");
-        assert_eq!(fs.getattr(&u).unwrap().fileid, fs.getattr(&g).unwrap().fileid);
+        assert_eq!(
+            fs.getattr(&u).unwrap().fileid,
+            fs.getattr(&g).unwrap().fileid
+        );
 
         let attrs = SetAttr {
             mode: Some(0o640),
@@ -215,7 +233,10 @@ fn rw_create_modes() {
         let (e, a) = fs
             .create(work, b"e", CreateMode::Exclusive, &attrs)
             .expect("EXCLUSIVE create");
-        assert_eq!(a.mode, 0o640, "attributes must be applied after EXCLUSIVE create");
+        assert_eq!(
+            a.mode, 0o640,
+            "attributes must be applied after EXCLUSIVE create"
+        );
         assert_eq!(a.ftype, FileType::Regular);
         match fs.create(work, b"e", CreateMode::Exclusive, &attrs) {
             Err(Error::Nfs(Status::Exist)) => {}
@@ -244,13 +265,22 @@ fn rw_mkdir_rmdir() {
     in_workdir("rw_mkdir_rmdir", |fs, work| {
         let (d, a) = fs.mkdir(work, b"d", &SetAttr::default()).expect("mkdir");
         assert_eq!(a.ftype, FileType::Directory);
-        assert!(matches!(fs.mkdir(work, b"d", &SetAttr::default()), Err(Error::Nfs(Status::Exist))));
+        assert!(matches!(
+            fs.mkdir(work, b"d", &SetAttr::default()),
+            Err(Error::Nfs(Status::Exist))
+        ));
 
         create_file(fs, &d, "inside");
-        assert!(matches!(fs.rmdir(work, b"d"), Err(Error::Nfs(Status::NotEmpty))));
+        assert!(matches!(
+            fs.rmdir(work, b"d"),
+            Err(Error::Nfs(Status::NotEmpty))
+        ));
         fs.remove(&d, b"inside").expect("remove inside");
         fs.rmdir(work, b"d").expect("rmdir");
-        assert!(matches!(fs.lookup(work, b"d"), Err(Error::Nfs(Status::NoEnt))));
+        assert!(matches!(
+            fs.lookup(work, b"d"),
+            Err(Error::Nfs(Status::NoEnt))
+        ));
     });
 }
 
@@ -259,13 +289,18 @@ fn rw_rename_same_and_cross_directory() {
     in_workdir("rw_rename", |fs, work| {
         let (fh, _) = create_file(fs, work, "a");
         write_all(fs, &fh, 0, b"payload");
-        fs.rename(work, b"a", work, b"b").expect("rename in directory");
-        assert!(matches!(fs.lookup(work, b"a"), Err(Error::Nfs(Status::NoEnt))));
+        fs.rename(work, b"a", work, b"b")
+            .expect("rename in directory");
+        assert!(matches!(
+            fs.lookup(work, b"a"),
+            Err(Error::Nfs(Status::NoEnt))
+        ));
         let (b, _) = fs.lookup(work, b"b").unwrap();
         assert_eq!(b, fh, "renamed file keeps its handle");
 
         let (sub, _) = fs.mkdir(work, b"sub", &SetAttr::default()).unwrap();
-        fs.rename(work, b"b", &sub, b"c").expect("rename across directories");
+        fs.rename(work, b"b", &sub, b"c")
+            .expect("rename across directories");
         assert_eq!(read_all(fs, &fh), b"payload");
         assert!(matches!(
             fs.rename(work, b"missing", work, b"x"),
@@ -284,11 +319,17 @@ fn rw_symlink_readlink() {
         assert_eq!(fs.readlink(&l).unwrap(), b"some/where/../target");
 
         let long = vec![b'a'; 1000];
-        let (l2, _) = fs.symlink(work, b"long", &long, &SetAttr::default()).unwrap();
+        let (l2, _) = fs
+            .symlink(work, b"long", &long, &SetAttr::default())
+            .unwrap();
         assert_eq!(fs.readlink(&l2).unwrap(), long);
         let (found, attr) = fs.lookup(work, b"l").unwrap();
         assert_eq!(found, l);
-        assert_eq!(attr.ftype, FileType::Symlink, "LOOKUP must not follow the link");
+        assert_eq!(
+            attr.ftype,
+            FileType::Symlink,
+            "LOOKUP must not follow the link"
+        );
     });
 }
 
@@ -322,7 +363,10 @@ fn rw_setattr_mode_size_times() {
                 },
             )
             .unwrap();
-        assert_eq!(a.mode, 0o4750, "setuid/setgid/sticky-compatible mode bits survive");
+        assert_eq!(
+            a.mode, 0o4750,
+            "setuid/setgid/sticky-compatible mode bits survive"
+        );
         assert_eq!(a.ftype, FileType::Regular);
 
         let a = fs
@@ -364,7 +408,10 @@ fn rw_setattr_mode_size_times() {
             .unwrap();
         assert_eq!(a.mtime.seconds, t.seconds);
 
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let a = fs
             .setattr(
                 &f,
@@ -374,7 +421,10 @@ fn rw_setattr_mode_size_times() {
                 },
             )
             .unwrap();
-        assert!((a.atime.seconds - before).abs() < 600, "server-set atime is near the server clock");
+        assert!(
+            (a.atime.seconds - before).abs() < 600,
+            "server-set atime is near the server clock"
+        );
     });
 }
 
@@ -383,8 +433,14 @@ fn rw_remove_then_missing() {
     in_workdir("rw_remove", |fs, work| {
         let (f, _) = create_file(fs, work, "gone");
         fs.remove(work, b"gone").unwrap();
-        assert!(matches!(fs.lookup(work, b"gone"), Err(Error::Nfs(Status::NoEnt))));
-        assert!(matches!(fs.remove(work, b"gone"), Err(Error::Nfs(Status::NoEnt))));
+        assert!(matches!(
+            fs.lookup(work, b"gone"),
+            Err(Error::Nfs(Status::NoEnt))
+        ));
+        assert!(matches!(
+            fs.remove(work, b"gone"),
+            Err(Error::Nfs(Status::NoEnt))
+        ));
         // The removed object's handle no longer resolves.
         assert!(fs.getattr(&f).is_err());
     });
@@ -405,8 +461,14 @@ fn rw_readdir_paginates_over_a_thousand_entries() {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), total);
-        assert!(entries.iter().all(|e| e.attr.is_some()), "READDIRPLUS supplies attributes");
-        assert!(entries.iter().all(|e| e.handle.is_some()), "READDIRPLUS supplies handles");
+        assert!(
+            entries.iter().all(|e| e.attr.is_some()),
+            "READDIRPLUS supplies attributes"
+        );
+        assert!(
+            entries.iter().all(|e| e.handle.is_some()),
+            "READDIRPLUS supplies handles"
+        );
     });
 }
 
@@ -434,7 +496,9 @@ fn rw_data_is_visible_on_a_fresh_connection() {
         // A second mount of the same export must see the bytes. File handles are
         // server-side names, so the work directory handle is valid there too.
         let Connected { fs: mut other, .. } = connect(ip, &path, Proto::Tcp);
-        let (seen, _) = other.lookup(work, b"durable").expect("file visible on second connection");
+        let (seen, _) = other
+            .lookup(work, b"durable")
+            .expect("file visible on second connection");
         assert!(read_all(other.as_mut(), &seen) == data);
         other.disconnect().expect("disconnect second connection");
     });
@@ -454,7 +518,13 @@ fn rw_udp_transfer_when_offered() {
         proto: Proto::Udp,
         ..RpcOptions::default()
     };
-    match nfsc::portmap::getport(ip, nfsc::nfs3::PROGRAM, nfsc::nfs3::VERSION, Proto::Udp, &udp) {
+    match nfsc::portmap::getport(
+        ip,
+        nfsc::nfs3::PROGRAM,
+        nfsc::nfs3::VERSION,
+        Proto::Udp,
+        &udp,
+    ) {
         Err(Error::NotRegistered { .. }) => {
             eprintln!("NFSv3 is not registered over UDP on this server; skipping");
             return;
@@ -462,14 +532,18 @@ fn rw_udp_transfer_when_offered() {
         Err(e) => panic!("portmap over UDP: {e}"),
         Ok(_) => {}
     }
-    let Connected { mut fs, remainder, .. } = fs::connect(ip, &path, &opts(Proto::Udp)).expect("connect over UDP");
+    let Connected {
+        mut fs, remainder, ..
+    } = fs::connect(ip, &path, &opts(Proto::Udp)).expect("connect over UDP");
     let root = fs.root();
     let mut base = root;
     for c in &remainder {
         base = fs.lookup(&base, c).unwrap().0;
     }
     let dirname = format!("nfsc-v3-{}", random_suffix());
-    let (work, _) = fs.mkdir(&base, dirname.as_bytes(), &SetAttr::default()).unwrap();
+    let (work, _) = fs
+        .mkdir(&base, dirname.as_bytes(), &SetAttr::default())
+        .unwrap();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let (f, _) = create_file(fs.as_mut(), &work, "u");
         let data = pattern(300_000, 4);

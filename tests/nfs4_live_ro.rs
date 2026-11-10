@@ -16,7 +16,10 @@ fn target() -> Option<(IpAddr, Vec<u8>)> {
 
 fn opts(minor: Option<u32>) -> ConnectOptions {
     ConnectOptions {
-        rpc: RpcOptions { auth: Auth::sys_from_process(), ..RpcOptions::default() },
+        rpc: RpcOptions {
+            auth: Auth::sys_from_process(),
+            ..RpcOptions::default()
+        },
         nfs_port: None,
         mount_port: None,
         version: match minor {
@@ -32,12 +35,19 @@ fn exercise(minor: Option<u32>) {
         eprintln!("NFSC_TEST_RO not set; skipping");
         return;
     };
-    let Connected { mut fs, .. } = nfsc::nfs4::connect(ip, &path, minor, &opts(minor)).expect("connect");
+    let Connected { mut fs, .. } =
+        nfsc::nfs4::connect(ip, &path, minor, &opts(minor)).expect("connect");
     let root = fs.root();
     let attr = fs.getattr(&root).expect("getattr root");
     assert_eq!(attr.ftype, FileType::Directory);
     let st = fs.fsstat(&root).expect("fsstat");
-    eprintln!("minor {minor:?}: root {:?} fsstat {:?} maxread {} maxwrite {}", fs.version(), st, fs.max_read(), fs.max_write());
+    eprintln!(
+        "minor {minor:?}: root {:?} fsstat {:?} maxread {} maxwrite {}",
+        fs.version(),
+        st,
+        fs.max_read(),
+        fs.max_write()
+    );
     let entries = fs.readdir(&root).expect("readdir");
     eprintln!("minor {minor:?}: {} entries", entries.len());
     for e in entries.iter().take(20) {

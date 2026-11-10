@@ -70,8 +70,14 @@ mod spoofing_tests {
 
     #[test]
     fn bidi_and_zero_width_format_characters_are_escaped() {
-        assert_eq!(display_name("invoice\u{202e}gpj.exe".as_bytes()), "invoice\\u{202e}gpj.exe");
-        assert_eq!(display_name("a\u{200b}b\u{feff}".as_bytes()), "a\\u{200b}b\\u{feff}");
+        assert_eq!(
+            display_name("invoice\u{202e}gpj.exe".as_bytes()),
+            "invoice\\u{202e}gpj.exe"
+        );
+        assert_eq!(
+            display_name("a\u{200b}b\u{feff}".as_bytes()),
+            "a\\u{200b}b\\u{feff}"
+        );
         assert_eq!(display_name("a\u{2066}b".as_bytes()), "a\\u{2066}b");
         assert_eq!(display_name("caf\u{e9}".as_bytes()), "caf\u{e9}");
     }

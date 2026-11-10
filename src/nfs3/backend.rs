@@ -5,18 +5,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AcceptError, Error, Result};
-use crate::fs::{self, Attr, CreateMode, FileHandle, Filesystem, FsStat, NfsVersion, SetAttr, Status};
+use crate::fs::{
+    self, Attr, CreateMode, FileHandle, Filesystem, FsStat, NfsVersion, SetAttr, Status,
+};
 use crate::mount;
-use crate::rpc::pipeline::{self, ReadIo, WriteAck, WriteIo, DEFAULT_WINDOW};
+use crate::rpc::pipeline::{self, DEFAULT_WINDOW, ReadIo, WriteAck, WriteIo};
 use crate::rpc::{Proto, RpcClient, RpcOptions};
 use crate::xdr::Pack;
 
 use super::proto::{
-    self, CommitArgs, CommitOk, CreateArgs, CreateOk, DiropArgs, DirEntry3, FhArg, FsinfoOk, FsstatOk, LinkArgs,
-    LinkOk, LookupOk, MkdirArgs, ReadArgs, ReadOk, ReadlinkOk, ReaddirArgs, ReaddirOk, ReaddirPlusArgs,
-    RenameArgs, RenameOk, Reply, SetattrArgs, SymlinkArgs, WriteArgs, WriteOk,
+    self, CommitArgs, CommitOk, CreateArgs, CreateOk, DirEntry3, DiropArgs, FhArg, FsinfoOk,
+    FsstatOk, LinkArgs, LinkOk, LookupOk, MkdirArgs, ReadArgs, ReadOk, ReaddirArgs, ReaddirOk,
+    ReaddirPlusArgs, ReadlinkOk, RenameArgs, RenameOk, Reply, SetattrArgs, SymlinkArgs, WriteArgs,
+    WriteOk,
 };
-use super::types::{CreateHow, Fattr3, Sattr3, TimeSet, Verf, WccData, FILE_SYNC, UNSTABLE};
+use super::types::{CreateHow, FILE_SYNC, Fattr3, Sattr3, TimeSet, UNSTABLE, Verf, WccData};
 
 /// Largest READ/WRITE transfer we will use, whatever FSINFO advertises.
 pub const MAX_TRANSFER: u32 = 1 << 20;
@@ -146,7 +149,9 @@ where
             return Ok(out);
         }
         if !got_any {
-            return Err(Error::Protocol("READDIR returned no entries before eof".into()));
+            return Err(Error::Protocol(
+                "READDIR returned no entries before eof".into(),
+            ));
         }
         verf = page.verf;
     }
@@ -175,13 +180,22 @@ fn page_from(verf: Verf, eof: bool, entries: Vec<DirEntry3>) -> Page {
 }
 
 impl Nfs3 {
-    fn call<A: Pack + ?Sized, R: crate::xdr::Unpack>(&mut self, procedure: u32, args: &A) -> Result<R> {
+    fn call<A: Pack + ?Sized, R: crate::xdr::Unpack>(
+        &mut self,
+        procedure: u32,
+        args: &A,
+    ) -> Result<R> {
         self.client.call(procedure, args)
     }
 
     /// The object created by CREATE/MKDIR/SYMLINK, with its attributes. The server
     /// may omit the handle or attributes; those are then fetched with LOOKUP/GETATTR.
-    fn new_object(&mut self, dir: &FileHandle, name: &[u8], ok: CreateOk) -> Result<(FileHandle, Attr)> {
+    fn new_object(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        ok: CreateOk,
+    ) -> Result<(FileHandle, Attr)> {
         match ok.fh {
             Some(fh) => {
                 let attr = match ok.attr {
@@ -245,7 +259,14 @@ impl ReadIo for V3Reads<'_, '_> {
     type Tag = u32;
 
     fn issue(&mut self, offset: u64, count: u32) -> Result<u32> {
-        self.fs.client.send_call(proto::READ, &ReadArgs { fh: self.fh, offset, count })
+        self.fs.client.send_call(
+            proto::READ,
+            &ReadArgs {
+                fh: self.fh,
+                offset,
+                count,
+            },
+        )
     }
 
     fn complete(&mut self, xid: u32) -> Result<(Vec<u8>, bool)> {
@@ -290,7 +311,14 @@ impl WriteIo for V3Writes<'_, '_> {
     }
 
     fn commit(&mut self, offset: u64, count: u32) -> Result<[u8; 8]> {
-        let c: Reply<CommitOk> = self.fs.call(proto::COMMIT, &CommitArgs { fh: self.fh, offset, count })?;
+        let c: Reply<CommitOk> = self.fs.call(
+            proto::COMMIT,
+            &CommitArgs {
+                fh: self.fh,
+                offset,
+                count,
+            },
+        )?;
         Ok(c.0.verf)
     }
 }
@@ -481,7 +509,12 @@ impl Filesystem for Nfs3 {
         Ok((fh, attr))
     }
 
-    fn mkdir(&mut self, dir: &FileHandle, name: &[u8], attrs: &SetAttr) -> Result<(FileHandle, Attr)> {
+    fn mkdir(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        attrs: &SetAttr,
+    ) -> Result<(FileHandle, Attr)> {
         let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_DIR_MODE);
         let s = Sattr3::from_fs(attrs);
         let r: Reply<CreateOk> = self.call(
@@ -565,7 +598,13 @@ impl Filesystem for Nfs3 {
 
     fn disconnect(&mut self) -> Result<()> {
         // UMNT is advisory: the server may already have forgotten the mount.
-        let _ = mount::umnt(self.host, self.mount_port, 3, &self.export, &self.mount_opts);
+        let _ = mount::umnt(
+            self.host,
+            self.mount_port,
+            3,
+            &self.export,
+            &self.mount_opts,
+        );
         Ok(())
     }
 }
@@ -596,14 +635,20 @@ mod tests {
     }
 
     fn names(v: &[fs::DirEntry]) -> Vec<String> {
-        v.iter().map(|e| String::from_utf8_lossy(&e.name).into_owned()).collect()
+        v.iter()
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect()
     }
 
     #[test]
     fn listing_single_page_filters_dots() {
         let out = list_all(|cookie, verf| {
             assert_eq!((cookie, verf), (0, [0; 8]));
-            Ok(page(0, vec![entry(".", 1), entry("..", 2), entry("a", 3), entry("b", 4)], true))
+            Ok(page(
+                0,
+                vec![entry(".", 1), entry("..", 2), entry("a", 3), entry("b", 4)],
+                true,
+            ))
         })
         .unwrap();
         assert_eq!(names(&out), ["a", "b"]);
@@ -615,7 +660,11 @@ mod tests {
         let out = list_all(|cookie, verf| {
             calls.borrow_mut().push((cookie, verf));
             Ok(match cookie {
-                0 => page(7, vec![entry(".", 1), entry("f1", 10), entry("f2", 11)], false),
+                0 => page(
+                    7,
+                    vec![entry(".", 1), entry("f1", 10), entry("f2", 11)],
+                    false,
+                ),
                 11 => page(7, vec![entry("f3", 12)], false),
                 12 => page(8, vec![entry("f4", 13)], true),
                 c => panic!("unexpected cookie {c}"),
@@ -687,7 +736,10 @@ mod tests {
         // Advertised 4 MiB is capped at 1 MiB.
         assert_eq!(transfer_size(4 << 20, 4 << 20, Proto::Tcp), MAX_TRANSFER);
         // UDP is capped lower.
-        assert_eq!(transfer_size(1 << 20, 1 << 20, Proto::Udp), UDP_MAX_TRANSFER);
+        assert_eq!(
+            transfer_size(1 << 20, 1 << 20, Proto::Udp),
+            UDP_MAX_TRANSFER
+        );
     }
 
     #[test]
@@ -730,7 +782,14 @@ mod tests {
         };
         let s = Nfs3::fsstat_from(f);
         assert_eq!(
-            (s.total_bytes, s.free_bytes, s.avail_bytes, s.total_files, s.free_files, s.avail_files),
+            (
+                s.total_bytes,
+                s.free_bytes,
+                s.avail_bytes,
+                s.total_files,
+                s.free_files,
+                s.avail_files
+            ),
             (1, 2, 3, 4, 5, 6)
         );
     }

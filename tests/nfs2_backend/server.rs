@@ -14,7 +14,7 @@ use std::thread;
 
 use nfsc::fs::FileHandle;
 use nfsc::nfs2::proto::*;
-use nfsc::xdr::{from_bytes, to_bytes, Decoder, Encoder, Opaque, Unpack};
+use nfsc::xdr::{Decoder, Encoder, Opaque, Unpack, from_bytes, to_bytes};
 
 const PROG: u32 = 100003;
 const VERS: u32 = 2;
@@ -295,7 +295,11 @@ impl MemFs {
             }
             return Ok((Self::handle(existing), self.attr(existing)));
         }
-        let mode = if sa.mode == UNSET { 0o644 } else { sa.mode & 0o7777 };
+        let mode = if sa.mode == UNSET {
+            0o644
+        } else {
+            sa.mode & 0o7777
+        };
         let (id, _) = self.insert_child(dir, name, mode, Body::File(Vec::new()))?;
         if sa.size != UNSET {
             self.setattr(&Self::handle(id), sa)?;
@@ -304,7 +308,11 @@ impl MemFs {
     }
 
     fn mkdir(&mut self, dir: &WireFh, name: &[u8], sa: Sattr) -> St<(WireFh, Fattr)> {
-        let mode = if sa.mode == UNSET { 0o755 } else { sa.mode & 0o7777 };
+        let mode = if sa.mode == UNSET {
+            0o755
+        } else {
+            sa.mode & 0o7777
+        };
         let (id, _) = self.insert_child(dir, name, mode, Body::Dir(BTreeMap::new()))?;
         self.node_mut(id).nlink = 2;
         Ok((Self::handle(id), self.attr(id)))
@@ -412,7 +420,8 @@ impl MemFs {
     fn readdir(&self, dir: &WireFh, cookie: Cookie, count: u32) -> St<DirList> {
         let d = self.id_of(dir)?;
         let entries = self.dir_entries(d)?;
-        let mut listing: Vec<(Vec<u8>, u32)> = vec![(b".".to_vec(), d), (b"..".to_vec(), self.node(d).parent)];
+        let mut listing: Vec<(Vec<u8>, u32)> =
+            vec![(b".".to_vec(), d), (b"..".to_vec(), self.node(d).parent)];
         listing.extend(entries.iter().map(|(k, &v)| (k.clone(), v)));
 
         let mut i = u32::from_be_bytes(cookie.0) as usize;
@@ -602,7 +611,6 @@ impl FakeNfs2 {
     pub fn root(&self) -> FileHandle {
         self.root.clone()
     }
-
 }
 
 /// Start a server on a fresh 127.0.0.1 port, serving TCP and UDP on that number.

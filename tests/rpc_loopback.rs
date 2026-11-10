@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use nfsc::error::{AcceptError, Error};
 use nfsc::rpc::{Auth, PortMode, Proto, RpcClient, RpcOptions};
-use nfsc::xdr::{to_bytes, Opaque};
+use nfsc::xdr::{Opaque, to_bytes};
 
 const PROG: u32 = 0x2000_0001;
 const VERS: u32 = 3;
@@ -70,7 +70,11 @@ fn write_record(s: &mut TcpStream, data: &[u8], frags: usize) {
     let chunk = data.len().div_ceil(frags).max(1);
     let pieces: Vec<&[u8]> = data.chunks(chunk).collect();
     for (i, piece) in pieces.iter().enumerate() {
-        let last = if i + 1 == pieces.len() { 0x8000_0000u32 } else { 0 };
+        let last = if i + 1 == pieces.len() {
+            0x8000_0000u32
+        } else {
+            0
+        };
         let hdr = last | piece.len() as u32;
         s.write_all(&hdr.to_be_bytes()).unwrap();
         s.write_all(piece).unwrap();
@@ -81,7 +85,9 @@ fn spawn_tcp(frags: usize, mut handler: Handler) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
-        let Ok((mut s, _)) = listener.accept() else { return };
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         while let Some(call) = read_record(&mut s) {
             let (xid, proc_, args) = parse_call(&call);
@@ -97,10 +103,13 @@ fn spawn_udp(mut handler: Handler) -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
     thread::spawn(move || {
-        sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
         let mut buf = vec![0u8; 65536];
         loop {
-            let Ok((n, peer)) = sock.recv_from(&mut buf) else { return };
+            let Ok((n, peer)) = sock.recv_from(&mut buf) else {
+                return;
+            };
             let (xid, proc_, args) = parse_call(&buf[..n]);
             for reply in handler(xid, proc_, &args) {
                 sock.send_to(&reply, peer).unwrap();
@@ -111,7 +120,12 @@ fn spawn_udp(mut handler: Handler) -> SocketAddr {
 }
 
 fn opts(proto: Proto, timeout: Duration) -> RpcOptions {
-    RpcOptions { proto, port_mode: PortMode::Unprivileged, timeout, auth: Auth::None }
+    RpcOptions {
+        proto,
+        port_mode: PortMode::Unprivileged,
+        timeout,
+        auth: Auth::None,
+    }
 }
 
 /// Procedure 0 = NULL; procedure 1 = double a u32; procedure 2 = opaque of N bytes (N from args).
@@ -147,7 +161,10 @@ fn tcp_multi_fragment_reply_is_reassembled() {
 #[test]
 fn tcp_skips_stale_xid_replies() {
     let handler: Handler = Box::new(|xid, _p, _a| {
-        vec![reply_ok(xid.wrapping_add(1000), &[0, 0, 0, 1]), reply_ok(xid, &[0, 0, 0, 84])]
+        vec![
+            reply_ok(xid.wrapping_add(1000), &[0, 0, 0, 1]),
+            reply_ok(xid, &[0, 0, 0, 84]),
+        ]
     });
     let addr = spawn_tcp(1, handler);
     let mut c = connect(addr, &opts(Proto::Tcp, Duration::from_secs(5)));
@@ -159,7 +176,10 @@ fn tcp_skips_stale_xid_replies() {
 #[test]
 fn udp_skips_stale_xid_datagrams() {
     let handler: Handler = Box::new(|xid, _p, _a| {
-        vec![reply_ok(xid.wrapping_add(1000), &[0, 0, 0, 1]), reply_ok(xid, &[0, 0, 0, 84])]
+        vec![
+            reply_ok(xid.wrapping_add(1000), &[0, 0, 0, 1]),
+            reply_ok(xid, &[0, 0, 0, 84]),
+        ]
     });
     let addr = spawn_udp(handler);
     let mut c = connect(addr, &opts(Proto::Udp, Duration::from_secs(5)));
@@ -183,10 +203,16 @@ fn udp_retransmits_when_first_datagram_is_dropped() {
     let mut c = connect(addr, &opts(Proto::Udp, Duration::from_secs(10)));
     let start = Instant::now();
     assert_eq!(c.call::<u32, u32>(1, &3).unwrap(), 6);
-    assert!(start.elapsed() >= Duration::from_millis(900), "retransmit should wait ~1s");
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "retransmit should wait ~1s"
+    );
     let seen = seen.lock().unwrap();
     assert!(seen.len() >= 2);
-    assert!(seen.iter().all(|&x| x == seen[0]), "retransmits reuse the xid");
+    assert!(
+        seen.iter().all(|&x| x == seen[0]),
+        "retransmits reuse the xid"
+    );
 }
 
 #[test]
@@ -205,7 +231,10 @@ fn udp_timeout_when_server_silent() {
     let start = Instant::now();
     assert!(matches!(c.null(), Err(Error::Timeout)));
     let el = start.elapsed();
-    assert!(el >= Duration::from_millis(1400) && el < Duration::from_secs(5), "{el:?}");
+    assert!(
+        el >= Duration::from_millis(1400) && el < Duration::from_secs(5),
+        "{el:?}"
+    );
 }
 
 #[test]
@@ -243,13 +272,19 @@ fn accept_error_is_surfaced() {
     });
     let addr = spawn_udp(handler);
     let mut c = connect(addr, &opts(Proto::Udp, Duration::from_secs(5)));
-    assert!(matches!(c.null(), Err(Error::Accept(AcceptError::ProgUnavail))));
+    assert!(matches!(
+        c.null(),
+        Err(Error::Accept(AcceptError::ProgUnavail))
+    ));
 }
 
 #[test]
 fn tcp_privileged_binds_or_errors() {
     let addr = spawn_tcp(1, standard_handler());
-    let o = RpcOptions { port_mode: PortMode::Privileged, ..opts(Proto::Tcp, Duration::from_secs(5)) };
+    let o = RpcOptions {
+        port_mode: PortMode::Privileged,
+        ..opts(Proto::Tcp, Duration::from_secs(5))
+    };
     match RpcClient::connect(addr, PROG, VERS, &o) {
         Ok(mut c) => {
             assert!(c.is_privileged());
@@ -264,7 +299,10 @@ fn tcp_privileged_binds_or_errors() {
 #[test]
 fn tcp_auto_mode_connects_and_calls() {
     let addr = spawn_tcp(1, standard_handler());
-    let o = RpcOptions { port_mode: PortMode::Auto, ..opts(Proto::Tcp, Duration::from_secs(5)) };
+    let o = RpcOptions {
+        port_mode: PortMode::Auto,
+        ..opts(Proto::Tcp, Duration::from_secs(5))
+    };
     let mut c = RpcClient::connect(addr, PROG, VERS, &o).unwrap();
     c.null().unwrap();
     assert_eq!(c.call::<u32, u32>(1, &5).unwrap(), 10);
@@ -273,7 +311,10 @@ fn tcp_auto_mode_connects_and_calls() {
 #[test]
 fn udp_auto_mode_connects_either_way() {
     let addr = spawn_udp(standard_handler());
-    let o = RpcOptions { port_mode: PortMode::Auto, ..opts(Proto::Udp, Duration::from_secs(5)) };
+    let o = RpcOptions {
+        port_mode: PortMode::Auto,
+        ..opts(Proto::Udp, Duration::from_secs(5))
+    };
     let mut c = RpcClient::connect(addr, PROG, VERS, &o).unwrap();
     c.null().unwrap();
 }
@@ -281,7 +322,10 @@ fn udp_auto_mode_connects_either_way() {
 #[test]
 fn udp_privileged_mode_either_binds_or_errors() {
     let addr = spawn_udp(standard_handler());
-    let o = RpcOptions { port_mode: PortMode::Privileged, ..opts(Proto::Udp, Duration::from_secs(5)) };
+    let o = RpcOptions {
+        port_mode: PortMode::Privileged,
+        ..opts(Proto::Udp, Duration::from_secs(5))
+    };
     match RpcClient::connect(addr, PROG, VERS, &o) {
         Ok(mut c) => {
             assert!(c.is_privileged());

@@ -1386,10 +1386,16 @@ fn get_r_does_not_write_through_a_local_symlink() {
     lcd(&mut s, &dl);
     let r = run(&mut s, "get -r t");
     assert!(
-        r.failure.as_deref().is_some_and(|f| f.contains("symbolic link")),
+        r.failure
+            .as_deref()
+            .is_some_and(|f| f.contains("symbolic link")),
         "{:?}",
         r.failure
     );
-    assert_eq!(fs::read(&victim).unwrap(), b"keep", "download wrote through a symlink");
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"keep",
+        "download wrote through a symlink"
+    );
     let _ = fs::remove_dir_all(&root);
 }

@@ -4,7 +4,10 @@
 
 use crate::error::{Error, Result};
 
-use super::backend::{back_channel_request, body, fore_channel_request, Nfs4Backend, Session, CB_PROGRAM, CHAN_REQUEST, MAX_SLOTS};
+use super::backend::{
+    CB_PROGRAM, CHAN_REQUEST, MAX_SLOTS, Nfs4Backend, Session, back_channel_request, body,
+    fore_channel_request,
+};
 use super::ops::{Op, Res};
 use super::types::code;
 

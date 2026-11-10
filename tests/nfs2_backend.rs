@@ -15,7 +15,7 @@ use nfsc::fs::{
 use nfsc::nfs2::connect_with_root;
 use nfsc::rpc::{Auth, PortMode, Proto, RpcOptions};
 
-use server::{start, FakeNfs2};
+use server::{FakeNfs2, start};
 
 fn rpc_opts(proto: Proto) -> RpcOptions {
     RpcOptions {
@@ -77,7 +77,12 @@ fn names(entries: &[nfsc::fs::DirEntry]) -> Vec<Vec<u8>> {
 }
 
 fn create_file(fs: &mut dyn Filesystem, dir: &FileHandle, name: &str) -> (FileHandle, Attr) {
-    ok(fs.create(dir, name.as_bytes(), CreateMode::Unchecked, &SetAttr::default()))
+    ok(fs.create(
+        dir,
+        name.as_bytes(),
+        CreateMode::Unchecked,
+        &SetAttr::default(),
+    ))
 }
 
 fn mkdir(fs: &mut dyn Filesystem, dir: &FileHandle, name: &str) -> FileHandle {
@@ -113,11 +118,21 @@ fn full_suite(proto: Proto) {
     assert_eq!(attr.ftype, FileType::Regular);
     assert_eq!(attr.size, 0);
     expect_status(
-        fs.create(&root, b"hello.txt", CreateMode::Guarded, &SetAttr::default()),
+        fs.create(
+            &root,
+            b"hello.txt",
+            CreateMode::Guarded,
+            &SetAttr::default(),
+        ),
         Status::Exist,
     );
     expect_status(
-        fs.create(&root, b"hello.txt", CreateMode::Exclusive, &SetAttr::default()),
+        fs.create(
+            &root,
+            b"hello.txt",
+            CreateMode::Exclusive,
+            &SetAttr::default(),
+        ),
         Status::Exist,
     );
     // Unchecked returns the existing file.
@@ -168,7 +183,13 @@ fn full_suite(proto: Proto) {
     let after = ok(fs.setattr(&hello, &attrs));
     assert_eq!(after.mode, 0o600);
     assert_eq!(after.size, 5);
-    assert_eq!(after.mtime, Time { seconds: 1_600_000_000, nseconds: 5_000_000 });
+    assert_eq!(
+        after.mtime,
+        Time {
+            seconds: 1_600_000_000,
+            nseconds: 5_000_000
+        }
+    );
     assert_eq!(read_all(fs.as_mut(), &hello), b"hello");
 
     // mkdir, nested lookup, ".." via lookup.
@@ -190,7 +211,11 @@ fn full_suite(proto: Proto) {
         names(&entries),
         vec![b"big.bin".to_vec(), b"d".to_vec(), b"hello.txt".to_vec()]
     );
-    assert!(entries.iter().all(|e| e.attr.is_none() && e.handle.is_none()));
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.attr.is_none() && e.handle.is_none())
+    );
     assert_eq!(names(&ok(fs.readdir(&dir))), vec![b"inner".to_vec()]);
 
     // symlink, then readlink; the new entry is looked up.
@@ -246,10 +271,7 @@ fn full_suite(proto: Proto) {
     expect_status(fs.getattr(&FileHandle(vec![0; 16])), Status::BadHandle);
 
     // Names over 255 bytes are rejected locally.
-    expect_status(
-        fs.lookup(&root, &[b'n'; 256]),
-        Status::NameTooLong,
-    );
+    expect_status(fs.lookup(&root, &[b'n'; 256]), Status::NameTooLong);
 
     // Exclusive create on a fresh name works (best effort, not atomic).
     ok(fs.create(&root, b"excl", CreateMode::Exclusive, &SetAttr::default()));
@@ -368,13 +390,8 @@ fn timeout_when_server_never_answers() {
     let srv = start();
     let mut opts = rpc_opts(Proto::Udp);
     opts.timeout = Duration::from_millis(1500);
-    let mut fs = connect_with_root(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        srv.port,
-        srv.root(),
-        &opts,
-    )
-    .unwrap();
+    let mut fs =
+        connect_with_root(IpAddr::V4(Ipv4Addr::LOCALHOST), srv.port, srv.root(), &opts).unwrap();
     // Drop more requests than the client will send in its window.
     srv.stats.udp_drop.store(100, Ordering::SeqCst);
     match fs.getattr(&fs.root()) {

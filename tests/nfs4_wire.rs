@@ -4,8 +4,8 @@
 use nfsc::fs::{FileType, NfsVersion, SetAttr, SetTime, Status, Time};
 use nfsc::nfs4::compound::{CompoundArgs, CompoundRes};
 use nfsc::nfs4::ops::{ChannelAttrs, Op, Res, ResOp};
-use nfsc::nfs4::types::{attr, bitmap, encode_setattr, StateId};
-use nfsc::xdr::{from_bytes, to_bytes, Encoder};
+use nfsc::nfs4::types::{StateId, attr, bitmap, encode_setattr};
+use nfsc::xdr::{Encoder, from_bytes, to_bytes};
 
 /// Big-endian u32 words to bytes.
 fn words(ws: &[u32]) -> Vec<u8> {
@@ -14,7 +14,10 @@ fn words(ws: &[u32]) -> Vec<u8> {
 
 #[test]
 fn exchange_id_args_bytes() {
-    let op = Op::ExchangeId { verifier: [1; 8], owner: b"ab".to_vec() };
+    let op = Op::ExchangeId {
+        verifier: [1; 8],
+        owner: b"ab".to_vec(),
+    };
     let mut want = words(&[42]);
     want.extend_from_slice(&[1; 8]);
     want.extend(words(&[2]));
@@ -28,7 +31,12 @@ fn sequence_putrootfh_getattr_compound_bytes() {
     let args = CompoundArgs {
         minor: 1,
         ops: vec![
-            Op::Sequence { session: [0xab; 16], seqid: 5, slot: 0, highest: 0 },
+            Op::Sequence {
+                session: [0xab; 16],
+                seqid: 5,
+                slot: 0,
+                highest: 0,
+            },
             Op::Putrootfh,
             Op::Getattr(vec![attr::TYPE]),
         ],
@@ -52,7 +60,13 @@ fn create_session_args_bytes() {
         maxoperations: 5,
         maxrequests: 6,
     };
-    let op = Op::CreateSession { clientid: 0x0102_0304_0506_0708, sequence: 9, fore: chan, back: chan, cb_program: 7 };
+    let op = Op::CreateSession {
+        clientid: 0x0102_0304_0506_0708,
+        sequence: 9,
+        fore: chan,
+        back: chan,
+        cb_program: 7,
+    };
     let mut want = words(&[43]);
     want.extend(words(&[0x0102_0304, 0x0506_0708, 9, 0])); // clientid, sequence, flags
     let ch = [1, 2, 3, 4, 5, 6, 0]; // six attrs + empty rdma_ird
@@ -69,7 +83,13 @@ fn close_and_readlink_result_decode() {
     b.extend(words(&[3]));
     b.extend([7; 12]);
     let r: ResOp = from_bytes(&b).unwrap();
-    assert_eq!(r.body, Res::Stateid(StateId { seqid: 3, other: [7; 12] }));
+    assert_eq!(
+        r.body,
+        Res::Stateid(StateId {
+            seqid: 3,
+            other: [7; 12]
+        })
+    );
 
     // READLINK result: "target"
     let mut b = words(&[27, 0, 6]);
@@ -92,14 +112,24 @@ fn getattr_fattr4_decode_and_conversion() {
     vals.put_string(b"alice@example.com");
     vals.put_i64(1_700_000_000).put_u32(5); // time_modify
     let vals = vals.into_inner();
-    let bm = bitmap(&[attr::TYPE, attr::SIZE, attr::MODE, attr::NUMLINKS, attr::OWNER, attr::OWNER_GROUP, attr::TIME_MODIFY]);
+    let bm = bitmap(&[
+        attr::TYPE,
+        attr::SIZE,
+        attr::MODE,
+        attr::NUMLINKS,
+        attr::OWNER,
+        attr::OWNER_GROUP,
+        attr::TIME_MODIFY,
+    ]);
     let mut b = words(&[9, 0]); // GETATTR, OK
     b.extend(words(&[bm.len() as u32]));
     b.extend(words(&bm));
     b.extend(words(&[vals.len() as u32]));
     b.extend_from_slice(&vals);
     let r: ResOp = from_bytes(&b).unwrap();
-    let Res::Attr(a) = r.body else { panic!("not an attr") };
+    let Res::Attr(a) = r.body else {
+        panic!("not an attr")
+    };
     let attr = a.to_attr();
     assert_eq!(attr.ftype, FileType::Directory);
     assert_eq!(attr.size, 4096);
@@ -109,7 +139,13 @@ fn getattr_fattr4_decode_and_conversion() {
     assert_eq!(attr.gid, u32::MAX, "user@domain owner maps to the sentinel");
     assert_eq!(attr.owner.as_deref(), Some("1000"));
     assert_eq!(attr.group.as_deref(), Some("alice@example.com"));
-    assert_eq!(attr.mtime, Time { seconds: 1_700_000_000, nseconds: 5 });
+    assert_eq!(
+        attr.mtime,
+        Time {
+            seconds: 1_700_000_000,
+            nseconds: 5
+        }
+    );
 }
 
 #[test]
@@ -140,7 +176,14 @@ fn readdir_reply_decode() {
     b.extend(words(&[0, 1]));
 
     let r: ResOp = from_bytes(&b).unwrap();
-    let Res::Readdir { verifier, entries, eof } = r.body else { panic!("not readdir") };
+    let Res::Readdir {
+        verifier,
+        entries,
+        eof,
+    } = r.body
+    else {
+        panic!("not readdir")
+    };
     assert_eq!(verifier, [9; 8]);
     assert!(eof);
     assert_eq!(entries.len(), 1);
@@ -156,7 +199,10 @@ fn compound_res_minor_version_mismatch() {
     let res: CompoundRes = from_bytes(&words(&[10021, 0, 0])).unwrap();
     assert_eq!(res.status, 10021);
     assert!(res.results.is_empty());
-    assert_eq!(Status::from_v4(10021, 2), Status::Other(NfsVersion::V4(2), 10021));
+    assert_eq!(
+        Status::from_v4(10021, 2),
+        Status::Other(NfsVersion::V4(2), 10021)
+    );
 }
 
 #[test]
@@ -165,7 +211,10 @@ fn status_mapping() {
     assert_eq!(Status::from_v4(21, 0), Status::IsDir);
     assert_eq!(Status::from_v4(10008, 0), Status::Jukebox);
     assert_eq!(Status::from_v4(10004, 1), Status::NotSupp);
-    assert_eq!(Status::from_v4(10063, 1), Status::Other(NfsVersion::V4(1), 10063));
+    assert_eq!(
+        Status::from_v4(10063, 1),
+        Status::Other(NfsVersion::V4(1), 10063)
+    );
 }
 
 #[test]
@@ -174,7 +223,10 @@ fn setattr_encoding_is_ascending_and_numeric_owner() {
         mode: Some(0o640),
         uid: Some(1000),
         size: Some(10),
-        mtime: Some(SetTime::Client(Time { seconds: 5, nseconds: 6 })),
+        mtime: Some(SetTime::Client(Time {
+            seconds: 5,
+            nseconds: 6,
+        })),
         atime: Some(SetTime::ServerNow),
         ..Default::default()
     };
@@ -190,7 +242,10 @@ fn setattr_encoding_is_ascending_and_numeric_owner() {
 
 #[test]
 fn stateid_roundtrip_and_anon() {
-    let s = StateId { seqid: 2, other: [3; 12] };
+    let s = StateId {
+        seqid: 2,
+        other: [3; 12],
+    };
     let b = to_bytes(&s);
     assert_eq!(b.len(), 16);
     assert_eq!(from_bytes::<StateId>(&b).unwrap(), s);
@@ -199,7 +254,12 @@ fn stateid_roundtrip_and_anon() {
 
 #[test]
 fn write_args_use_file_sync() {
-    let op = Op::Write { stateid: StateId::default(), offset: 0x10, data: b"xyz".to_vec(), stable: 2 };
+    let op = Op::Write {
+        stateid: StateId::default(),
+        offset: 0x10,
+        data: b"xyz".to_vec(),
+        stable: 2,
+    };
     let b = to_bytes(&op);
     // opcode 38, stateid(16), offset(8), stable=2, opaque(3 + pad)
     assert_eq!(&b[..4], &words(&[38])[..]);
@@ -210,7 +270,12 @@ fn write_args_use_file_sync() {
 #[test]
 fn unstable_write_args_encode_stable_how_zero() {
     use nfsc::nfs4::ops::UNSTABLE4;
-    let op = Op::Write { stateid: StateId::default(), offset: 0x20, data: b"ab".to_vec(), stable: UNSTABLE4 };
+    let op = Op::Write {
+        stateid: StateId::default(),
+        offset: 0x20,
+        data: b"ab".to_vec(),
+        stable: UNSTABLE4,
+    };
     let b = to_bytes(&op);
     // opcode 38, stateid(16), offset(8), stable_how=0 (UNSTABLE4), opaque(2 + pad)
     assert_eq!(&b[..4], &words(&[38])[..]);
@@ -231,13 +296,19 @@ fn unset_setattr_is_empty() {
 fn connection_refused_is_version_unsupported() {
     use nfsc::fs::{ConnectOptions, VersionPref};
     use nfsc::rpc::RpcOptions;
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let opts = ConnectOptions {
         rpc: RpcOptions::default(),
         nfs_port: Some(port),
         mount_port: None,
         version: VersionPref::AnyV4,
     };
-    let err = nfsc::nfs4::connect("127.0.0.1".parse().unwrap(), b"/", None, &opts).err().unwrap();
+    let err = nfsc::nfs4::connect("127.0.0.1".parse().unwrap(), b"/", None, &opts)
+        .err()
+        .unwrap();
     assert!(err.is_version_unsupported(), "got {err}");
 }

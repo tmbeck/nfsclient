@@ -56,7 +56,11 @@ pub fn get_fh(d: &mut Decoder<'_>) -> Result<FileHandle> {
 
 /// post_op_fh3: optional nfs_fh3.
 pub fn get_opt_fh(d: &mut Decoder<'_>) -> Result<Option<FileHandle>> {
-    if d.get_bool()? { Ok(Some(get_fh(d)?)) } else { Ok(None) }
+    if d.get_bool()? {
+        Ok(Some(get_fh(d)?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn put_verf(e: &mut Encoder, v: &Verf) {
@@ -336,7 +340,10 @@ mod tests {
             gid: Some(100),
             size: Some(0x1_0000_0002),
             atime: TimeSet::ServerTime,
-            mtime: TimeSet::Client(NfsTime { seconds: 7, nseconds: 9 }),
+            mtime: TimeSet::Client(NfsTime {
+                seconds: 7,
+                nseconds: 9,
+            }),
         };
         let want: &[u8] = &[
             0, 0, 0, 1, 0, 0, 0x01, 0xa4, // mode = 0644
@@ -393,7 +400,13 @@ mod tests {
         assert_eq!(a.ftype, FileType::Regular);
         assert_eq!(a.mode, 0o644, "file type bits must be stripped");
         assert_eq!(a.fileid, 42);
-        assert_eq!(a.mtime, Time { seconds: 1_700_000_001, nseconds: 2 });
+        assert_eq!(
+            a.mtime,
+            Time {
+                seconds: 1_700_000_001,
+                nseconds: 2
+            }
+        );
         assert_eq!(a.owner, None);
     }
 
@@ -423,7 +436,12 @@ mod tests {
     #[test]
     fn wcc_data_with_both_present() {
         let mut e = Encoder::new();
-        e.put_bool(true).put_u64(5).put_u32(1).put_u32(2).put_u32(3).put_u32(4);
+        e.put_bool(true)
+            .put_u64(5)
+            .put_u32(1)
+            .put_u32(2)
+            .put_u32(3)
+            .put_u32(4);
         e.put_bool(true).put_opaque_fixed(&sample_fattr_bytes());
         let w: WccData = from_bytes(e.as_bytes()).unwrap();
         assert_eq!(w.before.unwrap().size, 5);
@@ -468,7 +486,21 @@ mod tests {
 
     #[test]
     fn set_time_clamps() {
-        assert_eq!(NfsTime::from_time(Time { seconds: -5, nseconds: 0 }).seconds, 0);
-        assert_eq!(NfsTime::from_time(Time { seconds: 1 << 40, nseconds: 0 }).seconds, u32::MAX);
+        assert_eq!(
+            NfsTime::from_time(Time {
+                seconds: -5,
+                nseconds: 0
+            })
+            .seconds,
+            0
+        );
+        assert_eq!(
+            NfsTime::from_time(Time {
+                seconds: 1 << 40,
+                nseconds: 0
+            })
+            .seconds,
+            u32::MAX
+        );
     }
 }

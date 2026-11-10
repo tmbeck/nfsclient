@@ -37,7 +37,10 @@ pub enum Error {
     /// Protocol violation by the peer (bad xid, bad msg type, oversized record, ...).
     Protocol(String),
     /// Program/version/protocol is not registered with the portmapper.
-    NotRegistered { prog: u32, vers: u32 },
+    NotRegistered {
+        prog: u32,
+        vers: u32,
+    },
     /// Bad user input (address parse, etc.).
     Invalid(String),
     /// The server returned a non-OK NFS or MOUNT status.
@@ -87,7 +90,10 @@ impl fmt::Display for Error {
             Error::Accept(a) => match a {
                 AcceptError::ProgUnavail => write!(f, "RPC program unavailable"),
                 AcceptError::ProgMismatch { low, high } => {
-                    write!(f, "RPC program version mismatch (server supports {low}..{high})")
+                    write!(
+                        f,
+                        "RPC program version mismatch (server supports {low}..{high})"
+                    )
                 }
                 AcceptError::ProcUnavail => write!(f, "RPC procedure unavailable"),
                 AcceptError::GarbageArgs => write!(f, "server could not decode arguments"),
@@ -95,7 +101,10 @@ impl fmt::Display for Error {
             },
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::NotRegistered { prog, vers } => {
-                write!(f, "program {prog} version {vers} is not registered with portmapper")
+                write!(
+                    f,
+                    "program {prog} version {vers} is not registered with portmapper"
+                )
             }
             Error::Invalid(m) => write!(f, "{m}"),
             Error::Nfs(st) => write!(f, "{st}"),

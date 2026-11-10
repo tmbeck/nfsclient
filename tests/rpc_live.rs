@@ -24,6 +24,7 @@ fn portmap_null_over_tcp_and_udp() {
             auth: Auth::None,
         };
         let mut c = RpcClient::connect(addr, 100000, 2, &opts).expect("connect");
-        c.null().unwrap_or_else(|e| panic!("NULL over {}: {e}", proto.name()));
+        c.null()
+            .unwrap_or_else(|e| panic!("NULL over {}: {e}", proto.name()));
     }
 }

@@ -17,7 +17,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use nfsc::error::Error;
-use nfsc::fs::{self, Attr, ConnectOptions, Connected, FileHandle, FileType, Filesystem, NfsVersion, Status, VersionPref};
+use nfsc::fs::{
+    self, Attr, ConnectOptions, Connected, FileHandle, FileType, Filesystem, NfsVersion, Status,
+    VersionPref,
+};
 use nfsc::rpc::{Auth, PortMode, Proto, RpcOptions};
 
 fn resolve(host: &str) -> IpAddr {
@@ -35,7 +38,9 @@ fn resolve(host: &str) -> IpAddr {
 /// Parse `host:/export` from an environment variable.
 fn target(var: &str) -> Option<(IpAddr, Vec<u8>)> {
     let spec = std::env::var(var).ok()?;
-    let (host, path) = spec.split_once(':').unwrap_or_else(|| panic!("{var} must be host:/export"));
+    let (host, path) = spec
+        .split_once(':')
+        .unwrap_or_else(|| panic!("{var} must be host:/export"));
     Some((resolve(host), path.as_bytes().to_vec()))
 }
 
@@ -89,20 +94,32 @@ fn sha256_hex(data: &[u8]) -> String {
         .stdout(Stdio::piped())
         .spawn()
         .expect("run sha256sum");
-    child.stdin.take().unwrap().write_all(data).expect("write to sha256sum");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(data)
+        .expect("write to sha256sum");
     let out = child.wait_with_output().expect("sha256sum");
     String::from_utf8_lossy(&out.stdout)[..64].to_string()
 }
 
 fn browse(ip: IpAddr, path: &[u8], proto: Proto) {
-    let Connected { mut fs, export, remainder } = connect(ip, path, proto);
+    let Connected {
+        mut fs,
+        export,
+        remainder,
+    } = connect(ip, path, proto);
     assert_eq!(fs.version(), NfsVersion::V3);
     assert!(fs.max_read() > 0 && fs.max_write() > 0);
     eprintln!(
         "[{}] export {} remainder {:?} max_read {} max_write {}",
         proto.name(),
         String::from_utf8_lossy(&export),
-        remainder.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>(),
+        remainder
+            .iter()
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>(),
         fs.max_read(),
         fs.max_write()
     );
@@ -114,13 +131,21 @@ fn browse(ip: IpAddr, path: &[u8], proto: Proto) {
     let mut names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), entries.len(), "readdir returned duplicate names");
+    assert_eq!(
+        names.len(),
+        entries.len(),
+        "readdir returned duplicate names"
+    );
     assert!(!names.contains(&&b"."[..]) && !names.contains(&&b".."[..]));
 
     let mut checked_file = false;
     for e in &entries {
         let (fh, attr) = fs.lookup(&dir, &e.name).expect("lookup of a listed name");
-        assert_eq!(attr.fileid, e.fileid, "readdir fileid must match lookup for {:?}", e.name);
+        assert_eq!(
+            attr.fileid, e.fileid,
+            "readdir fileid must match lookup for {:?}",
+            e.name
+        );
         if let Some(a) = &e.attr {
             assert_eq!(a.size, attr.size, "READDIRPLUS attrs disagree with GETATTR");
         }
@@ -137,7 +162,10 @@ fn browse(ip: IpAddr, path: &[u8], proto: Proto) {
                     assert!(!first.0.is_empty(), "non-empty file returned no data");
                 }
                 let past = fs.read(&fh, attr.size, 4096).expect("read at EOF");
-                assert!(past.0.is_empty() && past.1, "read at EOF must be empty with eof");
+                assert!(
+                    past.0.is_empty() && past.1,
+                    "read at EOF must be empty with eof"
+                );
             }
             _ => {}
         }
@@ -151,7 +179,8 @@ fn browse(ip: IpAddr, path: &[u8], proto: Proto) {
         Err(Error::Nfs(Status::NoEnt)) => {}
         other => panic!("lookup of a missing name returned {other:?}"),
     }
-    fs.lookup(&root, b"..").expect("lookup .. from the export root");
+    fs.lookup(&root, b"..")
+        .expect("lookup .. from the export root");
     fs.disconnect().expect("disconnect");
 }
 
@@ -178,7 +207,13 @@ fn ro_browse_udp() {
         proto: Proto::Udp,
         ..RpcOptions::default()
     };
-    match nfsc::portmap::getport(ip, nfsc::nfs3::PROGRAM, nfsc::nfs3::VERSION, Proto::Udp, &udp) {
+    match nfsc::portmap::getport(
+        ip,
+        nfsc::nfs3::PROGRAM,
+        nfsc::nfs3::VERSION,
+        Proto::Udp,
+        &udp,
+    ) {
         Err(Error::NotRegistered { .. }) => {
             eprintln!("NFSv3 is not registered over UDP on this server; skipping");
             return;
@@ -202,7 +237,11 @@ fn ro_resolve_deeper_path() {
         .readdir(&root)
         .expect("readdir root")
         .into_iter()
-        .find(|e| e.attr.as_ref().is_some_and(|a| a.ftype == FileType::Directory))
+        .find(|e| {
+            e.attr
+                .as_ref()
+                .is_some_and(|a| a.ftype == FileType::Directory)
+        })
         .map(|e| e.name);
     fs.disconnect().expect("disconnect");
     let Some(subdir) = subdir else {
@@ -213,7 +252,11 @@ fn ro_resolve_deeper_path() {
     deeper.push(b'/');
     deeper.extend_from_slice(&subdir);
     deeper.extend_from_slice(b"/nfsc-missing");
-    let Connected { mut fs, export, remainder } = connect(ip, &deeper, Proto::Tcp);
+    let Connected {
+        mut fs,
+        export,
+        remainder,
+    } = connect(ip, &deeper, Proto::Tcp);
     assert_eq!(export, path, "the export containing the deeper path");
     assert_eq!(remainder.len(), 2);
     assert_eq!(remainder[0], subdir);
@@ -250,7 +293,9 @@ fn ro_fixtures_match_manifest() {
     };
     // Raw bytes: fixtures deliberately include a non-UTF-8 file name.
     let text = std::fs::read(&manifest).expect("read manifest");
-    let Connected { mut fs, remainder, .. } = connect(ip, &path, Proto::Tcp);
+    let Connected {
+        mut fs, remainder, ..
+    } = connect(ip, &path, Proto::Tcp);
     let root = fs.root();
     let (base, _) = walk(fs.as_mut(), root, &remainder);
 
@@ -258,7 +303,9 @@ fn ro_fixtures_match_manifest() {
     for line in text.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let (want, rel) = line.split_at(64);
         let want = std::str::from_utf8(want).expect("hex digest");
-        let rel = rel.strip_prefix(b"  ").expect("manifest line: '<sha256>  <path>'");
+        let rel = rel
+            .strip_prefix(b"  ")
+            .expect("manifest line: '<sha256>  <path>'");
         let mut fh = base.clone();
         for comp in rel.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
             fh = fs.lookup(&fh, comp).expect("lookup fixture").0;

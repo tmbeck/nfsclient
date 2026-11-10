@@ -60,7 +60,8 @@ fn read_record(s: &mut TcpStream) -> Option<Vec<u8>> {
 }
 
 fn write_record(s: &mut TcpStream, body: &[u8]) {
-    s.write_all(&(0x8000_0000u32 | body.len() as u32).to_be_bytes()).unwrap();
+    s.write_all(&(0x8000_0000u32 | body.len() as u32).to_be_bytes())
+        .unwrap();
     s.write_all(body).unwrap();
 }
 
@@ -98,7 +99,9 @@ fn reverse_batches(n: usize) -> SocketAddr {
         loop {
             let mut batch = Vec::new();
             for _ in 0..n {
-                let Some(rec) = read_record(&mut s) else { return };
+                let Some(rec) = read_record(&mut s) else {
+                    return;
+                };
                 batch.push(parse_call(&rec));
             }
             for (xid, _proc, arg) in batch.into_iter().rev() {
@@ -117,7 +120,9 @@ fn out_of_order_replies_are_matched_by_xid() {
     let addr = reverse_batches(8);
     let mut c = pipelined_client(addr, Duration::from_secs(10));
     assert!(c.pipelined());
-    let xids: Vec<u32> = (0..8).map(|i| c.send_call(DOUBLE, &(i as u32 + 1)).unwrap()).collect();
+    let xids: Vec<u32> = (0..8)
+        .map(|i| c.send_call(DOUBLE, &(i as u32 + 1)).unwrap())
+        .collect();
     assert_eq!(c.outstanding(), 8);
     for (i, xid) in xids.iter().enumerate() {
         let got: u32 = c.recv_reply(*xid).unwrap();
@@ -219,7 +224,10 @@ fn dropped_connection_fails_outstanding_calls_and_reconnects() {
     let mut c = pipelined_client(addr, Duration::from_secs(10));
     let a = c.send_call(DOUBLE, &1u32).unwrap();
     let b = c.send_call(DOUBLE, &2u32).unwrap();
-    assert!(c.recv_reply::<u32>(a).is_err(), "connection closed under pending calls");
+    assert!(
+        c.recv_reply::<u32>(a).is_err(),
+        "connection closed under pending calls"
+    );
     assert!(c.recv_reply::<u32>(b).is_err());
     assert_eq!(c.outstanding(), 0);
     // A new call reconnects (the server accepts a second connection).
@@ -256,7 +264,9 @@ fn large_window_of_pipelined_calls() {
     let addr = reverse_batches(16);
     let mut c = pipelined_client(addr, Duration::from_secs(20));
     for round in 0..4u32 {
-        let xids: Vec<u32> = (0..16).map(|i| c.send_call(DOUBLE, &(round * 100 + i)).unwrap()).collect();
+        let xids: Vec<u32> = (0..16)
+            .map(|i| c.send_call(DOUBLE, &(round * 100 + i)).unwrap())
+            .collect();
         for (i, x) in xids.iter().enumerate() {
             let v: u32 = c.recv_reply(*x).unwrap();
             assert_eq!(v, (round * 100 + i as u32) * 2);
@@ -271,12 +281,15 @@ fn udp_send_call_completes_synchronously_and_recv_returns_reply() {
     thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         loop {
-            let Ok((n, peer)) = sock.recv_from(&mut buf) else { return };
+            let Ok((n, peer)) = sock.recv_from(&mut buf) else {
+                return;
+            };
             let (xid, _, arg) = parse_call(&buf[..n]);
             sock.send_to(&double_reply(xid, arg), peer).unwrap();
         }
     });
-    let mut c = RpcClient::connect(addr, PROG, VERS, &opts(Proto::Udp, Duration::from_secs(5))).unwrap();
+    let mut c =
+        RpcClient::connect(addr, PROG, VERS, &opts(Proto::Udp, Duration::from_secs(5))).unwrap();
     assert!(!c.pipelined());
     let a = c.send_call(DOUBLE, &6u32).unwrap();
     let b = c.send_call(DOUBLE, &7u32).unwrap();

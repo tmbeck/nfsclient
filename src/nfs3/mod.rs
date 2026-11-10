@@ -91,7 +91,11 @@ fn choose_export(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> (Vec<u8>, 
 /// Canonical absolute form: single slashes, no trailing slash (except root).
 fn normalize(path: &[u8]) -> Vec<u8> {
     let mut out = vec![b'/'];
-    for (i, comp) in path.split(|&b| b == b'/').filter(|c| !c.is_empty()).enumerate() {
+    for (i, comp) in path
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty())
+        .enumerate()
+    {
         if i > 0 {
             out.push(b'/');
         }
@@ -130,7 +134,10 @@ mod tests {
         assert!(check_flavors(&[1], ex).is_ok());
         assert!(check_flavors(&[0, 390003], ex).is_ok());
         let err = check_flavors(&[390003, 390004], ex).unwrap_err();
-        assert!(err.to_string().contains("390003"), "message should list the flavors: {err}");
+        assert!(
+            err.to_string().contains("390003"),
+            "message should list the flavors: {err}"
+        );
         assert!(check_flavors(&[], ex).is_err());
     }
 }

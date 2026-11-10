@@ -46,7 +46,10 @@ mod tests {
 
     #[test]
     fn empty_compound_args_bytes() {
-        let args = CompoundArgs { minor: 2, ops: vec![] };
+        let args = CompoundArgs {
+            minor: 2,
+            ops: vec![],
+        };
         // tag "" , minorversion 2, zero ops
         assert_eq!(to_bytes(&args), vec![0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0]);
     }

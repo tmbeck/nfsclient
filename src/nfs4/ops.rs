@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::xdr::{Decoder, Encoder, Pack, Unpack};
 
-use super::types::{bitmap, code, get_session_id, get_verf, AttrSet, Fattr, StateId};
+use super::types::{AttrSet, Fattr, StateId, bitmap, code, get_session_id, get_verf};
 
 pub const OP_CLOSE: u32 = 4;
 pub const OP_COMMIT: u32 = 5;
@@ -94,7 +94,11 @@ pub enum Claim {
 pub enum OpenHow {
     NoCreate,
     /// createmode4: 0 UNCHECKED4, 1 GUARDED4, 2 EXCLUSIVE4, 3 EXCLUSIVE4_1.
-    Create { mode: u32, verf: [u8; 8], attrs: Fattr },
+    Create {
+        mode: u32,
+        verf: [u8; 8],
+        attrs: Fattr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,14 +122,37 @@ pub enum CreateKind {
 /// backend, not by callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    Sequence { session: [u8; 16], seqid: u32, slot: u32, highest: u32 },
-    ExchangeId { verifier: [u8; 8], owner: Vec<u8> },
-    CreateSession { clientid: u64, sequence: u32, fore: ChannelAttrs, back: ChannelAttrs, cb_program: u32 },
+    Sequence {
+        session: [u8; 16],
+        seqid: u32,
+        slot: u32,
+        highest: u32,
+    },
+    ExchangeId {
+        verifier: [u8; 8],
+        owner: Vec<u8>,
+    },
+    CreateSession {
+        clientid: u64,
+        sequence: u32,
+        fore: ChannelAttrs,
+        back: ChannelAttrs,
+        cb_program: u32,
+    },
     DestroySession([u8; 16]),
     DestroyClientid(u64),
     ReclaimComplete,
-    Setclientid { verifier: [u8; 8], id: Vec<u8>, cb_program: u32, cb_addr: String, cb_ident: u32 },
-    SetclientidConfirm { clientid: u64, verifier: [u8; 8] },
+    Setclientid {
+        verifier: [u8; 8],
+        id: Vec<u8>,
+        cb_program: u32,
+        cb_addr: String,
+        cb_ident: u32,
+    },
+    SetclientidConfirm {
+        clientid: u64,
+        verifier: [u8; 8],
+    },
     Renew(u64),
     Putrootfh,
     Putfh(Vec<u8>),
@@ -134,21 +161,55 @@ pub enum Op {
     Lookup(Vec<u8>),
     Lookupp,
     Getattr(Vec<u32>),
-    Setattr { stateid: StateId, attrs: Fattr },
+    Setattr {
+        stateid: StateId,
+        attrs: Fattr,
+    },
     Readlink,
-    Read { stateid: StateId, offset: u64, count: u32 },
+    Read {
+        stateid: StateId,
+        offset: u64,
+        count: u32,
+    },
     /// `stable` is UNSTABLE4 or FILE_SYNC4.
-    Write { stateid: StateId, offset: u64, data: Vec<u8>, stable: u32 },
-    Commit { offset: u64, count: u32 },
+    Write {
+        stateid: StateId,
+        offset: u64,
+        data: Vec<u8>,
+        stable: u32,
+    },
+    Commit {
+        offset: u64,
+        count: u32,
+    },
     Open(OpenArgs),
-    OpenConfirm { stateid: StateId, seqid: u32 },
-    Close { seqid: u32, stateid: StateId },
+    OpenConfirm {
+        stateid: StateId,
+        seqid: u32,
+    },
+    Close {
+        seqid: u32,
+        stateid: StateId,
+    },
     DelegReturn(StateId),
-    Create { kind: CreateKind, name: Vec<u8>, attrs: Fattr },
+    Create {
+        kind: CreateKind,
+        name: Vec<u8>,
+        attrs: Fattr,
+    },
     Remove(Vec<u8>),
-    Rename { from: Vec<u8>, to: Vec<u8> },
+    Rename {
+        from: Vec<u8>,
+        to: Vec<u8>,
+    },
     Link(Vec<u8>),
-    Readdir { cookie: u64, verifier: [u8; 8], dircount: u32, maxcount: u32, attrs: Vec<u32> },
+    Readdir {
+        cookie: u64,
+        verifier: [u8; 8],
+        dircount: u32,
+        maxcount: u32,
+        attrs: Vec<u32>,
+    },
 }
 
 fn put_name(e: &mut Encoder, name: &[u8]) {
@@ -197,7 +258,12 @@ impl Pack for OpenArgs {
 impl Pack for Op {
     fn pack(&self, e: &mut Encoder) {
         match self {
-            Op::Sequence { session, seqid, slot, highest } => {
+            Op::Sequence {
+                session,
+                seqid,
+                slot,
+                highest,
+            } => {
                 e.put_u32(OP_SEQUENCE)
                     .put_opaque_fixed(session)
                     .put_u32(*seqid)
@@ -206,13 +272,24 @@ impl Pack for Op {
                     .put_bool(false);
             }
             Op::ExchangeId { verifier, owner } => {
-                e.put_u32(OP_EXCHANGE_ID).put_opaque_fixed(verifier).put_opaque(owner);
+                e.put_u32(OP_EXCHANGE_ID)
+                    .put_opaque_fixed(verifier)
+                    .put_opaque(owner);
                 e.put_u32(0x0001_0000); // EXCHGID4_FLAG_USE_NON_PNFS
                 e.put_u32(0); // state_protect: SP4_NONE
                 e.put_u32(0); // client_impl_id<1>: empty
             }
-            Op::CreateSession { clientid, sequence, fore, back, cb_program } => {
-                e.put_u32(OP_CREATE_SESSION).put_u64(*clientid).put_u32(*sequence).put_u32(0);
+            Op::CreateSession {
+                clientid,
+                sequence,
+                fore,
+                back,
+                cb_program,
+            } => {
+                e.put_u32(OP_CREATE_SESSION)
+                    .put_u64(*clientid)
+                    .put_u32(*sequence)
+                    .put_u32(0);
                 fore.pack(e);
                 back.pack(e);
                 e.put_u32(*cb_program);
@@ -228,15 +305,25 @@ impl Pack for Op {
             Op::ReclaimComplete => {
                 e.put_u32(OP_RECLAIM_COMPLETE).put_bool(false);
             }
-            Op::Setclientid { verifier, id, cb_program, cb_addr, cb_ident } => {
-                e.put_u32(OP_SETCLIENTID).put_opaque_fixed(verifier).put_opaque(id);
+            Op::Setclientid {
+                verifier,
+                id,
+                cb_program,
+                cb_addr,
+                cb_ident,
+            } => {
+                e.put_u32(OP_SETCLIENTID)
+                    .put_opaque_fixed(verifier)
+                    .put_opaque(id);
                 e.put_u32(*cb_program);
                 e.put_string(b"tcp");
                 e.put_string(cb_addr.as_bytes());
                 e.put_u32(*cb_ident);
             }
             Op::SetclientidConfirm { clientid, verifier } => {
-                e.put_u32(OP_SETCLIENTID_CONFIRM).put_u64(*clientid).put_opaque_fixed(verifier);
+                e.put_u32(OP_SETCLIENTID_CONFIRM)
+                    .put_u64(*clientid)
+                    .put_opaque_fixed(verifier);
             }
             Op::Renew(id) => {
                 e.put_u32(OP_RENEW).put_u64(*id);
@@ -269,11 +356,27 @@ impl Pack for Op {
             Op::Readlink => {
                 e.put_u32(OP_READLINK);
             }
-            Op::Read { stateid, offset, count } => {
-                e.put_u32(OP_READ).put(stateid).put_u64(*offset).put_u32(*count);
+            Op::Read {
+                stateid,
+                offset,
+                count,
+            } => {
+                e.put_u32(OP_READ)
+                    .put(stateid)
+                    .put_u64(*offset)
+                    .put_u32(*count);
             }
-            Op::Write { stateid, offset, data, stable } => {
-                e.put_u32(OP_WRITE).put(stateid).put_u64(*offset).put_u32(*stable).put_opaque(data);
+            Op::Write {
+                stateid,
+                offset,
+                data,
+                stable,
+            } => {
+                e.put_u32(OP_WRITE)
+                    .put(stateid)
+                    .put_u64(*offset)
+                    .put_u32(*stable)
+                    .put_opaque(data);
             }
             Op::Commit { offset, count } => {
                 e.put_u32(OP_COMMIT).put_u64(*offset).put_u32(*count);
@@ -316,7 +419,13 @@ impl Pack for Op {
                 e.put_u32(OP_LINK);
                 put_name(e, name);
             }
-            Op::Readdir { cookie, verifier, dircount, maxcount, attrs } => {
+            Op::Readdir {
+                cookie,
+                verifier,
+                dircount,
+                maxcount,
+                attrs,
+            } => {
                 e.put_u32(OP_READDIR)
                     .put_u64(*cookie)
                     .put_opaque_fixed(verifier)
@@ -338,7 +447,11 @@ pub struct DirEnt {
 
 impl Unpack for DirEnt {
     fn unpack(d: &mut Decoder<'_>) -> Result<Self> {
-        Ok(DirEnt { cookie: d.get_u64()?, name: d.get_string()?, attrs: AttrSet::unpack(d)? })
+        Ok(DirEnt {
+            cookie: d.get_u64()?,
+            name: d.get_string()?,
+            attrs: AttrSet::unpack(d)?,
+        })
     }
 }
 
@@ -348,17 +461,42 @@ pub enum Res {
     /// Status-only success (PUTFH, LOOKUP, RENEW, ...), or an op whose body we ignore.
     Empty,
     Stateid(StateId),
-    Open { stateid: StateId, rflags: u32, deleg: Option<StateId> },
+    Open {
+        stateid: StateId,
+        rflags: u32,
+        deleg: Option<StateId>,
+    },
     Fh(Vec<u8>),
     Attr(Box<AttrSet>),
-    Read { eof: bool, data: Vec<u8> },
-    Write { count: u32, committed: u32, verf: [u8; 8] },
+    Read {
+        eof: bool,
+        data: Vec<u8>,
+    },
+    Write {
+        count: u32,
+        committed: u32,
+        verf: [u8; 8],
+    },
     Verf([u8; 8]),
-    Readdir { verifier: [u8; 8], entries: Vec<DirEnt>, eof: bool },
+    Readdir {
+        verifier: [u8; 8],
+        entries: Vec<DirEnt>,
+        eof: bool,
+    },
     Readlink(Vec<u8>),
-    ExchangeId { clientid: u64, sequence: u32 },
-    CreateSession { session: [u8; 16], sequence: u32, fore: ChannelAttrs },
-    Setclientid { clientid: u64, verifier: [u8; 8] },
+    ExchangeId {
+        clientid: u64,
+        sequence: u32,
+    },
+    CreateSession {
+        session: [u8; 16],
+        sequence: u32,
+        fore: ChannelAttrs,
+    },
+    Setclientid {
+        clientid: u64,
+        verifier: [u8; 8],
+    },
 }
 
 /// One result: the opcode, its status, and the decoded body (if status is OK).
@@ -423,10 +561,18 @@ impl Unpack for ResOp {
         // SETATTR's result always carries attrsset, even on failure.
         if opcode == OP_SETATTR {
             let _attrsset: Vec<u32> = d.get_array()?;
-            return Ok(ResOp { opcode, status, body: Res::Empty });
+            return Ok(ResOp {
+                opcode,
+                status,
+                body: Res::Empty,
+            });
         }
         if status != code::OK {
-            return Ok(ResOp { opcode, status, body: Res::Empty });
+            return Ok(ResOp {
+                opcode,
+                status,
+                body: Res::Empty,
+            });
         }
         let body = match opcode {
             OP_CLOSE | OP_OPEN_CONFIRM => Res::Stateid(d.get()?),
@@ -436,7 +582,11 @@ impl Unpack for ResOp {
                 let rflags = d.get_u32()?;
                 let _attrset: Vec<u32> = d.get_array()?;
                 let deleg = decode_open_delegation(d)?;
-                Res::Open { stateid, rflags, deleg }
+                Res::Open {
+                    stateid,
+                    rflags,
+                    deleg,
+                }
             }
             OP_COMMIT => Res::Verf(get_verf(d)?),
             OP_CREATE => {
@@ -457,19 +607,30 @@ impl Unpack for ResOp {
             OP_GETFH => Res::Fh(d.get_opaque_vec()?),
             OP_READ => {
                 let eof = d.get_bool()?;
-                Res::Read { eof, data: d.get_opaque_vec()? }
+                Res::Read {
+                    eof,
+                    data: d.get_opaque_vec()?,
+                }
             }
             OP_WRITE => {
                 let count = d.get_u32()?;
                 let committed = d.get_u32()?;
                 let verf = get_verf(d)?;
-                Res::Write { count, committed, verf }
+                Res::Write {
+                    count,
+                    committed,
+                    verf,
+                }
             }
             OP_READDIR => {
                 let verifier = get_verf(d)?;
                 let entries = d.get_list::<DirEnt>()?;
                 let eof = d.get_bool()?;
-                Res::Readdir { verifier, entries, eof }
+                Res::Readdir {
+                    verifier,
+                    entries,
+                    eof,
+                }
             }
             OP_READLINK => Res::Readlink(d.get_string()?),
             OP_EXCHANGE_ID => {
@@ -493,7 +654,11 @@ impl Unpack for ResOp {
                 let _flags = d.get_u32()?;
                 let fore = ChannelAttrs::unpack(d)?;
                 let _back = ChannelAttrs::unpack(d)?;
-                Res::CreateSession { session, sequence, fore }
+                Res::CreateSession {
+                    session,
+                    sequence,
+                    fore,
+                }
             }
             OP_SEQUENCE => {
                 let _session = get_session_id(d)?;
@@ -509,12 +674,24 @@ impl Unpack for ResOp {
                 let verifier = get_verf(d)?;
                 Res::Setclientid { clientid, verifier }
             }
-            OP_PUTFH | OP_PUTROOTFH | OP_SAVEFH | OP_LOOKUP | OP_LOOKUPP | OP_RENEW
-            | OP_SETCLIENTID_CONFIRM | OP_DELEGRETURN | OP_DESTROY_SESSION | OP_DESTROY_CLIENTID
+            OP_PUTFH
+            | OP_PUTROOTFH
+            | OP_SAVEFH
+            | OP_LOOKUP
+            | OP_LOOKUPP
+            | OP_RENEW
+            | OP_SETCLIENTID_CONFIRM
+            | OP_DELEGRETURN
+            | OP_DESTROY_SESSION
+            | OP_DESTROY_CLIENTID
             | OP_RECLAIM_COMPLETE => Res::Empty,
             other => return Err(Error::Xdr(format!("unexpected result for opcode {other}"))),
         };
-        Ok(ResOp { opcode, status, body })
+        Ok(ResOp {
+            opcode,
+            status,
+            body,
+        })
     }
 }
 
@@ -533,7 +710,7 @@ impl Unpack for SkipImplId {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{attr, StateId};
+    use super::super::types::{StateId, attr};
     use super::*;
     use crate::xdr::from_bytes;
 
@@ -561,9 +738,15 @@ mod tests {
 
     #[test]
     fn close_roundtrip_bytes() {
-        let sid = StateId { seqid: 7, other: [9; 12] };
+        let sid = StateId {
+            seqid: 7,
+            other: [9; 12],
+        };
         let mut e = Encoder::new();
-        e.put(&Op::Close { seqid: 3, stateid: sid });
+        e.put(&Op::Close {
+            seqid: 3,
+            stateid: sid,
+        });
         let mut want = vec![0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 7];
         want.extend_from_slice(&[9; 12]);
         assert_eq!(e.as_bytes(), want.as_slice());
@@ -571,6 +754,12 @@ mod tests {
         let mut reply = vec![0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8];
         reply.extend_from_slice(&[1; 12]);
         let r: ResOp = from_bytes(&reply).unwrap();
-        assert_eq!(r.body, Res::Stateid(StateId { seqid: 8, other: [1; 12] }));
+        assert_eq!(
+            r.body,
+            Res::Stateid(StateId {
+                seqid: 8,
+                other: [1; 12]
+            })
+        );
     }
 }

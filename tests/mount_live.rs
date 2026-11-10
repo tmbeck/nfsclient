@@ -24,7 +24,9 @@ fn resolve(host: &str) -> IpAddr {
 
 fn target() -> Option<(IpAddr, Vec<u8>)> {
     let spec = std::env::var("NFSC_TEST_RO").ok()?;
-    let (host, path) = spec.split_once(':').expect("NFSC_TEST_RO must be host:/export");
+    let (host, path) = spec
+        .split_once(':')
+        .expect("NFSC_TEST_RO must be host:/export");
     Some((resolve(host), path.as_bytes().to_vec()))
 }
 
@@ -66,7 +68,10 @@ fn mount_v3_mnt_returns_handle_and_flavors_then_umnt() {
     };
     let o = opts(Proto::Tcp);
     let (fh, flavors) = mount::mnt(ip, None, 3, &path, &o).expect("MNT v3");
-    assert!(!fh.0.is_empty() && fh.0.len() <= 64, "v3 handle is 1..=64 bytes");
+    assert!(
+        !fh.0.is_empty() && fh.0.len() <= 64,
+        "v3 handle is 1..=64 bytes"
+    );
     assert!(
         flavors.contains(&1) || flavors.contains(&0),
         "server accepts neither AUTH_SYS nor AUTH_NONE: {flavors:?}"

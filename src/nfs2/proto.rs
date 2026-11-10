@@ -451,14 +451,25 @@ mod tests {
             blocks: 8,
             fsid: 42,
             fileid: 77,
-            atime: TimeVal { seconds: 1, useconds: 2 },
-            mtime: TimeVal { seconds: 3, useconds: 4 },
-            ctime: TimeVal { seconds: 5, useconds: 6 },
+            atime: TimeVal {
+                seconds: 1,
+                useconds: 2,
+            },
+            mtime: TimeVal {
+                seconds: 3,
+                useconds: 4,
+            },
+            ctime: TimeVal {
+                seconds: 5,
+                useconds: 6,
+            },
         }
     }
 
     fn fattr_bytes() -> Vec<u8> {
-        w(&[2, 0o40755, 3, 1000, 100, 4096, 1024, 0, 8, 42, 77, 1, 2, 3, 4, 5, 6])
+        w(&[
+            2, 0o40755, 3, 1000, 100, 4096, 1024, 0, 8, 42, 77, 1, 2, 3, 4, 5, 6,
+        ])
     }
 
     #[test]
@@ -473,13 +484,19 @@ mod tests {
         assert!(WireFh::from_fs(&FileHandle(fh(1))).is_some());
         assert!(WireFh::from_fs(&FileHandle(vec![0; 16])).is_none());
         assert!(WireFh::from_fs(&FileHandle(vec![0; 64])).is_none());
-        assert_eq!(WireFh::from_fs(&FileHandle(fh(9))).unwrap().to_fs(), FileHandle(fh(9)));
+        assert_eq!(
+            WireFh::from_fs(&FileHandle(fh(9))).unwrap().to_fs(),
+            FileHandle(fh(9))
+        );
     }
 
     #[test]
     fn cookie_is_four_opaque_bytes() {
         assert_eq!(to_bytes(&Cookie([0, 0, 1, 2])), [0, 0, 1, 2]);
-        assert_eq!(from_bytes::<Cookie>(&[9, 8, 7, 6]).unwrap(), Cookie([9, 8, 7, 6]));
+        assert_eq!(
+            from_bytes::<Cookie>(&[9, 8, 7, 6]).unwrap(),
+            Cookie([9, 8, 7, 6])
+        );
     }
 
     #[test]
@@ -503,7 +520,10 @@ mod tests {
             gid: UNSET,
             size: 0,
             atime: TimeVal::UNSET,
-            mtime: TimeVal { seconds: 100, useconds: 500_000 },
+            mtime: TimeVal {
+                seconds: 100,
+                useconds: 500_000,
+            },
         };
         let want = w(&[0o644, UNSET, UNSET, 0, UNSET, UNSET, 100, 500_000]);
         assert_eq!(to_bytes(&s), want);
@@ -532,7 +552,10 @@ mod tests {
 
     #[test]
     fn attrstat_replies() {
-        assert_eq!(to_bytes(&Res::Ok(sample_fattr())), cat(&[&w(&[0]), &fattr_bytes()]));
+        assert_eq!(
+            to_bytes(&Res::Ok(sample_fattr())),
+            cat(&[&w(&[0]), &fattr_bytes()])
+        );
         assert_eq!(to_bytes(&Res::<Fattr>::Err(70)), w(&[70]));
         assert_eq!(from_bytes::<Res<Fattr>>(&w(&[2])).unwrap(), Res::Err(2));
     }
@@ -542,7 +565,10 @@ mod tests {
         let ok = Res::Ok((wfh(3), sample_fattr()));
         assert_eq!(to_bytes(&ok), cat(&[&w(&[0]), &fh(3), &fattr_bytes()]));
         assert_eq!(to_bytes(&Res::<(WireFh, Fattr)>::Err(2)), w(&[2]));
-        assert_eq!(from_bytes::<Res<(WireFh, Fattr)>>(&to_bytes(&ok)).unwrap(), ok);
+        assert_eq!(
+            from_bytes::<Res<(WireFh, Fattr)>>(&to_bytes(&ok)).unwrap(),
+            ok
+        );
     }
 
     #[test]
@@ -582,7 +608,10 @@ mod tests {
             totalcount: 0,
             data: Opaque(b"xy".to_vec()),
         };
-        assert_eq!(to_bytes(&args), cat(&[&fh(6), &w(&[0, 100, 0]), &op(b"xy")]));
+        assert_eq!(
+            to_bytes(&args),
+            cat(&[&fh(6), &w(&[0, 100, 0]), &op(b"xy")])
+        );
         assert_eq!(from_bytes::<WriteArgs>(&to_bytes(&args)).unwrap(), args);
     }
 
@@ -596,8 +625,14 @@ mod tests {
 
     #[test]
     fn rename_args() {
-        let args = ((wfh(1), Opaque(b"a".to_vec())), (wfh(2), Opaque(b"bb".to_vec())));
-        assert_eq!(to_bytes(&args), cat(&[&fh(1), &op(b"a"), &fh(2), &op(b"bb")]));
+        let args = (
+            (wfh(1), Opaque(b"a".to_vec())),
+            (wfh(2), Opaque(b"bb".to_vec())),
+        );
+        assert_eq!(
+            to_bytes(&args),
+            cat(&[&fh(1), &op(b"a"), &fh(2), &op(b"bb")])
+        );
     }
 
     #[test]
@@ -643,15 +678,15 @@ mod tests {
             eof: true,
         };
         let want = cat(&[
-            &w(&[0]),                 // NFS_OK
-            &w(&[1, 2]),              // entry present, fileid 2
-            &op(b"a"),                // name
-            &[0, 0, 0, 1],            // cookie
-            &w(&[1, 3]),              // entry present, fileid 3
+            &w(&[0]),      // NFS_OK
+            &w(&[1, 2]),   // entry present, fileid 2
+            &op(b"a"),     // name
+            &[0, 0, 0, 1], // cookie
+            &w(&[1, 3]),   // entry present, fileid 3
             &op(b"bcde"),
             &[0, 0, 0, 2],
-            &w(&[0]),                 // no more entries
-            &w(&[1]),                 // eof
+            &w(&[0]), // no more entries
+            &w(&[1]), // eof
         ]);
         assert_eq!(to_bytes(&Res::Ok(list.clone())), want);
         assert_eq!(from_bytes::<Res<DirList>>(&want).unwrap(), Res::Ok(list));
@@ -659,7 +694,10 @@ mod tests {
 
     #[test]
     fn readdir_reply_empty_not_eof() {
-        let list = DirList { entries: vec![], eof: false };
+        let list = DirList {
+            entries: vec![],
+            eof: false,
+        };
         assert_eq!(to_bytes(&Res::Ok(list)), w(&[0, 0, 0]));
     }
 
@@ -679,10 +717,7 @@ mod tests {
             bfree: 500,
             bavail: 400,
         };
-        assert_eq!(
-            to_bytes(&Res::Ok(s)),
-            w(&[0, 8192, 1024, 1000, 500, 400])
-        );
+        assert_eq!(to_bytes(&Res::Ok(s)), w(&[0, 8192, 1024, 1000, 500, 400]));
         assert_eq!(
             from_bytes::<Res<StatfsOk>>(&w(&[0, 8192, 1024, 1000, 500, 400])).unwrap(),
             Res::Ok(s)

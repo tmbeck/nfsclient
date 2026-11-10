@@ -211,7 +211,9 @@ impl RpcClient {
             return Ok(reply);
         }
         if !self.pending.contains(&xid) {
-            return Err(Error::Invalid(format!("no outstanding RPC call with xid {xid:#010x}")));
+            return Err(Error::Invalid(format!(
+                "no outstanding RPC call with xid {xid:#010x}"
+            )));
         }
         let deadline = Instant::now() + self.timeout;
         loop {
@@ -225,7 +227,10 @@ impl RpcClient {
             if record.len() < 4 {
                 self.inner.reset();
                 self.discard_outstanding();
-                return Err(Error::Protocol(format!("reply record of {} bytes", record.len())));
+                return Err(Error::Protocol(format!(
+                    "reply record of {} bytes",
+                    record.len()
+                )));
             }
             let got = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
             if !self.pending.remove(&got) {
@@ -280,6 +285,6 @@ pub const PRIVILEGED_PORT_HINT: &str = "the server may require a reserved source
 (setcap cap_net_bind_service=+ep), or use --port-mode priv";
 
 pub mod auth;
-pub(crate) mod pipeline;
 pub mod message;
+pub(crate) mod pipeline;
 pub mod transport;

@@ -25,7 +25,13 @@ pub(crate) fn encode_cred(auth: &Auth, e: &mut Encoder) {
             e.put_u32(AUTH_NONE);
             e.put_opaque(&[]);
         }
-        Auth::Sys { stamp, machine_name, uid, gid, gids } => {
+        Auth::Sys {
+            stamp,
+            machine_name,
+            uid,
+            gid,
+            gids,
+        } => {
             let mut body = Encoder::with_capacity(MAX_AUTH_BODY);
             body.put_u32(*stamp);
             let name = machine_name.as_bytes();
@@ -62,7 +68,10 @@ fn read_ids() -> Option<(u32, u32, Vec<u32>)> {
         } else if let Some(rest) = line.strip_prefix("Gid:") {
             gid = first_u32(rest);
         } else if let Some(rest) = line.strip_prefix("Groups:") {
-            gids = rest.split_ascii_whitespace().filter_map(|s| s.parse().ok()).collect();
+            gids = rest
+                .split_ascii_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
         }
     }
     // Uid/Gid lines are "real effective saved fs"; the first field is the real id.

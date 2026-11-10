@@ -8,18 +8,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::fs::{
-    Attr, ConnectOptions, Connected, CreateMode, DirEntry, FileHandle, FileType, Filesystem, FsStat,
-    NfsVersion, SetAttr,
+    Attr, ConnectOptions, Connected, CreateMode, DirEntry, FileHandle, FileType, Filesystem,
+    FsStat, NfsVersion, SetAttr,
 };
 use crate::rpc::{RpcClient, RpcOptions};
 
 use super::compound::{CompoundArgs, CompoundRes, PROC_COMPOUND};
-use super::ops::{ChannelAttrs, Claim, CreateKind, Op, OpenHow, Res, ResOp, FILE_SYNC4, OP_CLOSE, OP_OPEN, OP_OPEN_CONFIRM, UNSTABLE4};
-use crate::rpc::pipeline::{self, ReadIo, WriteAck, WriteIo, DEFAULT_WINDOW};
-use super::types::{
-    attr, code, encode_setattr, Fattr, StateId, ANON_STATEID, BASIC_ATTRS, FSSTAT_ATTRS, OPEN4_SHARE_ACCESS_BOTH,
-    READDIR_ATTRS,
+use super::ops::{
+    ChannelAttrs, Claim, CreateKind, FILE_SYNC4, OP_CLOSE, OP_OPEN, OP_OPEN_CONFIRM, Op, OpenHow,
+    Res, ResOp, UNSTABLE4,
 };
+use super::types::{
+    ANON_STATEID, BASIC_ATTRS, FSSTAT_ATTRS, Fattr, OPEN4_SHARE_ACCESS_BOTH, READDIR_ATTRS,
+    StateId, attr, code, encode_setattr,
+};
+use crate::rpc::pipeline::{self, DEFAULT_WINDOW, ReadIo, WriteAck, WriteIo};
 
 pub const PROGRAM: u32 = 100003;
 pub const VERSION: u32 = 4;
@@ -88,7 +91,10 @@ pub(crate) struct Nfs4Backend {
 /// Random 64-bit value (std only; RandomState is seeded from the OS).
 pub(super) fn rand64() -> u64 {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     h.write_u128(nanos);
     h.finish()
 }
@@ -113,7 +119,12 @@ fn map_connect_err(e: Error) -> Error {
 
 /// Connect with the given minor version, or negotiate the highest supported
 /// (2, then 1, then 0) when `minor` is None. Walks `path` from PUTROOTFH.
-pub(crate) fn connect(host: IpAddr, path: &[u8], minor: Option<u32>, opts: &ConnectOptions) -> Result<Connected> {
+pub(crate) fn connect(
+    host: IpAddr,
+    path: &[u8],
+    minor: Option<u32>,
+    opts: &ConnectOptions,
+) -> Result<Connected> {
     let addr = SocketAddr::new(host, opts.nfs_port.unwrap_or(DEFAULT_PORT));
     let rpc = RpcClient::connect(addr, PROGRAM, VERSION, &opts.rpc).map_err(map_connect_err)?;
     let mut be = Nfs4Backend {
@@ -147,15 +158,23 @@ pub(crate) fn connect(host: IpAddr, path: &[u8], minor: Option<u32>, opts: &Conn
                 negotiated = true;
                 break;
             }
-            Err(Error::Nfs(crate::fs::Status::Other(_, c))) if c == code::MINOR_VERS_MISMATCH => continue,
+            Err(Error::Nfs(crate::fs::Status::Other(_, c))) if c == code::MINOR_VERS_MISMATCH => {
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
     if !negotiated {
-        return Err(Error::VersionUnsupported("server offers no NFSv4 minor version".into()));
+        return Err(Error::VersionUnsupported(
+            "server offers no NFSv4 minor version".into(),
+        ));
     }
     be.walk(path)?;
-    Ok(Connected { fs: Box::new(be), export: path.to_vec(), remainder: Vec::new() })
+    Ok(Connected {
+        fs: Box::new(be),
+        export: path.to_vec(),
+        remainder: Vec::new(),
+    })
 }
 
 impl Nfs4Backend {
@@ -203,7 +222,10 @@ impl Nfs4Backend {
             slot = Some(free);
         }
         all.extend(ops);
-        let args = CompoundArgs { minor: self.minor, ops: all };
+        let args = CompoundArgs {
+            minor: self.minor,
+            ops: all,
+        };
         let res: CompoundRes = self.rpc.call(PROC_COMPOUND, &args)?;
         self.last_activity = Instant::now();
         let mut results = res.results;
@@ -221,7 +243,10 @@ impl Nfs4Backend {
                 self.open_seqid = self.open_seqid.wrapping_add(1);
             }
         }
-        Ok(CompoundRes { status: res.status, results })
+        Ok(CompoundRes {
+            status: res.status,
+            results,
+        })
     }
 
     /// Send one COMPOUND without waiting for its reply (pipelining). On NFSv4.1+
@@ -249,7 +274,10 @@ impl Nfs4Backend {
             slot = Some(free);
         }
         all.extend(ops);
-        let args = CompoundArgs { minor: self.minor, ops: all };
+        let args = CompoundArgs {
+            minor: self.minor,
+            ops: all,
+        };
         let xid = self.rpc.send_call(PROC_COMPOUND, &args)?;
         if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
             s.busy[i] = true;
@@ -399,7 +427,10 @@ impl Nfs4Backend {
     fn walk(&mut self, path: &[u8]) -> Result<()> {
         let res = self.exec(|_| vec![Op::Putrootfh, Op::Getfh])?;
         let mut cur = fh_at(&res, 1)?;
-        for comp in path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".") {
+        for comp in path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty() && *c != b".")
+        {
             let dir = cur.clone();
             let is_parent = comp == b"..";
             let name = comp.to_vec();
@@ -407,7 +438,11 @@ impl Nfs4Backend {
                 if is_parent {
                     vec![Op::Putfh(dir.0.clone()), Op::Lookupp, Op::Getfh]
                 } else {
-                    vec![Op::Putfh(dir.0.clone()), Op::Lookup(name.clone()), Op::Getfh]
+                    vec![
+                        Op::Putfh(dir.0.clone()),
+                        Op::Lookup(name.clone()),
+                        Op::Getfh,
+                    ]
                 }
             })?;
             let next = fh_at(&res, 2)?;
@@ -419,7 +454,12 @@ impl Nfs4Backend {
         let res = self.exec(|_| {
             vec![
                 Op::Putfh(cur.0.clone()),
-                Op::Getattr(vec![attr::SUPPORTED_ATTRS, attr::LEASE_TIME, attr::MAXREAD, attr::MAXWRITE]),
+                Op::Getattr(vec![
+                    attr::SUPPORTED_ATTRS,
+                    attr::LEASE_TIME,
+                    attr::MAXREAD,
+                    attr::MAXWRITE,
+                ]),
             ]
         })?;
         let a = attr_at(&res, 1)?;
@@ -430,10 +470,20 @@ impl Nfs4Backend {
             Some(s) => (s.max_req, s.max_resp),
             None => (u32::MAX, u32::MAX),
         };
-        let srv_read = a.maxread.map(|v| v.min(u64::from(u32::MAX)) as u32).unwrap_or(MAX_IO);
-        let srv_write = a.maxwrite.map(|v| v.min(u64::from(u32::MAX)) as u32).unwrap_or(MAX_IO);
-        self.max_read = srv_read.min(chan_resp.saturating_sub(CHAN_OVERHEAD)).clamp(512, MAX_IO);
-        self.max_write = srv_write.min(chan_req.saturating_sub(CHAN_OVERHEAD)).clamp(512, MAX_IO);
+        let srv_read = a
+            .maxread
+            .map(|v| v.min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(MAX_IO);
+        let srv_write = a
+            .maxwrite
+            .map(|v| v.min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(MAX_IO);
+        self.max_read = srv_read
+            .min(chan_resp.saturating_sub(CHAN_OVERHEAD))
+            .clamp(512, MAX_IO);
+        self.max_write = srv_write
+            .min(chan_req.saturating_sub(CHAN_OVERHEAD))
+            .clamp(512, MAX_IO);
         self.readdir_max = chan_resp.saturating_sub(4096).clamp(1024, 32 * 1024);
         self.root = cur;
         Ok(())
@@ -444,18 +494,25 @@ impl Nfs4Backend {
         if self.names.len() >= NAME_CACHE_CAP {
             self.names.clear();
         }
-        self.names.insert(child.clone(), (dir.clone(), name.to_vec()));
+        self.names
+            .insert(child.clone(), (dir.clone(), name.to_vec()));
     }
 
     /// Run `build` with the stateid for I/O on `fh`. If the stateid is rejected,
     /// forget it and retry once with the anonymous stateid.
-    pub(super) fn exec_stateid<F>(&mut self, fh: &FileHandle, write: bool, build: F) -> Result<Vec<ResOp>>
+    pub(super) fn exec_stateid<F>(
+        &mut self,
+        fh: &FileHandle,
+        write: bool,
+        build: F,
+    ) -> Result<Vec<ResOp>>
     where
         F: Fn(StateId) -> Vec<Op>,
     {
         let sid = self.stateid_for_io(fh, write);
         match self.exec(|_| build(sid)) {
-            Err(Error::Nfs(crate::fs::Status::Other(_, c))) if sid != ANON_STATEID && Self::is_stateid_error(c) =>
+            Err(Error::Nfs(crate::fs::Status::Other(_, c)))
+                if sid != ANON_STATEID && Self::is_stateid_error(c) =>
             {
                 self.opens.forget(fh);
                 self.exec(|_| build(ANON_STATEID))
@@ -480,7 +537,16 @@ impl Nfs4Backend {
         }
         for (fh, sid) in self.opens.drain() {
             let seqid = self.open_seqid;
-            let _ = self.send(vec![Op::Putfh(fh.0.clone()), Op::Close { seqid, stateid: sid }], true);
+            let _ = self.send(
+                vec![
+                    Op::Putfh(fh.0.clone()),
+                    Op::Close {
+                        seqid,
+                        stateid: sid,
+                    },
+                ],
+                true,
+            );
         }
         if self.minor >= 1 {
             if let Some(id) = self.session.as_ref().map(|s| s.id) {
@@ -518,7 +584,14 @@ impl ReadIo for V4Reads<'_, '_> {
 
     fn issue(&mut self, offset: u64, count: u32) -> Result<Pending> {
         let (fh, stateid) = (self.fh.0.clone(), self.stateid);
-        self.be.issue_compound(vec![Op::Putfh(fh), Op::Read { stateid, offset, count }])
+        self.be.issue_compound(vec![
+            Op::Putfh(fh),
+            Op::Read {
+                stateid,
+                offset,
+                count,
+            },
+        ])
     }
 
     fn complete(&mut self, p: Pending) -> Result<(Vec<u8>, bool)> {
@@ -548,14 +621,23 @@ impl WriteIo for V4Writes<'_, '_> {
         let (fh, stateid) = (self.fh.0.clone(), self.stateid);
         self.be.issue_compound(vec![
             Op::Putfh(fh),
-            Op::Write { stateid, offset, data: data.to_vec(), stable: UNSTABLE4 },
+            Op::Write {
+                stateid,
+                offset,
+                data: data.to_vec(),
+                stable: UNSTABLE4,
+            },
         ])
     }
 
     fn complete(&mut self, p: Pending) -> Result<WriteAck> {
         let res = self.be.complete_compound(p)?;
         match body(&res, 1)? {
-            Res::Write { count, committed, verf } => Ok(WriteAck {
+            Res::Write {
+                count,
+                committed,
+                verf,
+            } => Ok(WriteAck {
                 count: *count,
                 durable: *committed == FILE_SYNC4,
                 verf: *verf,
@@ -566,7 +648,9 @@ impl WriteIo for V4Writes<'_, '_> {
 
     fn commit(&mut self, offset: u64, count: u32) -> Result<[u8; 8]> {
         let fh = self.fh.0.clone();
-        let res = self.be.exec(|_| vec![Op::Putfh(fh.clone()), Op::Commit { offset, count }])?;
+        let res = self
+            .be
+            .exec(|_| vec![Op::Putfh(fh.clone()), Op::Commit { offset, count }])?;
         match body(&res, 1)? {
             Res::Verf(v) => Ok(*v),
             _ => Err(xdr_err("COMMIT")),
@@ -629,7 +713,8 @@ impl Filesystem for Nfs4Backend {
     }
 
     fn getattr(&mut self, fh: &FileHandle) -> Result<Attr> {
-        let res = self.exec(|_| vec![Op::Putfh(fh.0.clone()), Op::Getattr(BASIC_ATTRS.to_vec())])?;
+        let res =
+            self.exec(|_| vec![Op::Putfh(fh.0.clone()), Op::Getattr(BASIC_ATTRS.to_vec())])?;
         Ok(to_fs_attr(attr_at(&res, 1)?))
     }
 
@@ -639,7 +724,10 @@ impl Filesystem for Nfs4Backend {
             self.exec_stateid(fh, true, |sid| {
                 vec![
                     Op::Putfh(fh.0.clone()),
-                    Op::Setattr { stateid: sid, attrs: fat.clone() },
+                    Op::Setattr {
+                        stateid: sid,
+                        attrs: fat.clone(),
+                    },
                     Op::Getattr(BASIC_ATTRS.to_vec()),
                 ]
             })?
@@ -647,7 +735,10 @@ impl Filesystem for Nfs4Backend {
             self.exec(|_| {
                 vec![
                     Op::Putfh(fh.0.clone()),
-                    Op::Setattr { stateid: ANON_STATEID, attrs: fat.clone() },
+                    Op::Setattr {
+                        stateid: ANON_STATEID,
+                        attrs: fat.clone(),
+                    },
                     Op::Getattr(BASIC_ATTRS.to_vec()),
                 ]
             })?
@@ -663,7 +754,12 @@ impl Filesystem for Nfs4Backend {
         let parent = name == b"..";
         let res = self.exec(|_| {
             if parent {
-                vec![Op::Putfh(dir.0.clone()), Op::Lookupp, Op::Getfh, Op::Getattr(BASIC_ATTRS.to_vec())]
+                vec![
+                    Op::Putfh(dir.0.clone()),
+                    Op::Lookupp,
+                    Op::Getfh,
+                    Op::Getattr(BASIC_ATTRS.to_vec()),
+                ]
             } else {
                 vec![
                     Op::Putfh(dir.0.clone()),
@@ -689,13 +785,16 @@ impl Filesystem for Nfs4Backend {
         loop {
             let (cookie_now, verf_now) = (cookie, verf);
             let res = self.exec(|s| {
-                vec![Op::Putfh(dir.0.clone()), Op::Readdir {
-                    cookie: cookie_now,
-                    verifier: verf_now,
-                    dircount: s.readdir_max,
-                    maxcount: s.readdir_max,
-                    attrs: READDIR_ATTRS.to_vec(),
-                }]
+                vec![
+                    Op::Putfh(dir.0.clone()),
+                    Op::Readdir {
+                        cookie: cookie_now,
+                        verifier: verf_now,
+                        dircount: s.readdir_max,
+                        maxcount: s.readdir_max,
+                        attrs: READDIR_ATTRS.to_vec(),
+                    },
+                ]
             });
             let res = match res {
                 Err(Error::Nfs(crate::fs::Status::BadCookie)) if !restarted => {
@@ -708,13 +807,19 @@ impl Filesystem for Nfs4Backend {
                 other => other?,
             };
             let (new_verf, entries, eof) = match body(&res, 1)? {
-                Res::Readdir { verifier, entries, eof } => (*verifier, entries.clone(), *eof),
+                Res::Readdir {
+                    verifier,
+                    entries,
+                    eof,
+                } => (*verifier, entries.clone(), *eof),
                 _ => return Err(xdr_err("READDIR")),
             };
             // Without this, a server that returns empty pages without EOF would
             // keep the loop spinning on the same cookie forever.
             if entries.is_empty() && !eof {
-                return Err(Error::Protocol("READDIR returned no entries before eof".into()));
+                return Err(Error::Protocol(
+                    "READDIR returned no entries before eof".into(),
+                ));
             }
             for e in entries {
                 cookie = e.cookie;
@@ -722,12 +827,21 @@ impl Filesystem for Nfs4Backend {
                     continue;
                 }
                 let handle = e.attrs.filehandle.clone().map(FileHandle);
-                let attr = if e.attrs.rdattr_error.unwrap_or(0) == 0 { Some(to_fs_attr(&e.attrs)) } else { None };
+                let attr = if e.attrs.rdattr_error.unwrap_or(0) == 0 {
+                    Some(to_fs_attr(&e.attrs))
+                } else {
+                    None
+                };
                 let fileid = e.attrs.fileid.unwrap_or(0);
                 if let Some(h) = &handle {
                     self.remember(h, dir, &e.name);
                 }
-                out.push(DirEntry { name: e.name, fileid, attr, handle });
+                out.push(DirEntry {
+                    name: e.name,
+                    fileid,
+                    attr,
+                    handle,
+                });
             }
             if out.len() > crate::fs::MAX_DIR_ENTRIES {
                 return Err(Error::Protocol(format!(
@@ -757,7 +871,14 @@ impl Filesystem for Nfs4Backend {
             return Ok((Vec::new(), false));
         }
         let res = self.exec_stateid(fh, false, |sid| {
-            vec![Op::Putfh(fh.0.clone()), Op::Read { stateid: sid, offset, count }]
+            vec![
+                Op::Putfh(fh.0.clone()),
+                Op::Read {
+                    stateid: sid,
+                    offset,
+                    count,
+                },
+            ]
         })?;
         match body(&res, 1)? {
             Res::Read { eof, data } => Ok((data.clone(), *eof)),
@@ -775,17 +896,32 @@ impl Filesystem for Nfs4Backend {
             let res = self.exec_stateid(fh, true, |sid| {
                 vec![
                     Op::Putfh(fh.0.clone()),
-                    Op::Write { stateid: sid, offset: off, data: chunk.to_vec(), stable: FILE_SYNC4 },
+                    Op::Write {
+                        stateid: sid,
+                        offset: off,
+                        data: chunk.to_vec(),
+                        stable: FILE_SYNC4,
+                    },
                 ]
             })?;
             let (count, committed) = match body(&res, 1)? {
-                Res::Write { count, committed, .. } => (*count as usize, *committed),
+                Res::Write {
+                    count, committed, ..
+                } => (*count as usize, *committed),
                 _ => return Err(xdr_err("WRITE")),
             };
             let count = count.min(n);
             if committed != FILE_SYNC4 && count > 0 {
                 // Server buffered the data; make it durable.
-                self.exec(|_| vec![Op::Putfh(fh.0.clone()), Op::Commit { offset: off, count: count as u32 }])?;
+                self.exec(|_| {
+                    vec![
+                        Op::Putfh(fh.0.clone()),
+                        Op::Commit {
+                            offset: off,
+                            count: count as u32,
+                        },
+                    ]
+                })?;
             }
             if count == 0 {
                 break;
@@ -805,7 +941,11 @@ impl Filesystem for Nfs4Backend {
         self.maybe_renew();
         let stateid = self.stateid_for_io(fh, false);
         let (chunk, window) = (self.max_read, self.window());
-        let mut io = V4Reads { be: self, fh, stateid };
+        let mut io = V4Reads {
+            be: self,
+            fh,
+            stateid,
+        };
         pipeline::read_pipelined(&mut io, offset, len, chunk, window, sink)
     }
 
@@ -818,7 +958,11 @@ impl Filesystem for Nfs4Backend {
         self.maybe_renew();
         let stateid = self.stateid_for_io(fh, true);
         let (chunk, window) = (self.max_write as usize, self.window());
-        let mut io = V4Writes { be: self, fh, stateid };
+        let mut io = V4Writes {
+            be: self,
+            fh,
+            stateid,
+        };
         pipeline::write_pipelined(&mut io, offset, chunk, window, source)
     }
 
@@ -832,7 +976,11 @@ impl Filesystem for Nfs4Backend {
         let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_FILE_MODE);
         let exclusive = mode == CreateMode::Exclusive;
         let verf = self.new_verifier();
-        let fat = if exclusive { Fattr::default() } else { encode_setattr(attrs, Some(0o644)) };
+        let fat = if exclusive {
+            Fattr::default()
+        } else {
+            encode_setattr(attrs, Some(0o644))
+        };
         let createmode = match mode {
             CreateMode::Unchecked => 0,
             CreateMode::Guarded => 1,
@@ -850,7 +998,11 @@ impl Filesystem for Nfs4Backend {
                 Op::Open(super::state40::open_args(
                     s,
                     OPEN4_SHARE_ACCESS_BOTH,
-                    OpenHow::Create { mode: createmode, verf, attrs: fat.clone() },
+                    OpenHow::Create {
+                        mode: createmode,
+                        verf,
+                        attrs: fat.clone(),
+                    },
                     Claim::Null(name.to_vec()),
                 )),
                 Op::Getfh,
@@ -858,7 +1010,11 @@ impl Filesystem for Nfs4Backend {
             ]
         })?;
         let (stateid, rflags, deleg) = match body(&res, 1)? {
-            Res::Open { stateid, rflags, deleg } => (*stateid, *rflags, *deleg),
+            Res::Open {
+                stateid,
+                rflags,
+                deleg,
+            } => (*stateid, *rflags, *deleg),
             _ => return Err(xdr_err("OPEN")),
         };
         let fh = fh_at(&res, 2)?;
@@ -871,13 +1027,22 @@ impl Filesystem for Nfs4Backend {
         Ok((fh, attr))
     }
 
-    fn mkdir(&mut self, dir: &FileHandle, name: &[u8], attrs: &SetAttr) -> Result<(FileHandle, Attr)> {
+    fn mkdir(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        attrs: &SetAttr,
+    ) -> Result<(FileHandle, Attr)> {
         let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_DIR_MODE);
         let fat = encode_setattr(attrs, Some(0o755));
         let res = self.exec(|_| {
             vec![
                 Op::Putfh(dir.0.clone()),
-                Op::Create { kind: CreateKind::Dir, name: name.to_vec(), attrs: fat.clone() },
+                Op::Create {
+                    kind: CreateKind::Dir,
+                    name: name.to_vec(),
+                    attrs: fat.clone(),
+                },
                 Op::Getfh,
                 Op::Getattr(BASIC_ATTRS.to_vec()),
             ]
@@ -900,7 +1065,11 @@ impl Filesystem for Nfs4Backend {
         let res = self.exec(|_| {
             vec![
                 Op::Putfh(dir.0.clone()),
-                Op::Create { kind: CreateKind::Symlink(target.to_vec()), name: name.to_vec(), attrs: fat.clone() },
+                Op::Create {
+                    kind: CreateKind::Symlink(target.to_vec()),
+                    name: name.to_vec(),
+                    attrs: fat.clone(),
+                },
                 Op::Getfh,
                 Op::Getattr(BASIC_ATTRS.to_vec()),
             ]
@@ -952,14 +1121,18 @@ impl Filesystem for Nfs4Backend {
                 Op::Putfh(from_dir.0.clone()),
                 Op::Savefh,
                 Op::Putfh(to_dir.0.clone()),
-                Op::Rename { from: from_name.to_vec(), to: to_name.to_vec() },
+                Op::Rename {
+                    from: from_name.to_vec(),
+                    to: to_name.to_vec(),
+                },
             ]
         })?;
         Ok(())
     }
 
     fn fsstat(&mut self, fh: &FileHandle) -> Result<FsStat> {
-        let res = self.exec(|_| vec![Op::Putfh(fh.0.clone()), Op::Getattr(FSSTAT_ATTRS.to_vec())])?;
+        let res =
+            self.exec(|_| vec![Op::Putfh(fh.0.clone()), Op::Getattr(FSSTAT_ATTRS.to_vec())])?;
         Ok(attr_at(&res, 1)?.to_fsstat())
     }
 
@@ -1014,4 +1187,3 @@ mod tests {
         assert_eq!(next_seqid(u32::MAX), 1);
     }
 }
-

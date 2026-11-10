@@ -80,7 +80,8 @@ fn map_io(e: io::Error) -> Error {
 
 /// Time left until `end`, or `None` if it has passed.
 fn remaining_until(end: Instant) -> Option<Duration> {
-    end.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+    end.checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
 }
 
 /// Outcome of trying to connect from a reserved TCP source port.
@@ -163,7 +164,8 @@ fn connect_tcp(peer: SocketAddr, timeout: Duration, mode: PortMode) -> Result<(T
         }
     }
     let sock = new_tcp_socket(peer)?;
-    sock.connect_timeout(&SockAddr::from(peer), timeout).map_err(map_io)?;
+    sock.connect_timeout(&SockAddr::from(peer), timeout)
+        .map_err(map_io)?;
     Ok((finish_tcp(sock.into())?, false))
 }
 
@@ -188,7 +190,15 @@ impl Transport {
                 (Conn::Udp(sock), privileged)
             }
         };
-        Ok((Transport { addr, timeout: opts.timeout, port_mode: opts.port_mode, conn }, privileged))
+        Ok((
+            Transport {
+                addr,
+                timeout: opts.timeout,
+                port_mode: opts.port_mode,
+                conn,
+            },
+            privileged,
+        ))
     }
 
     /// UDP only: send one call and return the raw bytes of the reply whose xid
@@ -196,7 +206,9 @@ impl Transport {
     pub fn round_trip(&mut self, xid: u32, msg: &[u8]) -> Result<Vec<u8>> {
         match &mut self.conn {
             Conn::Udp(sock) => udp_round_trip(sock, self.timeout, xid, msg),
-            Conn::Tcp(_) => Err(Error::Invalid("round_trip is UDP-only; use send_record".into())),
+            Conn::Tcp(_) => Err(Error::Invalid(
+                "round_trip is UDP-only; use send_record".into(),
+            )),
         }
     }
 
@@ -227,7 +239,10 @@ impl Transport {
             return Err(Error::Invalid("recv_record is TCP-only".into()));
         };
         let Some(stream) = slot.as_mut() else {
-            return Err(Error::Io(io::Error::new(io::ErrorKind::NotConnected, "connection was lost")));
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection was lost",
+            )));
         };
         let result = read_record(stream, deadline);
         if result.is_err() {
@@ -321,7 +336,9 @@ fn read_record(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
         let last = word & LAST_FRAGMENT != 0;
         let len = (word & !LAST_FRAGMENT) as usize;
         if record.len() + len > MAX_RECORD {
-            return Err(Error::Protocol(format!("reply record exceeds {MAX_RECORD} bytes")));
+            return Err(Error::Protocol(format!(
+                "reply record exceeds {MAX_RECORD} bytes"
+            )));
         }
         let start = record.len();
         record.resize(start + len, 0);
@@ -376,7 +393,12 @@ fn udp_round_trip(sock: &UdpSocket, timeout: Duration, xid: u32, msg: &[u8]) -> 
                     }
                     // Datagram for another call: ignore.
                 }
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}

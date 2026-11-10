@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 use crate::fs::FileHandle;
 
-use super::backend::{body, fh_at, Nfs4Backend, CB_PROGRAM};
+use super::backend::{CB_PROGRAM, Nfs4Backend, body, fh_at};
 use super::ops::{Claim, Op, OpenArgs, OpenHow, Res, ResOp};
 use super::types::{
-    code, StateId, ANON_STATEID, OPEN4_RESULT_CONFIRM, OPEN4_SHARE_ACCESS_BOTH, OPEN4_SHARE_ACCESS_READ,
+    ANON_STATEID, OPEN4_RESULT_CONFIRM, OPEN4_SHARE_ACCESS_BOTH, OPEN4_SHARE_ACCESS_READ, StateId,
+    code,
 };
 
 /// Open-owner string sent with every OPEN. One owner per client ID.
@@ -50,7 +51,12 @@ impl OpenCache {
 
     /// Insert. Returns the (handle, stateid) pairs that must now be CLOSEd: a
     /// replaced entry for the same handle, or the least recently used victim.
-    pub fn insert(&mut self, fh: FileHandle, stateid: StateId, access: u32) -> Vec<(FileHandle, StateId)> {
+    pub fn insert(
+        &mut self,
+        fh: FileHandle,
+        stateid: StateId,
+        access: u32,
+    ) -> Vec<(FileHandle, StateId)> {
         self.tick += 1;
         let mut to_close = Vec::new();
         if let Some(old) = self.entries.remove(&fh) {
@@ -61,12 +67,23 @@ impl OpenCache {
             }
         }
         if self.entries.len() >= OPEN_CACHE_CAP {
-            let victim = self.entries.iter().min_by_key(|(_, e)| e.last).map(|(k, _)| k.clone());
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last)
+                .map(|(k, _)| k.clone());
             if let Some(e) = victim.and_then(|v| self.entries.remove(&v).map(|e| (v, e))) {
                 to_close.push((e.0, e.1.stateid));
             }
         }
-        self.entries.insert(fh, Entry { stateid, access, last: self.tick });
+        self.entries.insert(
+            fh,
+            Entry {
+                stateid,
+                access,
+                last: self.tick,
+            },
+        );
         to_close
     }
 
@@ -89,7 +106,12 @@ impl OpenCache {
 }
 
 /// Build OPEN arguments for the current open owner.
-pub(super) fn open_args(s: &Nfs4Backend, share_access: u32, how: OpenHow, claim: Claim) -> OpenArgs {
+pub(super) fn open_args(
+    s: &Nfs4Backend,
+    share_access: u32,
+    how: OpenHow,
+    claim: Claim,
+) -> OpenArgs {
     OpenArgs {
         seqid: s.open_seqid,
         share_access,
@@ -102,7 +124,11 @@ pub(super) fn open_args(s: &Nfs4Backend, share_access: u32, how: OpenHow, claim:
 
 fn open_body(res: &[ResOp], i: usize) -> Result<(StateId, u32, Option<StateId>)> {
     match body(res, i)? {
-        Res::Open { stateid, rflags, deleg } => Ok((*stateid, *rflags, *deleg)),
+        Res::Open {
+            stateid,
+            rflags,
+            deleg,
+        } => Ok((*stateid, *rflags, *deleg)),
         _ => Err(Error::Xdr("expected OPEN result".into())),
     }
 }
@@ -128,7 +154,13 @@ impl Nfs4Backend {
             Res::Setclientid { clientid, verifier } => (*clientid, *verifier),
             _ => return Err(Error::Xdr("expected SETCLIENTID result".into())),
         };
-        let res = self.send(vec![Op::SetclientidConfirm { clientid, verifier: confirm }], false)?;
+        let res = self.send(
+            vec![Op::SetclientidConfirm {
+                clientid,
+                verifier: confirm,
+            }],
+            false,
+        )?;
         self.check(res)?;
         self.clientid = clientid;
         self.open_seqid = 0;
@@ -143,7 +175,10 @@ impl Nfs4Backend {
         let res = self.exec(|s| {
             vec![
                 Op::Putfh(fh.0.clone()),
-                Op::OpenConfirm { stateid: sid, seqid: s.open_seqid },
+                Op::OpenConfirm {
+                    stateid: sid,
+                    seqid: s.open_seqid,
+                },
             ]
         })?;
         match body(&res, 1)? {
@@ -177,7 +212,11 @@ impl Nfs4Backend {
 
     /// Open `fh` for read or write and return the new stateid. The caller caches it.
     fn open_file(&mut self, fh: &FileHandle, write: bool) -> Result<StateId> {
-        let access = if write { OPEN4_SHARE_ACCESS_BOTH } else { OPEN4_SHARE_ACCESS_READ };
+        let access = if write {
+            OPEN4_SHARE_ACCESS_BOTH
+        } else {
+            OPEN4_SHARE_ACCESS_READ
+        };
         if self.minor >= 1 {
             // NFSv4.1+: open the filehandle itself (CLAIM_FH).
             let res = self.exec(|s| {
@@ -200,7 +239,12 @@ impl Nfs4Backend {
             let res = self.exec(|s| {
                 vec![
                     Op::Putfh(dir.0.clone()),
-                    Op::Open(open_args(s, access, OpenHow::NoCreate, Claim::Null(name.clone()))),
+                    Op::Open(open_args(
+                        s,
+                        access,
+                        OpenHow::NoCreate,
+                        Claim::Null(name.clone()),
+                    )),
                     Op::Getfh,
                 ]
             })?;
@@ -209,7 +253,9 @@ impl Nfs4Backend {
             if got != *fh {
                 self.close_stateid(fh, sid);
                 self.names.remove(fh);
-                return Err(Error::Invalid("cached name no longer refers to this handle".into()));
+                return Err(Error::Invalid(
+                    "cached name no longer refers to this handle".into(),
+                ));
             }
             self.return_delegation(fh, deleg);
             self.maybe_confirm(fh, sid, rflags)
@@ -227,7 +273,11 @@ impl Nfs4Backend {
             // Upgrading a read-only open: close it before reopening for write.
             self.close_entry(fh);
         }
-        let access = if write { OPEN4_SHARE_ACCESS_BOTH } else { OPEN4_SHARE_ACCESS_READ };
+        let access = if write {
+            OPEN4_SHARE_ACCESS_BOTH
+        } else {
+            OPEN4_SHARE_ACCESS_READ
+        };
         match self.open_file(fh, write) {
             Ok(sid) => {
                 self.cache_open(fh, sid, access);
@@ -253,14 +303,26 @@ impl Nfs4Backend {
 
     /// CLOSE an open stateid on `fh`. Errors are ignored: the state is going away either way.
     pub(super) fn close_stateid(&mut self, fh: &FileHandle, sid: StateId) {
-        let _ = self.exec(|s| vec![Op::Putfh(fh.0.clone()), Op::Close { seqid: s.open_seqid, stateid: sid }]);
+        let _ = self.exec(|s| {
+            vec![
+                Op::Putfh(fh.0.clone()),
+                Op::Close {
+                    seqid: s.open_seqid,
+                    stateid: sid,
+                },
+            ]
+        });
     }
 
     /// Whether a status code means the stateid itself is unusable.
     pub(super) fn is_stateid_error(c: u32) -> bool {
         matches!(
             c,
-            code::BAD_STATEID | code::OLD_STATEID | code::STALE_STATEID | code::ADMIN_REVOKED | code::EXPIRED
+            code::BAD_STATEID
+                | code::OLD_STATEID
+                | code::STALE_STATEID
+                | code::ADMIN_REVOKED
+                | code::EXPIRED
         )
     }
 }

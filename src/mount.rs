@@ -93,7 +93,12 @@ impl Unpack for MntV3 {
 }
 
 /// Client for MOUNT `vers` on `host`: the given port, or a portmap lookup.
-fn mount_client(host: IpAddr, mount_port: Option<u16>, vers: u32, opts: &RpcOptions) -> Result<RpcClient> {
+fn mount_client(
+    host: IpAddr,
+    mount_port: Option<u16>,
+    vers: u32,
+    opts: &RpcOptions,
+) -> Result<RpcClient> {
     let port = match mount_port {
         Some(p) => p,
         None => portmap::getport(host, PROGRAM, vers, opts.proto, opts)?,
@@ -101,7 +106,12 @@ fn mount_client(host: IpAddr, mount_port: Option<u16>, vers: u32, opts: &RpcOpti
     RpcClient::connect(SocketAddr::new(host, port), PROGRAM, vers, opts)
 }
 
-fn export_version(host: IpAddr, mount_port: Option<u16>, vers: u32, opts: &RpcOptions) -> Result<Vec<Export>> {
+fn export_version(
+    host: IpAddr,
+    mount_port: Option<u16>,
+    vers: u32,
+    opts: &RpcOptions,
+) -> Result<Vec<Export>> {
     let mut client = mount_client(host, mount_port, vers, opts)?;
     let ExportList(list) = client.call(MOUNTPROC_EXPORT, &())?;
     Ok(list)
@@ -118,12 +128,17 @@ pub fn exports(host: IpAddr, mount_port: Option<u16>, opts: &RpcOptions) -> Resu
 
 /// Split a path on '/', ignoring empty components (duplicate and trailing slashes).
 fn components(path: &[u8]) -> Vec<&[u8]> {
-    path.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect()
+    path.split(|&b| b == b'/')
+        .filter(|c| !c.is_empty())
+        .collect()
 }
 
 /// Pick the export that `path` lives in: exact match, else the longest export
 /// that is a whole-component prefix of `path`. Returns (export, remainder components).
-pub fn resolve_export<'a>(exports: &'a [Export], path: &[u8]) -> Option<(&'a Export, Vec<Vec<u8>>)> {
+pub fn resolve_export<'a>(
+    exports: &'a [Export],
+    path: &[u8],
+) -> Option<(&'a Export, Vec<Vec<u8>>)> {
     let want = components(path);
     let mut best: Option<(&'a Export, usize)> = None;
     for e in exports {
@@ -162,7 +177,13 @@ pub fn mnt(
 }
 
 /// MOUNTPROC_UMNT. Best effort.
-pub fn umnt(host: IpAddr, mount_port: Option<u16>, version: u32, dir: &[u8], opts: &RpcOptions) -> Result<()> {
+pub fn umnt(
+    host: IpAddr,
+    mount_port: Option<u16>,
+    version: u32,
+    dir: &[u8],
+    opts: &RpcOptions,
+) -> Result<()> {
     let mut client = mount_client(host, mount_port, version, opts)?;
     client.call::<_, ()>(MOUNTPROC_UMNT, &DirPath(dir))
 }
@@ -173,12 +194,18 @@ mod tests {
     use crate::xdr::{from_bytes, to_bytes};
 
     fn ex(dir: &str) -> Export {
-        Export { dir: dir.as_bytes().to_vec(), groups: vec![] }
+        Export {
+            dir: dir.as_bytes().to_vec(),
+            groups: vec![],
+        }
     }
 
     #[test]
     fn dirpath_encoding_is_byte_exact() {
-        assert_eq!(to_bytes(&DirPath(b"/srv")), [0, 0, 0, 4, b'/', b's', b'r', b'v']);
+        assert_eq!(
+            to_bytes(&DirPath(b"/srv")),
+            [0, 0, 0, 4, b'/', b's', b'r', b'v']
+        );
         // "/a" pads to 4 bytes.
         assert_eq!(to_bytes(&DirPath(b"/a")), [0, 0, 0, 2, b'/', b'a', 0, 0]);
     }
@@ -211,7 +238,10 @@ mod tests {
                     dir: b"/srv/data".to_vec(),
                     groups: vec!["10.0.0.0/8".into(), "*".into()],
                 },
-                Export { dir: b"/tank".to_vec(), groups: vec![] },
+                Export {
+                    dir: b"/tank".to_vec(),
+                    groups: vec![]
+                },
             ]
         );
     }
@@ -249,7 +279,10 @@ mod tests {
         let r: Result<MntV3> = from_bytes(&[0, 0, 0, 2]);
         assert!(matches!(r, Err(Error::Nfs(Status::NoEnt))));
         let r: Result<MntV3> = from_bytes(&[0, 0, 0x27, 0x14]);
-        assert!(matches!(r, Err(Error::Nfs(Status::NotSupp))), "10004 is NFS3ERR_NOTSUPP");
+        assert!(
+            matches!(r, Err(Error::Nfs(Status::NotSupp))),
+            "10004 is NFS3ERR_NOTSUPP"
+        );
         // Unknown mountstat3 code is preserved.
         let r: Result<MntV3> = from_bytes(&[0, 0, 0, 99]);
         assert!(matches!(r, Err(Error::Nfs(Status::Other(_, 99)))));
@@ -335,7 +368,15 @@ mod export_list_fuzz {
         };
         // A valid list: one export with two groups, then the end marker.
         let mut seed = Vec::new();
-        for word in [1u32, 4, u32::from_be_bytes(*b"/srv"), 1, 3, u32::from_be_bytes(*b"a\0\0\0"), 0] {
+        for word in [
+            1u32,
+            4,
+            u32::from_be_bytes(*b"/srv"),
+            1,
+            3,
+            u32::from_be_bytes(*b"a\0\0\0"),
+            0,
+        ] {
             seed.extend_from_slice(&word.to_be_bytes());
         }
         let mut inputs: Vec<Vec<u8>> = (0..=seed.len()).map(|n| seed[..n].to_vec()).collect();

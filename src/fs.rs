@@ -172,34 +172,34 @@ pub enum CreateMode {
 /// for the common values). Version-specific errors go in `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
-    Perm,         // 1
-    NoEnt,        // 2
-    Io,           // 5
-    Nxio,         // 6
-    Access,       // 13
-    Exist,        // 17
-    XDev,         // 18
-    NoDev,        // 19
-    NotDir,       // 20
-    IsDir,        // 21
-    Inval,        // 22
-    FBig,         // 27
-    NoSpc,        // 28
-    Rofs,         // 30
-    MLink,        // 31
-    NameTooLong,  // 63
-    NotEmpty,     // 66
-    DQuot,        // 69
-    Stale,        // 70
-    Remote,       // 71
-    BadHandle,    // 10001
-    NotSync,      // 10002
-    BadCookie,    // 10003
-    NotSupp,      // 10004
-    TooSmall,     // 10005
-    ServerFault,  // 10006
-    BadType,      // 10007
-    Jukebox,      // 10008 (v4: NFS4ERR_DELAY)
+    Perm,        // 1
+    NoEnt,       // 2
+    Io,          // 5
+    Nxio,        // 6
+    Access,      // 13
+    Exist,       // 17
+    XDev,        // 18
+    NoDev,       // 19
+    NotDir,      // 20
+    IsDir,       // 21
+    Inval,       // 22
+    FBig,        // 27
+    NoSpc,       // 28
+    Rofs,        // 30
+    MLink,       // 31
+    NameTooLong, // 63
+    NotEmpty,    // 66
+    DQuot,       // 69
+    Stale,       // 70
+    Remote,      // 71
+    BadHandle,   // 10001
+    NotSync,     // 10002
+    BadCookie,   // 10003
+    NotSupp,     // 10004
+    TooSmall,    // 10005
+    ServerFault, // 10006
+    BadType,     // 10007
+    Jukebox,     // 10008 (v4: NFS4ERR_DELAY)
     /// Any other code; the version tells you how to interpret it.
     Other(NfsVersion, u32),
 }
@@ -338,7 +338,12 @@ pub trait Filesystem {
         mode: CreateMode,
         attrs: &SetAttr,
     ) -> Result<(FileHandle, Attr)>;
-    fn mkdir(&mut self, dir: &FileHandle, name: &[u8], attrs: &SetAttr) -> Result<(FileHandle, Attr)>;
+    fn mkdir(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        attrs: &SetAttr,
+    ) -> Result<(FileHandle, Attr)>;
     fn symlink(
         &mut self,
         dir: &FileHandle,
@@ -422,7 +427,9 @@ pub trait Filesystem {
             while done < n {
                 let w = self.write(fh, pos, &buf[done..n])? as usize;
                 if w == 0 {
-                    return Err(crate::error::Error::Protocol("server accepted a 0-byte write".into()));
+                    return Err(crate::error::Error::Protocol(
+                        "server accepted a 0-byte write".into(),
+                    ));
                 }
                 if w > n - done {
                     return Err(crate::error::Error::Protocol(format!(
@@ -515,13 +522,25 @@ mod tests {
         fn write(&mut self, _: &FileHandle, _: u64, data: &[u8]) -> Result<u32> {
             Ok(data.len() as u32 + self.write_extra)
         }
-        fn create(&mut self, _: &FileHandle, _: &[u8], _: CreateMode, _: &SetAttr) -> Result<(FileHandle, Attr)> {
+        fn create(
+            &mut self,
+            _: &FileHandle,
+            _: &[u8],
+            _: CreateMode,
+            _: &SetAttr,
+        ) -> Result<(FileHandle, Attr)> {
             unused()
         }
         fn mkdir(&mut self, _: &FileHandle, _: &[u8], _: &SetAttr) -> Result<(FileHandle, Attr)> {
             unused()
         }
-        fn symlink(&mut self, _: &FileHandle, _: &[u8], _: &[u8], _: &SetAttr) -> Result<(FileHandle, Attr)> {
+        fn symlink(
+            &mut self,
+            _: &FileHandle,
+            _: &[u8],
+            _: &[u8],
+            _: &SetAttr,
+        ) -> Result<(FileHandle, Attr)> {
             unused()
         }
         fn link(&mut self, _: &FileHandle, _: &FileHandle, _: &[u8]) -> Result<()> {
@@ -546,7 +565,10 @@ mod tests {
 
     #[test]
     fn read_stream_rejects_a_reply_larger_than_requested() {
-        let mut liar = Liar { read_extra: 10, write_extra: 0 };
+        let mut liar = Liar {
+            read_extra: 10,
+            write_extra: 0,
+        };
         let mut seen = 0u64;
         let r = liar.read_stream(&FileHandle(vec![1]), 0, Some(16), &mut |c: &[u8]| {
             seen += c.len() as u64;
@@ -558,13 +580,19 @@ mod tests {
 
     #[test]
     fn write_stream_rejects_a_count_beyond_the_data_sent() {
-        let mut liar = Liar { read_extra: 0, write_extra: 5 };
+        let mut liar = Liar {
+            read_extra: 0,
+            write_extra: 5,
+        };
         let mut left = 40usize;
         let r = liar.write_stream(&FileHandle(vec![1]), 0, &mut |buf: &mut [u8]| {
             let n = left.min(buf.len());
             left -= n;
             Ok(n)
         });
-        assert!(r.is_err(), "WRITE count beyond the data was accepted: {r:?}");
+        assert!(
+            r.is_err(),
+            "WRITE count beyond the data was accepted: {r:?}"
+        );
     }
 }

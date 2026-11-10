@@ -161,7 +161,10 @@ pub fn put_nfstime(e: &mut Encoder, t: Time) {
 }
 
 fn get_nfstime(d: &mut Decoder<'_>) -> Result<Time> {
-    Ok(Time { seconds: d.get_i64()?, nseconds: d.get_u32()? })
+    Ok(Time {
+        seconds: d.get_i64()?,
+        nseconds: d.get_u32()?,
+    })
 }
 
 /// Encode the settable subset of `a`. `default_mode` applies when `a.mode` is
@@ -194,7 +197,10 @@ pub fn encode_setattr(a: &SetAttr, default_mode: Option<u32>) -> Fattr {
         attrs.push(attr::TIME_MODIFY_SET);
         put_settime(&mut v, t);
     }
-    Fattr { bitmap: bitmap(&attrs), vals: v.into_inner() }
+    Fattr {
+        bitmap: bitmap(&attrs),
+        vals: v.into_inner(),
+    }
 }
 
 /// Decoded fattr4. Only attributes the backend requests can appear; an
@@ -256,7 +262,11 @@ impl AttrSet {
             attr::TIME_ACCESS => self.time_access = Some(get_nfstime(v)?),
             attr::TIME_METADATA => self.time_metadata = Some(get_nfstime(v)?),
             attr::TIME_MODIFY => self.time_modify = Some(get_nfstime(v)?),
-            other => return Err(Error::Xdr(format!("unrequested attribute {other} in reply"))),
+            other => {
+                return Err(Error::Xdr(format!(
+                    "unrequested attribute {other} in reply"
+                )));
+            }
         }
         Ok(())
     }
@@ -276,7 +286,10 @@ impl AttrSet {
             size: self.size.unwrap_or(0),
             used: self.space_used.unwrap_or(0),
             rdev: self.rawdev.unwrap_or((0, 0)),
-            fsid: self.fsid.map(|(major, minor)| major ^ minor.rotate_left(32)).unwrap_or(0),
+            fsid: self
+                .fsid
+                .map(|(major, minor)| major ^ minor.rotate_left(32))
+                .unwrap_or(0),
             fileid: self.fileid.unwrap_or(0),
             atime: self.time_access.unwrap_or_default(),
             mtime: self.time_modify.unwrap_or_default(),
@@ -342,7 +355,10 @@ pub struct StateId {
 }
 
 /// The anonymous stateid (all zero): used for READ/WRITE/SETATTR when no open exists.
-pub const ANON_STATEID: StateId = StateId { seqid: 0, other: [0; 12] };
+pub const ANON_STATEID: StateId = StateId {
+    seqid: 0,
+    other: [0; 12],
+};
 
 impl Pack for StateId {
     fn pack(&self, e: &mut Encoder) {

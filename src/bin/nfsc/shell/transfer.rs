@@ -253,8 +253,12 @@ impl Session {
             let (_, base) = split_last(src);
             if node.attr.ftype == FileType::Directory && !recursive {
                 if several {
-                    writeln!(err, "nfsc: get: skipping directory {} (use -r)", display_str(src))
-                        .map_err(|e| CmdFailure::new(CMD, None, e.to_string()))?;
+                    writeln!(
+                        err,
+                        "nfsc: get: skipping directory {} (use -r)",
+                        display_str(src)
+                    )
+                    .map_err(|e| CmdFailure::new(CMD, None, e.to_string()))?;
                     continue;
                 }
                 return Err(CmdFailure::new(CMD, Some(src), "is a directory (use -r)"));
@@ -386,12 +390,17 @@ impl Session {
         let mut done = start;
         let result = if start < size {
             file.seek(SeekFrom::Start(start)).map_err(local_err)?;
-            self.download(fh, start, Some(size - start), &mut |chunk: &[u8]| -> Result<()> {
-                file.write_all(chunk).map_err(local_err)?;
-                done += chunk.len() as u64;
-                meter.tick(err, done);
-                Ok(())
-            })
+            self.download(
+                fh,
+                start,
+                Some(size - start),
+                &mut |chunk: &[u8]| -> Result<()> {
+                    file.write_all(chunk).map_err(local_err)?;
+                    done += chunk.len() as u64;
+                    meter.tick(err, done);
+                    Ok(())
+                },
+            )
         } else {
             Ok(0)
         };
@@ -402,7 +411,11 @@ impl Session {
                 drop(file);
                 if interrupt::is_interrupt(&e) && !resume {
                     let _ = fs::remove_file(path);
-                    let _ = writeln!(err, "nfsc: get: removed partial file {}", display_path(path));
+                    let _ = writeln!(
+                        err,
+                        "nfsc: get: removed partial file {}",
+                        display_path(path)
+                    );
                 }
                 return Err(e);
             }
@@ -491,11 +504,18 @@ impl Session {
                         writeln!(err, "nfsc: get: skipping directory loop {label}")
                             .map_err(local_err)?;
                     } else if ancestors.len() >= MAX_TREE_DEPTH {
-                        writeln!(err, "nfsc: get: skipping {label}: directory tree is too deep")
-                            .map_err(local_err)?;
-                    } else if fs::symlink_metadata(&child).is_ok_and(|m| m.file_type().is_symlink()) {
-                        writeln!(err, "nfsc: get: skipping {label}: a symbolic link is in the way")
-                            .map_err(local_err)?;
+                        writeln!(
+                            err,
+                            "nfsc: get: skipping {label}: directory tree is too deep"
+                        )
+                        .map_err(local_err)?;
+                    } else if fs::symlink_metadata(&child).is_ok_and(|m| m.file_type().is_symlink())
+                    {
+                        writeln!(
+                            err,
+                            "nfsc: get: skipping {label}: a symbolic link is in the way"
+                        )
+                        .map_err(local_err)?;
                     } else {
                         self.get_tree(&cfh, key, &child, resume, err, ancestors)?;
                     }

@@ -17,12 +17,12 @@
 
 use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::time::Instant;
 
 use nfsc::error::{Error, Result};
 use nfsc::fs::{
-    connect, ConnectOptions, CreateMode, FileHandle, Filesystem, NfsVersion, SetAttr, VersionPref,
+    ConnectOptions, CreateMode, FileHandle, Filesystem, NfsVersion, SetAttr, VersionPref, connect,
 };
 use nfsc::rpc::{Auth, RpcOptions};
 
@@ -90,7 +90,13 @@ fn pattern_source(base: u64, len: u64) -> impl FnMut(&mut [u8]) -> Result<usize>
 }
 
 /// Sequential transfer exactly as the trait's default `read_stream` does it.
-fn seq_read(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, len: u64, sink: &mut dyn FnMut(&[u8])) -> Result<u64> {
+fn seq_read(
+    fs: &mut dyn Filesystem,
+    fh: &FileHandle,
+    offset: u64,
+    len: u64,
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<u64> {
     let chunk = fs.max_read();
     let mut pos = offset;
     let end = offset + len;
@@ -109,7 +115,12 @@ fn seq_read(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, len: u64, sin
 }
 
 /// Sequential write exactly as the trait's default `write_stream` does it.
-fn seq_write(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, source: &mut dyn FnMut(&mut [u8]) -> Result<usize>) -> Result<u64> {
+fn seq_write(
+    fs: &mut dyn Filesystem,
+    fh: &FileHandle,
+    offset: u64,
+    source: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+) -> Result<u64> {
     let mut buf = vec![0u8; fs.max_write() as usize];
     let mut pos = offset;
     loop {
@@ -132,15 +143,25 @@ fn seq_write(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, source: &mut
 
 fn unique_dir() -> String {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
     format!("nfsc-perf-{:012x}", h.finish() & 0xffff_ffff_ffff)
 }
 
 /// Run `body` in a fresh scratch directory on the export, then remove it even on panic.
-fn in_scratch_dir(fs: &mut dyn Filesystem, body: &mut dyn FnMut(&mut dyn Filesystem, &FileHandle) -> Result<()>) {
+fn in_scratch_dir(
+    fs: &mut dyn Filesystem,
+    body: &mut dyn FnMut(&mut dyn Filesystem, &FileHandle) -> Result<()>,
+) {
     let root = fs.root();
     let name = unique_dir();
-    let (dir, _) = fs.mkdir(&root, name.as_bytes(), &SetAttr::default()).expect("mkdir scratch");
+    let (dir, _) = fs
+        .mkdir(&root, name.as_bytes(), &SetAttr::default())
+        .expect("mkdir scratch");
     let r = catch_unwind(AssertUnwindSafe(|| body(fs, &dir)));
     // Best-effort removal: children first, then the directory.
     if let Ok(entries) = fs.readdir(&dir) {
@@ -156,13 +177,24 @@ fn in_scratch_dir(fs: &mut dyn Filesystem, body: &mut dyn FnMut(&mut dyn Filesys
 }
 
 fn create_file(fs: &mut dyn Filesystem, dir: &FileHandle, name: &str) -> FileHandle {
-    fs.create(dir, name.as_bytes(), CreateMode::Guarded, &SetAttr::default())
-        .expect("create")
-        .0
+    fs.create(
+        dir,
+        name.as_bytes(),
+        CreateMode::Guarded,
+        &SetAttr::default(),
+    )
+    .expect("create")
+    .0
 }
 
 /// Check that `fs.read_stream` returns exactly `byte_at` content for the range.
-fn verify_read(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, len: Option<u64>, expect_len: u64) -> Result<()> {
+fn verify_read(
+    fs: &mut dyn Filesystem,
+    fh: &FileHandle,
+    offset: u64,
+    len: Option<u64>,
+    expect_len: u64,
+) -> Result<()> {
     let mut pos = offset;
     let mut bad: Option<String> = None;
     let n = fs.read_stream(fh, offset, len, &mut |b: &[u8]| {
@@ -177,7 +209,10 @@ fn verify_read(fs: &mut dyn Filesystem, fh: &FileHandle, offset: u64, len: Optio
     if let Some(m) = bad {
         return Err(Error::Protocol(m));
     }
-    assert_eq!(n, expect_len, "bytes delivered (offset {offset}, len {len:?})");
+    assert_eq!(
+        n, expect_len,
+        "bytes delivered (offset {offset}, len {len:?})"
+    );
     assert_eq!(pos - offset, expect_len);
     Ok(())
 }
@@ -192,7 +227,15 @@ fn stream_round_trip_at_boundaries() {
             let max = max_r.min(max_w);
             eprintln!("{target} {vname}: max_read {max_r} max_write {max_w}");
             in_scratch_dir(fs.as_mut(), &mut |fs, dir| {
-                let sizes = [0, 1, max - 1, max, max + 1, 3 * max + 17, 5 * 1024 * 1024 + 3];
+                let sizes = [
+                    0,
+                    1,
+                    max - 1,
+                    max,
+                    max + 1,
+                    3 * max + 17,
+                    5 * 1024 * 1024 + 3,
+                ];
                 for (i, &size) in sizes.iter().enumerate() {
                     let name = format!("f{i}.bin");
                     let fh = create_file(fs, dir, &name);
@@ -240,8 +283,14 @@ fn sink_error_aborts_and_connection_still_works() {
                         Ok(())
                     }
                 });
-                assert!(matches!(r, Err(Error::Invalid(_))), "{target} {vname}: {r:?}");
-                assert_eq!(calls, 3, "{target} {vname}: sink not called after its error");
+                assert!(
+                    matches!(r, Err(Error::Invalid(_))),
+                    "{target} {vname}: {r:?}"
+                );
+                assert_eq!(
+                    calls, 3,
+                    "{target} {vname}: sink not called after its error"
+                );
                 // The same connection serves a complete read afterwards.
                 verify_read(fs, &fh, 0, None, size)?;
                 Ok(())
@@ -263,7 +312,10 @@ fn write_stream_then_read_back_via_sequential_path() {
                 let mut got = Vec::new();
                 let n = seq_read(fs, &fh, 0, size, &mut |b: &[u8]| got.extend_from_slice(b))?;
                 assert_eq!(n, size, "{target} {vname}");
-                assert!(got.iter().enumerate().all(|(i, &b)| b == byte_at(i as u64)), "{target} {vname}: content");
+                assert!(
+                    got.iter().enumerate().all(|(i, &b)| b == byte_at(i as u64)),
+                    "{target} {vname}: content"
+                );
                 Ok(())
             });
             let _ = fs.disconnect();
@@ -278,34 +330,40 @@ fn ro_targets() -> Option<(IpAddr, Vec<u8>)> {
 
 #[test]
 fn read_stream_on_readonly_fixture_matches_sequential() {
-    let Some((ip, export)) = ro_targets() else { return };
+    let Some((ip, export)) = ro_targets() else {
+        return;
+    };
     for (vname, version) in versions() {
         let (mut fs, _) = open(ip, &export, version);
         let root = fs.root();
         let entries = fs.readdir(&root).expect("readdir");
-        let Some(f) = entries.iter().find(|e| e.name == b"big.bin") else { continue };
-        let fh = f.handle.clone().unwrap_or_else(|| fs.lookup(&root, b"big.bin").unwrap().0);
+        let Some(f) = entries.iter().find(|e| e.name == b"big.bin") else {
+            continue;
+        };
+        let fh = f
+            .handle
+            .clone()
+            .unwrap_or_else(|| fs.lookup(&root, b"big.bin").unwrap().0);
         let size = fs.getattr(&fh).unwrap().size;
         let mut seq = Vec::new();
-        seq_read(fs.as_mut(), &fh, 0, size, &mut |b: &[u8]| seq.extend_from_slice(b)).unwrap();
-        let mut piped = Vec::new();
-        let n = fs.read_stream(&fh, 0, None, &mut |b: &[u8]| {
-            piped.extend_from_slice(b);
-            Ok(())
+        seq_read(fs.as_mut(), &fh, 0, size, &mut |b: &[u8]| {
+            seq.extend_from_slice(b)
         })
         .unwrap();
+        let mut piped = Vec::new();
+        let n = fs
+            .read_stream(&fh, 0, None, &mut |b: &[u8]| {
+                piped.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(n, size, "{vname}");
         assert_eq!(piped, seq, "{vname}: pipelined and sequential reads differ");
     }
 }
 
 /// Timed read of `len` bytes from `off` with a transfer function; returns MiB/s.
-fn time_read(
-    fs: &mut dyn Filesystem,
-    fh: &FileHandle,
-    len: u64,
-    pipelined: bool,
-) -> f64 {
+fn time_read(fs: &mut dyn Filesystem, fh: &FileHandle, len: u64, pipelined: bool) -> f64 {
     let mut total = 0u64;
     let started = Instant::now();
     let mut sink = |b: &[u8]| total += b.len() as u64;
@@ -327,7 +385,10 @@ fn time_read(
 #[test]
 #[ignore = "benchmark: run with --ignored --nocapture"]
 fn bench_rw_sequential_vs_pipelined() {
-    let mib: u64 = std::env::var("NFSC_PERF_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    let mib: u64 = std::env::var("NFSC_PERF_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
     let size = mib * 1024 * 1024;
     for (target, ip, path) in rw_targets() {
         for (vname, version) in versions() {
@@ -357,11 +418,16 @@ fn bench_rw_sequential_vs_pipelined() {
 #[test]
 #[ignore = "benchmark: NFSC_PERF_RO_FILE; run with --ignored --nocapture"]
 fn bench_ro_read_sequential_vs_pipelined() {
-    let Ok(spec) = std::env::var("NFSC_PERF_RO_FILE") else { return };
+    let Ok(spec) = std::env::var("NFSC_PERF_RO_FILE") else {
+        return;
+    };
     let Some((ip, file_path, _)) = parse_target(&spec) else {
         panic!("NFSC_PERF_RO_FILE must be host:/export/path/to/file");
     };
-    let mib: u64 = std::env::var("NFSC_PERF_RO_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let mib: u64 = std::env::var("NFSC_PERF_RO_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
     let vers = std::env::var("NFSC_PERF_RO_VERS").unwrap_or_else(|_| "3,4.0,4.1,4.2".into());
     // Split the export from the file name at the last slash.
     let cut = file_path.iter().rposition(|&b| b == b'/').unwrap_or(0);

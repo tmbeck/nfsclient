@@ -424,7 +424,10 @@ mod server_text_tests {
     use super::*;
 
     fn attr_with_owner(owner: &str, group: &str) -> Attr {
-        let t = Time { seconds: 0, nseconds: 0 };
+        let t = Time {
+            seconds: 0,
+            nseconds: 0,
+        };
         Attr {
             ftype: FileType::Regular,
             mode: 0o644,
@@ -452,6 +455,9 @@ mod server_text_tests {
         assert!(!owner.contains(['\u{1b}', '\u{7}']), "{owner:?}");
         assert!(!group.contains(['\u{7}', '\u{202e}']), "{group:?}");
         let text = stat_text("f", &a, None, 4096);
-        assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text:?}");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "{text:?}"
+        );
     }
 }

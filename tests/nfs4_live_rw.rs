@@ -8,13 +8,13 @@
 
 use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use nfsc::error::{Error, Result};
 use nfsc::fs::{
-    ConnectOptions, Connected, CreateMode, FileHandle, FileType, Filesystem, NfsVersion, SetAttr, SetTime,
-    Status, Time, VersionPref,
+    ConnectOptions, Connected, CreateMode, FileHandle, FileType, Filesystem, NfsVersion, SetAttr,
+    SetTime, Status, Time, VersionPref,
 };
 use nfsc::rpc::{Auth, RpcOptions};
 
@@ -26,20 +26,37 @@ struct Target {
 
 fn targets() -> Vec<Target> {
     let mut out = Vec::new();
-    for (name, key) in [("knfsd", "NFSC_TEST_RW_KNFSD"), ("ganesha", "NFSC_TEST_RW_GANESHA")] {
+    for (name, key) in [
+        ("knfsd", "NFSC_TEST_RW_KNFSD"),
+        ("ganesha", "NFSC_TEST_RW_GANESHA"),
+    ] {
         let Ok(v) = std::env::var(key) else { continue };
-        let Some((host, path)) = v.split_once(':') else { continue };
-        let Some(ip) = (host, 2049).to_socket_addrs().ok().and_then(|mut it| it.next()).map(|a| a.ip()) else {
+        let Some((host, path)) = v.split_once(':') else {
             continue;
         };
-        out.push(Target { name, ip, path: path.as_bytes().to_vec() });
+        let Some(ip) = (host, 2049)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+            .map(|a| a.ip())
+        else {
+            continue;
+        };
+        out.push(Target {
+            name,
+            ip,
+            path: path.as_bytes().to_vec(),
+        });
     }
     out
 }
 
 fn connect(t: &Target, minor: u32) -> Connected {
     let opts = ConnectOptions {
-        rpc: RpcOptions { auth: Auth::sys_from_process(), ..RpcOptions::default() },
+        rpc: RpcOptions {
+            auth: Auth::sys_from_process(),
+            ..RpcOptions::default()
+        },
         nfs_port: None,
         mount_port: None,
         version: VersionPref::Exact(NfsVersion::V4(minor)),
@@ -56,7 +73,12 @@ fn uid() -> u32 {
 
 fn unique_name() -> String {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
     format!("nfsc-v4-{:012x}", h.finish() & 0xffff_ffff_ffff)
 }
 
@@ -82,14 +104,39 @@ fn suite(fs: &mut dyn Filesystem, dir: &FileHandle) {
 
     // CREATE: all modes, guarded conflict.
     let (g, _) = fs
-        .create(dir, b"guarded", CreateMode::Guarded, &SetAttr { mode: Some(0o644), ..Default::default() })
+        .create(
+            dir,
+            b"guarded",
+            CreateMode::Guarded,
+            &SetAttr {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        )
         .expect("guarded create");
-    assert!(is_status(fs.create(dir, b"guarded", CreateMode::Guarded, &ds), Status::Exist));
-    fs.create(dir, b"guarded", CreateMode::Unchecked, &ds).expect("unchecked on existing");
-    let (_ex, _) = fs.create(dir, b"excl", CreateMode::Exclusive, &ds).expect("exclusive");
-    assert!(is_status(fs.create(dir, b"excl", CreateMode::Exclusive, &ds), Status::Exist));
+    assert!(is_status(
+        fs.create(dir, b"guarded", CreateMode::Guarded, &ds),
+        Status::Exist
+    ));
+    fs.create(dir, b"guarded", CreateMode::Unchecked, &ds)
+        .expect("unchecked on existing");
+    let (_ex, _) = fs
+        .create(dir, b"excl", CreateMode::Exclusive, &ds)
+        .expect("exclusive");
+    assert!(is_status(
+        fs.create(dir, b"excl", CreateMode::Exclusive, &ds),
+        Status::Exist
+    ));
     let (ex2, ea) = fs
-        .create(dir, b"excl2", CreateMode::Exclusive, &SetAttr { mode: Some(0o700), ..Default::default() })
+        .create(
+            dir,
+            b"excl2",
+            CreateMode::Exclusive,
+            &SetAttr {
+                mode: Some(0o700),
+                ..Default::default()
+            },
+        )
         .expect("exclusive with attrs");
     assert_eq!(ea.mode, 0o700, "attributes applied after exclusive create");
     fs.remove(dir, b"excl2").expect("remove excl2");
@@ -97,7 +144,9 @@ fn suite(fs: &mut dyn Filesystem, dir: &FileHandle) {
 
     // WRITE / READ across max_write and max_read boundaries.
     let len = 3 * 1024 * 1024 + 4567;
-    let data: Vec<u8> = (0..len).map(|i: usize| (i.wrapping_mul(7) % 251) as u8).collect();
+    let data: Vec<u8> = (0..len)
+        .map(|i: usize| (i.wrapping_mul(7) % 251) as u8)
+        .collect();
     assert_eq!(fs.write(&g, 0, &data).expect("write") as usize, len);
     assert_eq!(fs.getattr(&g).expect("getattr").size, len as u64);
     let mut back = Vec::with_capacity(len);
@@ -125,7 +174,9 @@ fn suite(fs: &mut dyn Filesystem, dir: &FileHandle) {
     assert_eq!(fs.lookup(dir, b"renamed").expect("renamed").0, g);
 
     // SYMLINK / READLINK.
-    let (ln, la) = fs.symlink(dir, b"lnk", b"renamed/target", &ds).expect("symlink");
+    let (ln, la) = fs
+        .symlink(dir, b"lnk", b"renamed/target", &ds)
+        .expect("symlink");
     assert_eq!(la.ftype, FileType::Symlink);
     assert_eq!(fs.readlink(&ln).expect("readlink"), b"renamed/target");
 
@@ -141,7 +192,10 @@ fn suite(fs: &mut dyn Filesystem, dir: &FileHandle) {
                 mode: Some(0o600),
                 size: Some(100),
                 uid: Some(uid()),
-                mtime: Some(SetTime::Client(Time { seconds: 1_000_000_000, nseconds: 0 })),
+                mtime: Some(SetTime::Client(Time {
+                    seconds: 1_000_000_000,
+                    nseconds: 0,
+                })),
                 ..Default::default()
             },
         )
@@ -161,7 +215,13 @@ fn suite(fs: &mut dyn Filesystem, dir: &FileHandle) {
     // READDIR with pagination.
     let (big, _) = fs.mkdir(dir, b"big", &ds).expect("mkdir big");
     for i in 0..1200 {
-        fs.create(&big, format!("f{i:04}").as_bytes(), CreateMode::Guarded, &ds).expect("create many");
+        fs.create(
+            &big,
+            format!("f{i:04}").as_bytes(),
+            CreateMode::Guarded,
+            &ds,
+        )
+        .expect("create many");
     }
     let entries = fs.readdir(&big).expect("readdir");
     assert_eq!(entries.len(), 1200);
@@ -179,7 +239,9 @@ fn run_target(t: &Target, minor: u32) {
     let Connected { mut fs, .. } = connect(t, minor);
     let root = fs.root();
     let name = unique_name();
-    let (dir, _) = fs.mkdir(&root, name.as_bytes(), &SetAttr::default()).expect("mkdir test dir");
+    let (dir, _) = fs
+        .mkdir(&root, name.as_bytes(), &SetAttr::default())
+        .expect("mkdir test dir");
     let result = catch_unwind(AssertUnwindSafe(|| suite(&mut *fs, &dir)));
     let cleanup = rm_rf(&mut *fs, &root, name.as_bytes());
     let _ = fs.disconnect();
@@ -203,7 +265,10 @@ fn rw_all_targets_all_minors() {
             eprintln!("== {} NFSv4.{minor}", t.name);
             // Not every server offers every minor (e.g. some kernels drop 4.0).
             let opts = ConnectOptions {
-                rpc: RpcOptions { auth: Auth::sys_from_process(), ..RpcOptions::default() },
+                rpc: RpcOptions {
+                    auth: Auth::sys_from_process(),
+                    ..RpcOptions::default()
+                },
                 ..ConnectOptions::default()
             };
             match nfsc::nfs4::connect(t.ip, &t.path, Some(minor), &opts) {

@@ -9,8 +9,8 @@ use crate::fs::FileHandle;
 use crate::xdr::{Decoder, Encoder, Pack, Unpack};
 
 use super::types::{
-    check_status, get_fh, get_opt_attr, get_opt_fh, get_verf, put_fh, put_verf, Fattr3, CreateHow, NfsTime,
-    Sattr3, Verf, WccData,
+    CreateHow, Fattr3, NfsTime, Sattr3, Verf, WccData, check_status, get_fh, get_opt_attr,
+    get_opt_fh, get_verf, put_fh, put_verf,
 };
 
 pub const NULL: u32 = 0;
@@ -253,7 +253,11 @@ impl Unpack for LookupOk {
         let fh = get_fh(d)?;
         let obj_attr = get_opt_attr(d)?;
         let dir_attr = get_opt_attr(d)?;
-        Ok(LookupOk { fh, obj_attr, dir_attr })
+        Ok(LookupOk {
+            fh,
+            obj_attr,
+            dir_attr,
+        })
     }
 }
 
@@ -299,7 +303,12 @@ impl Unpack for ReadOk {
         let count = d.get_u32()?;
         let eof = d.get_bool()?;
         let data = d.get_opaque_vec()?;
-        Ok(ReadOk { attr, count, eof, data })
+        Ok(ReadOk {
+            attr,
+            count,
+            eof,
+            data,
+        })
     }
 }
 
@@ -318,7 +327,12 @@ impl Unpack for WriteOk {
         let count = d.get_u32()?;
         let committed = d.get_u32()?;
         let verf = get_verf(d)?;
-        Ok(WriteOk { wcc, count, committed, verf })
+        Ok(WriteOk {
+            wcc,
+            count,
+            committed,
+            verf,
+        })
     }
 }
 
@@ -540,10 +554,15 @@ mod tests {
     #[test]
     fn diropargs_byte_exact() {
         let f = fh(&[0xaa, 0xbb]);
-        let a = DiropArgs { dir: &f, name: b"abc" };
+        let a = DiropArgs {
+            dir: &f,
+            name: b"abc",
+        };
         assert_eq!(
             to_bytes(&a),
-            [0, 0, 0, 2, 0xaa, 0xbb, 0, 0, 0, 0, 0, 3, b'a', b'b', b'c', 0]
+            [
+                0, 0, 0, 2, 0xaa, 0xbb, 0, 0, 0, 0, 0, 3, b'a', b'b', b'c', 0
+            ]
         );
     }
 
@@ -554,25 +573,41 @@ mod tests {
             size: Some(0),
             ..Sattr3::default()
         };
-        let none = to_bytes(&SetattrArgs { fh: &f, attrs: &s, guard: None });
+        let none = to_bytes(&SetattrArgs {
+            fh: &f,
+            attrs: &s,
+            guard: None,
+        });
         // fh(4+4) + sattr(mode 4, uid 4, gid 4, size 4+8, atime 4, mtime 4) + guard FALSE 4
         assert_eq!(none.len(), 8 + 4 + 4 + 4 + 12 + 4 + 4 + 4);
         assert_eq!(&none[none.len() - 4..], [0, 0, 0, 0]);
         let some = to_bytes(&SetattrArgs {
             fh: &f,
             attrs: &s,
-            guard: Some(NfsTime { seconds: 5, nseconds: 6 }),
+            guard: Some(NfsTime {
+                seconds: 5,
+                nseconds: 6,
+            }),
         });
-        assert_eq!(&some[some.len() - 12..], [0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 6]);
+        assert_eq!(
+            &some[some.len() - 12..],
+            [0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 6]
+        );
     }
 
     #[test]
     fn read_args_byte_exact() {
         let f = fh(&[7, 7, 7, 7]);
-        let a = ReadArgs { fh: &f, offset: 0x0102, count: 4096 };
+        let a = ReadArgs {
+            fh: &f,
+            offset: 0x0102,
+            count: 4096,
+        };
         assert_eq!(
             to_bytes(&a),
-            [0, 0, 0, 4, 7, 7, 7, 7, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0x10, 0]
+            [
+                0, 0, 0, 4, 7, 7, 7, 7, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0x10, 0
+            ]
         );
     }
 
@@ -602,7 +637,10 @@ mod tests {
         let f = fh(&[1]);
         let how = CreateHow::Exclusive([0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 1]);
         let a = CreateArgs {
-            dir: DiropArgs { dir: &f, name: b"x" },
+            dir: DiropArgs {
+                dir: &f,
+                name: b"x",
+            },
             how: &how,
         };
         assert_eq!(
@@ -621,7 +659,10 @@ mod tests {
         let f = fh(&[1]);
         let attrs = Sattr3::default();
         let a = SymlinkArgs {
-            dir: DiropArgs { dir: &f, name: b"l" },
+            dir: DiropArgs {
+                dir: &f,
+                name: b"l",
+            },
             attrs: &attrs,
             target: b"/t",
         };
@@ -636,8 +677,14 @@ mod tests {
         let a = fh(&[1]);
         let b = fh(&[2]);
         let r = RenameArgs {
-            from: DiropArgs { dir: &a, name: b"f" },
-            to: DiropArgs { dir: &b, name: b"g" },
+            from: DiropArgs {
+                dir: &a,
+                name: b"f",
+            },
+            to: DiropArgs {
+                dir: &b,
+                name: b"g",
+            },
         };
         assert_eq!(
             to_bytes(&r),
@@ -648,7 +695,10 @@ mod tests {
         );
         let l = LinkArgs {
             file: &a,
-            dir: DiropArgs { dir: &b, name: b"h" },
+            dir: DiropArgs {
+                dir: &b,
+                name: b"h",
+            },
         };
         assert_eq!(to_bytes(&l).len(), 8 + 8 + 8);
     }
@@ -677,22 +727,44 @@ mod tests {
     #[test]
     fn commit_args_byte_exact() {
         let f = fh(&[1]);
-        let a = CommitArgs { fh: &f, offset: 0, count: 0 };
-        assert_eq!(to_bytes(&a), [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let a = CommitArgs {
+            fh: &f,
+            offset: 0,
+            count: 0,
+        };
+        assert_eq!(
+            to_bytes(&a),
+            [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
     fn reply_status_error_is_surfaced() {
         let r: Result<Reply<Fattr3>> = from_bytes(&[0, 0, 0, 70]);
-        assert!(matches!(r, Err(crate::error::Error::Nfs(crate::fs::Status::Stale))));
+        assert!(matches!(
+            r,
+            Err(crate::error::Error::Nfs(crate::fs::Status::Stale))
+        ));
         let r: Result<Reply<WccData>> = from_bytes(&10001u32.to_be_bytes());
-        assert!(matches!(r, Err(crate::error::Error::Nfs(crate::fs::Status::BadHandle))));
+        assert!(matches!(
+            r,
+            Err(crate::error::Error::Nfs(crate::fs::Status::BadHandle))
+        ));
     }
 
     fn attr_bytes(fileid: u64) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.put_u32(2).put_u32(0o40755).put_u32(2).put_u32(0).put_u32(0);
-        e.put_u64(4096).put_u64(4096).put_u32(0).put_u32(0).put_u64(1).put_u64(fileid);
+        e.put_u32(2)
+            .put_u32(0o40755)
+            .put_u32(2)
+            .put_u32(0)
+            .put_u32(0);
+        e.put_u64(4096)
+            .put_u64(4096)
+            .put_u32(0)
+            .put_u32(0)
+            .put_u64(1)
+            .put_u64(fileid);
         for _ in 0..3 {
             e.put_u32(1).put_u32(0);
         }
@@ -716,7 +788,10 @@ mod tests {
     fn lookup_noent_is_error_even_with_failure_arm() {
         // NOENT followed by dir_attributes post_op_attr FALSE.
         let r: Result<Reply<LookupOk>> = from_bytes(&[0, 0, 0, 2, 0, 0, 0, 0]);
-        assert!(matches!(r, Err(crate::error::Error::Nfs(crate::fs::Status::NoEnt))));
+        assert!(matches!(
+            r,
+            Err(crate::error::Error::Nfs(crate::fs::Status::NoEnt))
+        ));
     }
 
     #[test]
@@ -762,7 +837,11 @@ mod tests {
     #[test]
     fn readdir_empty_eof() {
         let mut e = Encoder::new();
-        e.put_u32(0).put_bool(false).put_opaque_fixed(&[0; 8]).put_bool(false).put_bool(true);
+        e.put_u32(0)
+            .put_bool(false)
+            .put_opaque_fixed(&[0; 8])
+            .put_bool(false)
+            .put_bool(true);
         let r: Reply<ReaddirOk<false>> = from_bytes(e.as_bytes()).unwrap();
         assert!(r.0.entries.is_empty() && r.0.eof);
     }
@@ -778,7 +857,11 @@ mod tests {
     #[test]
     fn read_ok_decodes_data_and_eof() {
         let mut e = Encoder::new();
-        e.put_u32(0).put_bool(false).put_u32(3).put_bool(true).put_opaque(b"abc");
+        e.put_u32(0)
+            .put_bool(false)
+            .put_u32(3)
+            .put_bool(true)
+            .put_opaque(b"abc");
         let r: Reply<ReadOk> = from_bytes(e.as_bytes()).unwrap();
         assert_eq!(r.0.data, b"abc");
         assert_eq!(r.0.count, 3);
@@ -800,7 +883,11 @@ mod tests {
     #[test]
     fn create_ok_without_handle_or_attrs() {
         let mut e = Encoder::new();
-        e.put_u32(0).put_bool(false).put_bool(false).put_bool(false).put_bool(false);
+        e.put_u32(0)
+            .put_bool(false)
+            .put_bool(false)
+            .put_bool(false)
+            .put_bool(false);
         let r: Reply<CreateOk> = from_bytes(e.as_bytes()).unwrap();
         assert!(r.0.fh.is_none() && r.0.attr.is_none());
     }
@@ -834,13 +921,19 @@ mod tests {
     #[test]
     fn commit_and_rename_decode() {
         let mut e = Encoder::new();
-        e.put_u32(0).put_bool(false).put_bool(false).put_opaque_fixed(&[3; 8]);
+        e.put_u32(0)
+            .put_bool(false)
+            .put_bool(false)
+            .put_opaque_fixed(&[3; 8]);
         let r: Reply<CommitOk> = from_bytes(e.as_bytes()).unwrap();
         assert_eq!(r.0.verf, [3; 8]);
 
         let mut e = Encoder::new();
         e.put_u32(0);
-        e.put_bool(false).put_bool(false).put_bool(false).put_bool(false);
+        e.put_bool(false)
+            .put_bool(false)
+            .put_bool(false)
+            .put_bool(false);
         let r: Reply<RenameOk> = from_bytes(e.as_bytes()).unwrap();
         assert!(r.0.from_wcc.after.is_none());
     }
