@@ -1,14 +1,21 @@
 //! Shell behaviour against an in-memory export (`nfsc::memfs::MemFs`).
 //! Session paths are shown as `/export/...`, matching the export name given to `Session::new`.
 
-use std::fs;
+use std::cell::RefCell;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, UNIX_EPOCH};
 
-use nfsc::fs::{CreateMode, Filesystem, SetAttr};
+use nfsc::fs::{Attr, CreateMode, DirEntry, FileHandle, Filesystem, FsStat, NfsVersion, SetAttr};
 use nfsc::memfs::MemFs;
 
+use super::complete::ShellHelper;
 use super::line::parse_script;
-use super::session::{Flow, Session};
+use super::session::{COMMANDS, Flow, Session};
 use super::{CmdError, run_script_to};
 
 const NOW: i64 = 1_700_000_000; // 2023-11-14 22:13:20 UTC
@@ -383,7 +390,7 @@ fn unknown_commands_and_bad_options_are_reported() {
     assert_eq!(fails(&mut s, "ls -z"), "nfsc: ls: invalid option -- 'z'");
     assert_eq!(
         fails(&mut s, "get"),
-        "nfsc: get: usage: get [-r] remote [local]"
+        "nfsc: get: usage: get [-r] [-c] remote [local]"
     );
 }
 
@@ -659,8 +666,9 @@ fn put_fails_instead_of_looping_when_no_bytes_are_accepted() {
     backend.write_call_limit = Some(0);
     let mut s = session(backend);
     lcd(&mut s, &dir);
+    // The bulk default in the Filesystem trait reports this as a protocol error.
     let msg = fails(&mut s, "put z.txt");
-    assert!(msg.contains("server accepted no data"), "{msg}");
+    assert!(msg.contains("0-byte write"), "{msg}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -753,4 +761,485 @@ fn session_prompt_follows_cd() {
     let mut s = session(fixture());
     ok(&mut s, "cd a");
     assert_eq!(s.prompt(), "nfs nas:/export/a> ");
+}
+
+/// Sessions that share a test-owned flag, so Ctrl-C can be simulated.
+fn session_with(fs: Box<dyn Filesystem>, flag: Arc<AtomicBool>) -> Session {
+    let mut s = Session::new(fs, "nas".into(), b"/export".to_vec(), &[]).unwrap();
+    s.clock = NOW;
+    s.term_width = 80;
+    s.interrupt = flag;
+    s
+}
+
+/// A backend shared with the test. It raises `flag` on the `trip_after`-th
+/// read or write call, as if Ctrl-C had been pressed at that moment.
+struct Tripwire {
+    fs: Rc<RefCell<MemFs>>,
+    flag: Arc<AtomicBool>,
+    calls: usize,
+    trip_after: usize,
+}
+
+impl Tripwire {
+    fn new(fs: Rc<RefCell<MemFs>>, flag: Arc<AtomicBool>, trip_after: usize) -> Self {
+        Tripwire {
+            fs,
+            flag,
+            calls: 0,
+            trip_after,
+        }
+    }
+
+    fn tick(&mut self) {
+        self.calls += 1;
+        if self.calls == self.trip_after {
+            self.flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Filesystem for Tripwire {
+    fn version(&self) -> NfsVersion {
+        self.fs.borrow().version()
+    }
+    fn root(&self) -> FileHandle {
+        self.fs.borrow().root()
+    }
+    fn max_read(&self) -> u32 {
+        self.fs.borrow().max_read()
+    }
+    fn max_write(&self) -> u32 {
+        self.fs.borrow().max_write()
+    }
+    fn getattr(&mut self, fh: &FileHandle) -> nfsc::Result<Attr> {
+        self.fs.borrow_mut().getattr(fh)
+    }
+    fn setattr(&mut self, fh: &FileHandle, attrs: &SetAttr) -> nfsc::Result<Attr> {
+        self.fs.borrow_mut().setattr(fh, attrs)
+    }
+    fn lookup(&mut self, dir: &FileHandle, name: &[u8]) -> nfsc::Result<(FileHandle, Attr)> {
+        self.fs.borrow_mut().lookup(dir, name)
+    }
+    fn readdir(&mut self, dir: &FileHandle) -> nfsc::Result<Vec<DirEntry>> {
+        self.fs.borrow_mut().readdir(dir)
+    }
+    fn readlink(&mut self, fh: &FileHandle) -> nfsc::Result<Vec<u8>> {
+        self.fs.borrow_mut().readlink(fh)
+    }
+    fn read(&mut self, fh: &FileHandle, offset: u64, count: u32) -> nfsc::Result<(Vec<u8>, bool)> {
+        self.tick();
+        self.fs.borrow_mut().read(fh, offset, count)
+    }
+    fn write(&mut self, fh: &FileHandle, offset: u64, data: &[u8]) -> nfsc::Result<u32> {
+        self.tick();
+        self.fs.borrow_mut().write(fh, offset, data)
+    }
+    fn create(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        mode: CreateMode,
+        attrs: &SetAttr,
+    ) -> nfsc::Result<(FileHandle, Attr)> {
+        self.fs.borrow_mut().create(dir, name, mode, attrs)
+    }
+    fn mkdir(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        attrs: &SetAttr,
+    ) -> nfsc::Result<(FileHandle, Attr)> {
+        self.fs.borrow_mut().mkdir(dir, name, attrs)
+    }
+    fn symlink(
+        &mut self,
+        dir: &FileHandle,
+        name: &[u8],
+        target: &[u8],
+        attrs: &SetAttr,
+    ) -> nfsc::Result<(FileHandle, Attr)> {
+        self.fs.borrow_mut().symlink(dir, name, target, attrs)
+    }
+    fn link(&mut self, target: &FileHandle, dir: &FileHandle, name: &[u8]) -> nfsc::Result<()> {
+        self.fs.borrow_mut().link(target, dir, name)
+    }
+    fn remove(&mut self, dir: &FileHandle, name: &[u8]) -> nfsc::Result<()> {
+        self.fs.borrow_mut().remove(dir, name)
+    }
+    fn rmdir(&mut self, dir: &FileHandle, name: &[u8]) -> nfsc::Result<()> {
+        self.fs.borrow_mut().rmdir(dir, name)
+    }
+    fn rename(
+        &mut self,
+        from_dir: &FileHandle,
+        from_name: &[u8],
+        to_dir: &FileHandle,
+        to_name: &[u8],
+    ) -> nfsc::Result<()> {
+        self.fs
+            .borrow_mut()
+            .rename(from_dir, from_name, to_dir, to_name)
+    }
+    fn fsstat(&mut self, fh: &FileHandle) -> nfsc::Result<FsStat> {
+        self.fs.borrow_mut().fsstat(fh)
+    }
+    fn disconnect(&mut self) -> nfsc::Result<()> {
+        self.fs.borrow_mut().disconnect()
+    }
+}
+
+/// `len` bytes of a repeating ASCII pattern, so contents are easy to compare.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| b'a' + (i % 26) as u8).collect()
+}
+
+/// Completion candidates for `line` as (display, replacement) pairs.
+fn complete(s: &Session, line: &str) -> Vec<(String, String)> {
+    let mut helper = ShellHelper::new();
+    s.sync_completer(&mut helper);
+    let (_, pairs) = helper.candidates(line);
+    pairs
+        .into_iter()
+        .map(|p| (p.display, p.replacement))
+        .collect()
+}
+
+fn pair(display: &str, replacement: &str) -> (String, String) {
+    (display.to_string(), replacement.to_string())
+}
+
+#[test]
+fn completes_command_names_at_the_start_of_each_command() {
+    let s = session(fixture());
+    assert_eq!(complete(&s, "ca"), vec![pair("cat", "cat ")]);
+    assert_eq!(complete(&s, "ls; st"), vec![pair("stat", "stat ")]);
+    assert_eq!(complete(&s, "").len(), COMMANDS.len());
+    assert!(
+        complete(&s, "ls -l ca").is_empty(),
+        "after a command, words are paths, not commands"
+    );
+}
+
+#[test]
+fn completes_remote_paths_and_marks_directories() {
+    let s = session(fixture());
+    assert_eq!(complete(&s, "cat b"), vec![pair("b.txt", "b.txt ")]);
+    assert_eq!(
+        complete(&s, "ls a/i"),
+        vec![pair("inner.txt", "a/inner.txt ")]
+    );
+    assert_eq!(
+        complete(&s, "cd "),
+        vec![pair("a/", "a/")],
+        "cd lists directories only"
+    );
+    assert_eq!(complete(&s, "stat ln"), vec![pair("ln", "ln ")]);
+    assert!(
+        complete(&s, "cd nosuch/").is_empty(),
+        "errors give no candidates"
+    );
+}
+
+#[test]
+fn hidden_names_need_a_leading_dot() {
+    let mut fs = fixture();
+    fs.add_file(".hidden", b"x").unwrap();
+    let s = session(fs);
+    let plain: Vec<String> = complete(&s, "cat ").into_iter().map(|p| p.0).collect();
+    assert!(!plain.contains(&".hidden".to_string()), "{plain:?}");
+    assert_eq!(complete(&s, "cat .h"), vec![pair(".hidden", ".hidden ")]);
+}
+
+#[test]
+fn names_with_spaces_and_quotes_complete_to_readable_words() {
+    let mut fs = MemFs::new();
+    fs.add_file("my file.txt", b"x").unwrap();
+    fs.add_dir("my dir").unwrap();
+    fs.add_file("my dir/inner file", b"y").unwrap();
+    let s = session(fs);
+    assert_eq!(
+        complete(&s, "cat my\\ f"),
+        vec![pair("my file.txt", "my\\ file.txt ")]
+    );
+    assert_eq!(
+        complete(&s, "cat \"my f"),
+        vec![pair("my file.txt", "\"my file.txt\" ")]
+    );
+    assert_eq!(
+        complete(&s, "cat 'my f"),
+        vec![pair("my file.txt", "'my file.txt' ")]
+    );
+    assert_eq!(
+        complete(&s, "cd \"my d"),
+        vec![pair("my dir/", "\"my dir/")]
+    );
+    assert_eq!(
+        complete(&s, "cat \"my dir/i"),
+        vec![pair("inner file", "\"my dir/inner file\" ")]
+    );
+    // Replacements read back, through the line parser, as the names they stand for.
+    let word = complete(&s, "cat \"my dir/i")[0].1.clone();
+    let cmds = parse_script(&format!("cat {word}")).unwrap();
+    assert_eq!(cmds[0][1], "my dir/inner file");
+    let word = complete(&s, "cat my\\ f")[0].1.clone();
+    let cmds = parse_script(&format!("cat {word}")).unwrap();
+    assert_eq!(cmds[0][1], "my file.txt");
+}
+
+#[test]
+fn names_the_line_parser_cannot_express_are_not_offered() {
+    let mut fs = MemFs::new();
+    fs.add_file("a*b", b"x").unwrap();
+    fs.add_file("plain", b"y").unwrap();
+    let s = session(fs);
+    assert_eq!(complete(&s, "cat "), vec![pair("plain", "plain ")]);
+}
+
+#[test]
+fn completion_listings_refresh_after_a_modifying_command() {
+    let mut s = session(fixture());
+    assert!(complete(&s, "cat ne").is_empty());
+    ok(&mut s, "mkdir nested");
+    assert_eq!(complete(&s, "cat ne"), vec![pair("nested/", "nested/")]);
+}
+
+#[test]
+fn flags_complete_after_a_dash() {
+    let s = session(fixture());
+    assert_eq!(complete(&s, "ls -"), vec![pair("-l", "-l ")]);
+    assert_eq!(
+        complete(&s, "get -"),
+        vec![pair("-c", "-c"), pair("-r", "-r")]
+    );
+    assert_eq!(complete(&s, "ln -"), vec![pair("-s", "-s ")]);
+}
+
+#[test]
+fn local_paths_complete_from_the_local_directory() {
+    let dir = scratch("complete_local");
+    fs::write(dir.join("upload.bin"), b"x").unwrap();
+    fs::create_dir_all(dir.join("sub dir")).unwrap();
+    let mut s = session(fixture());
+    lcd(&mut s, &dir);
+    assert_eq!(
+        complete(&s, "put up"),
+        vec![pair("upload.bin", "upload.bin ")]
+    );
+    assert_eq!(complete(&s, "lcd su"), vec![pair("sub dir/", "sub\\ dir/")]);
+    assert_eq!(complete(&s, "lcd "), vec![pair("sub dir/", "sub\\ dir/")]);
+    assert_eq!(
+        complete(&s, "get b.txt up"),
+        vec![pair("upload.bin", "upload.bin ")],
+        "the second argument of get is local"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ctrl_c_with_no_transfer_running_stops_a_script_with_status_130() {
+    let mut s = session(fixture());
+    s.interrupt.store(true, Ordering::SeqCst);
+    let cmds = parse_script("pwd; pwd").unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let r = run_script_to(&mut s, &cmds, &mut out, &mut err);
+    assert!(matches!(r, Err(CmdError::Reported(130))));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "/export\n",
+        "only the first command ran"
+    );
+    assert_eq!(String::from_utf8(err).unwrap(), "nfsc: interrupted\n");
+}
+
+#[test]
+fn ctrl_c_during_get_removes_the_partial_file() {
+    let dir = scratch("ctrl_c_get");
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.max_read = 512;
+    inner.add_file("big.bin", &pattern(8192)).unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    let backend = Rc::new(RefCell::new(inner));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend, flag.clone(), 2)),
+        flag.clone(),
+    );
+    lcd(&mut s, &dir);
+    assert_eq!(
+        fails(&mut s, "get big.bin"),
+        "nfsc: get: big.bin: interrupted"
+    );
+    assert!(
+        !dir.join("big.bin").exists(),
+        "the partial download is removed"
+    );
+    // The prompt works again once the flag is cleared.
+    flag.store(false, Ordering::SeqCst);
+    assert_eq!(ok(&mut s, "pwd"), "/export\n");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ctrl_c_during_put_leaves_a_partial_remote_file_that_put_c_completes() {
+    let dir = scratch("ctrl_c_put");
+    let data = pattern(8192);
+    fs::write(dir.join("up.bin"), &data).unwrap();
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.max_write = 512;
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), 2)),
+        flag.clone(),
+    );
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put up.bin");
+    assert_eq!(r.failure.as_deref(), Some("nfsc: put: up.bin: interrupted"));
+    assert!(
+        r.err
+            .contains("partial (1024 of 8192 bytes); put -c continues it"),
+        "{}",
+        r.err
+    );
+    assert_eq!(backend.borrow().attr_at("up.bin").unwrap().size, 1024);
+
+    flag.store(false, Ordering::SeqCst);
+    let r = run(&mut s, "put -c up.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 1024"), "{}", r.err);
+    assert_eq!(backend.borrow().read_file("up.bin"), Some(data));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_c_continues_a_partial_local_file() {
+    let dir = scratch("get_resume");
+    let data = pattern(8192);
+    let mut backend = MemFs::new();
+    backend.clock = NOW;
+    backend.add_file("big.bin", &data).unwrap();
+    let mut s = session(backend);
+    lcd(&mut s, &dir);
+    fs::write(dir.join("big.bin"), &data[..3000]).unwrap();
+
+    let r = run(&mut s, "get -c big.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 3000"), "{}", r.err);
+    assert_eq!(fs::read(dir.join("big.bin")).unwrap(), data);
+
+    let r = run(&mut s, "get -c big.bin");
+    assert!(r.err.contains("already complete"), "{}", r.err);
+
+    fs::write(dir.join("big.bin"), vec![0u8; 9000]).unwrap();
+    let msg = fails(&mut s, "get -c big.bin");
+    assert!(msg.contains("larger than the remote file"), "{msg}");
+    assert_eq!(
+        fs::metadata(dir.join("big.bin")).unwrap().len(),
+        9000,
+        "never truncated"
+    );
+
+    ok(&mut s, "get big.bin");
+    assert_eq!(
+        fs::read(dir.join("big.bin")).unwrap(),
+        data,
+        "without -c it is overwritten"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_c_continues_a_partial_remote_file() {
+    let dir = scratch("put_resume");
+    let data = pattern(8192);
+    fs::write(dir.join("up.bin"), &data).unwrap();
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.add_file("up.bin", &data[..3000]).unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put -c up.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 3000"), "{}", r.err);
+    assert_eq!(backend.borrow().read_file("up.bin"), Some(data));
+    let r = run(&mut s, "put -c up.bin");
+    assert!(r.err.contains("already complete"), "{}", r.err);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_sets_the_local_mtime_to_the_remote_mtime() {
+    let dir = scratch("mtime");
+    let mut s = session(fixture());
+    lcd(&mut s, &dir);
+    ok(&mut s, "get b.txt");
+    let mtime = fs::metadata(dir.join("b.txt")).unwrap().modified().unwrap();
+    assert_eq!(mtime, UNIX_EPOCH + Duration::from_secs(NOW as u64));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_c_past_four_gib_fetches_only_the_tail() {
+    const FOUR_GIB: u64 = 1 << 32;
+    let dir = scratch("sparse_get");
+    let local = dir.join("huge.bin");
+    File::create(&local).unwrap().set_len(FOUR_GIB).unwrap();
+    let mut backend = MemFs::new();
+    backend.clock = NOW;
+    backend
+        .add_sparse_file("huge.bin", FOUR_GIB + 4096, 0xAB)
+        .unwrap();
+    let mut s = session(backend);
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get -c huge.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 4294967296"), "{}", r.err);
+    let mut f = File::open(&local).unwrap();
+    assert_eq!(f.metadata().unwrap().len(), FOUR_GIB + 4096);
+    f.seek(SeekFrom::Start(FOUR_GIB)).unwrap();
+    let mut tail = vec![0u8; 4096];
+    f.read_exact(&mut tail).unwrap();
+    assert!(tail.iter().all(|&b| b == 0xAB));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_c_past_four_gib_uploads_only_the_tail() {
+    const FOUR_GIB: u64 = 1 << 32;
+    let dir = scratch("sparse_put");
+    let local = dir.join("huge.bin");
+    {
+        let mut f = File::create(&local).unwrap();
+        f.set_len(FOUR_GIB + 4096).unwrap();
+        f.seek(SeekFrom::Start(FOUR_GIB)).unwrap();
+        f.write_all(&[0x5A; 4096]).unwrap();
+    }
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.add_sparse_file("huge.bin", FOUR_GIB, 0).unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put -c huge.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 4294967296"), "{}", r.err);
+    let b = backend.borrow();
+    assert_eq!(b.attr_at("huge.bin").unwrap().size, FOUR_GIB + 4096);
+    assert_eq!(
+        b.read_at("huge.bin", FOUR_GIB, 4096).unwrap(),
+        vec![0x5A; 4096]
+    );
+    drop(b);
+    let _ = fs::remove_dir_all(&dir);
 }

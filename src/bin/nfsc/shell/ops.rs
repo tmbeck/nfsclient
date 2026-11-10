@@ -4,7 +4,7 @@
 use std::io::Write;
 
 use nfsc::Error;
-use nfsc::fs::{Attr, DirEntry, FileHandle, FileType, SetAttr, Status};
+use nfsc::fs::{Attr, DirEntry, FileHandle, FileType, Filesystem, SetAttr, Status};
 
 use super::format::{self, LongEntry};
 use super::line::parse_args;
@@ -65,28 +65,38 @@ pub fn write_help(out: &mut dyn Write) -> std::io::Result<()> {
 
 const HELP: &str = "\
 Paths: a leading / is the export root; others are relative to the remote
-working directory. Use \"double\" or 'single' quotes, or \\ to escape spaces.
-Separate several commands on one line with ';'.
+working directory. Quote a name with spaces in \"double\" or 'single' quotes,
+or escape one character with a backslash. Separate commands on one line with
+';'. Tab completes command names, remote and local paths, and flags.
 
   ls [-l] [path]            list a directory, or show a file (* and ? match names)
-  dir                       same as ls
-  cd [path]                 change directory (no argument: the export root)
+  dir [-l] [path]           same as ls
+  cd [path]                 change the remote directory (no argument: export root)
   pwd                       print the remote working directory
-  lcd [path]                change the local working directory (no argument: $HOME)
-  stat path...              attributes; symlinks are shown, not followed
-  get [-r] remote [local]   download; -r includes directories; local - writes stdout
-  put [-r] local [remote]   upload; -r includes directories
+  lcd [path]                change the local directory (no argument: $HOME)
+  stat path...              show attributes; symbolic links are shown, not followed
+  get [-r] [-c] remote [local]
+                            download; local defaults to the local directory, - is
+                            stdout. -r downloads a directory tree. -c resumes a
+                            partial local file from its current size
+  put [-r] [-c] local [remote]
+                            upload. -r uploads a directory tree. -c resumes a
+                            partial remote file from its current size
   cat path                  write a file to stdout
   mkdir path...             create directories
-  rm path...                remove files or symlinks (not directories)
+  rm path...                remove files and symbolic links (not directories)
   rmdir path...             remove empty directories
-  mv src dst                rename or move (into dst if it is a directory)
+  mv src dst                rename or move (into dst if dst is a directory)
   ln [-s] target name       hard link, or symbolic link with -s
   chmod mode path...        change permissions (octal, e.g. 644)
-  chown uid[:gid] path...   change owner and group (numeric)
-  df [path]                 space on the file system
-  help                      this text
+  chown uid[:gid] path...   change owner and group (numeric ids)
+  df [path]                 show space on the file system
+  help                      show this text
   exit, quit                leave the shell
+
+Ctrl-C stops a transfer and returns to the prompt. An interrupted download
+is removed unless -c is used; an interrupted upload stays on the server as a
+partial file, which put -c continues. Ctrl-D leaves the shell.
 ";
 
 impl Session {
@@ -279,9 +289,7 @@ impl Session {
         if node.attr.ftype == FileType::Directory {
             return Err(CmdFailure::from_error(CMD, path, Error::Nfs(Status::IsDir)));
         }
-        self.stream_file(&node.fh, out, |_| {})
-            .ctx(CMD, path)
-            .map(|_| ())
+        self.stream_to(&node.fh, 0, out).ctx(CMD, path).map(|_| ())
     }
 
     pub(super) fn cmd_mkdir(&mut self, args: &[String]) -> CmdResult<()> {

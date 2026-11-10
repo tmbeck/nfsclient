@@ -20,7 +20,18 @@ const MAX_GIDS: usize = 16;
 #[command(
     name = "nfsc",
     version,
-    about = "Userspace NFS client: browse and transfer files without mounting"
+    about = "Userspace NFS client: browse and transfer files without mounting",
+    after_help = "\
+Examples:
+  nfsc shell nas:/srv/backups                       open an interactive shell
+  nfsc shell nfs://nas/srv/backups -c 'get -c vm.img ./vm.img'
+  nfsc exports nas                                  list exports (showmount -e)
+  nfsc rpcinfo nas                                  list portmapper services (rpcinfo -p)
+
+Exit status: 0 success; 1 a command failed; 2 bad command line;
+130 interrupted with Ctrl-C.
+
+Run 'nfsc <command> --help' for the options of each command."
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -79,6 +90,20 @@ pub struct Globals {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Interactive shell on a path below an export, or run -c commands and exit
+    #[command(after_long_help = "\
+Interactive use: Tab completes command names, remote and local paths, and
+flags. Ctrl-C stops a running transfer (a partial download is removed unless
+-c is given) and returns to the prompt; at the prompt it clears the line.
+Ctrl-D leaves the shell. Type 'help' at the prompt for the command list.
+
+Scripted use: -c, or commands piped on stdin, stop at the first failure.
+
+Exit status: 0 success, or 'exit' / 'quit'; 1 a command failed; 130 Ctrl-C.
+
+Examples:
+  nfsc shell nas:/srv/backups
+  nfsc shell nfs://nas/srv/backups -c 'get -c vm.img ./vm.img; ls -l'
+  nfsc shell nas:/srv/iso -v 4.1 -c 'ls'")]
     Shell(ShellArgs),
     /// List the exports of a server (MOUNT EXPORT, like showmount -e)
     Exports(HostArgs),
@@ -92,7 +117,7 @@ pub struct ShellArgs {
     pub target: String,
 
     /// Run these commands separated by ';' and exit. Stops at the first failure
-    /// (status 1); 'exit' or 'quit' ends early with status 0.
+    /// (status 1), or at Ctrl-C (status 130). 'exit' or 'quit' ends early with status 0.
     #[arg(short = 'c', long = "command", value_name = "CMDS")]
     pub command: Option<String>,
 
