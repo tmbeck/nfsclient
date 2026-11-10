@@ -306,3 +306,35 @@ fn send_call_on_a_dead_port_reports_an_error() {
     let r = RpcClient::connect(addr, PROG, VERS, &opts(Proto::Tcp, Duration::from_secs(2)));
     assert!(r.is_err());
 }
+
+#[test]
+fn replies_received_before_a_drop_stay_claimable() {
+    // Connection 0 reads three calls, answers the last two (newest first) and
+    // closes without answering the first.
+    let addr = spawn_tcp(|mut s, conn| {
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        if conn == 0 {
+            let calls: Vec<_> = (0..3).filter_map(|_| read_record(&mut s)).collect();
+            for rec in calls.iter().skip(1).rev() {
+                let (xid, _, arg) = parse_call(rec);
+                write_record(&mut s, &double_reply(xid, arg));
+            }
+            return;
+        }
+        while let Some(rec) = read_record(&mut s) {
+            let (xid, _, arg) = parse_call(&rec);
+            write_record(&mut s, &double_reply(xid, arg));
+        }
+    });
+    let mut c = pipelined_client(addr, Duration::from_secs(10));
+    let a = c.send_call(DOUBLE, &1u32).unwrap();
+    let b = c.send_call(DOUBLE, &2u32).unwrap();
+    let d = c.send_call(DOUBLE, &3u32).unwrap();
+    // Waiting for `a` buffers the replies to `d` and `b`, then hits the close.
+    assert!(c.recv_reply::<u32>(a).is_err());
+    assert_eq!(c.outstanding(), 0);
+    // The replies that did arrive are not thrown away with the connection.
+    assert_eq!(c.recv_reply::<u32>(b).unwrap(), 4);
+    assert_eq!(c.recv_reply::<u32>(d).unwrap(), 6);
+    assert_eq!(c.call::<u32, u32>(DOUBLE, &50).unwrap(), 100);
+}

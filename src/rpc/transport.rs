@@ -69,6 +69,10 @@ pub struct Transport {
     timeout: Duration,
     port_mode: PortMode,
     conn: Conn,
+    /// Whether the current socket's local port is reserved. Updated when a
+    /// lost TCP stream is re-established, since the new socket may land on a
+    /// different privilege level (for example when reserved ports run out).
+    privileged: bool,
 }
 
 fn map_io(e: io::Error) -> Error {
@@ -196,6 +200,7 @@ impl Transport {
                 timeout: opts.timeout,
                 port_mode: opts.port_mode,
                 conn,
+                privileged,
             },
             privileged,
         ))
@@ -220,9 +225,11 @@ impl Transport {
             return Err(Error::Invalid("send_record is TCP-only".into()));
         };
         if slot.is_none() {
-            // A reconnect may land on a different privilege level; the
-            // `privileged` flag reported at connect time is not updated.
-            *slot = Some(connect_tcp(addr, timeout, mode)?.0);
+            // A reconnect may land on a different privilege level than the
+            // first connection; track the new socket's.
+            let (stream, privileged) = connect_tcp(addr, timeout, mode)?;
+            *slot = Some(stream);
+            self.privileged = privileged;
         }
         let stream = slot.as_mut().expect("stream was just ensured");
         let result = tcp_send(stream, timeout, msg);
@@ -268,6 +275,12 @@ impl Transport {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Whether the current (most recently connected) socket uses a reserved
+    /// local port.
+    pub fn is_privileged(&self) -> bool {
+        self.privileged
     }
 }
 
@@ -410,5 +423,31 @@ fn udp_round_trip(sock: &UdpSocket, timeout: Duration, xid: u32, msg: &[u8]) -> 
             return Err(Error::Timeout);
         }
         interval = (interval * 2).min(UDP_MAX_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn reconnect_updates_privileged_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = RpcOptions {
+            port_mode: PortMode::Unprivileged,
+            ..RpcOptions::default()
+        };
+        let (mut t, privileged) = Transport::connect(addr, &opts).unwrap();
+        assert!(!privileged);
+        assert!(!t.is_privileged());
+        // Pretend the first socket was privileged, then lose it: the reconnect
+        // (always unprivileged in this mode) must update the flag.
+        t.privileged = true;
+        t.reset();
+        t.send_record(b"\0\0\0\0").unwrap();
+        assert!(!t.is_privileged(), "flag reflects the new socket");
+        drop(listener);
     }
 }
