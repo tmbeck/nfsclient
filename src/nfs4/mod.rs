@@ -3,8 +3,8 @@
 //! - [`types`]: bitmaps, fattr4 attribute sets, stateids, shared constants.
 //! - [`ops`]: per-operation argument encoding and result decoding.
 //! - [`compound`]: COMPOUND4args / COMPOUND4res.
-//! - [`session`]: NFSv4.1+ client ID and session establishment.
-//! - [`state40`]: NFSv4.0 client ID, open stateid cache, OPEN / CLOSE helpers.
+//! - `session`: NFSv4.1+ client ID and session establishment.
+//! - `state40`: NFSv4.0 client ID, open stateid cache, OPEN / CLOSE helpers.
 //! - `backend`: connection, retry / recovery, and the Filesystem implementation.
 
 pub mod compound;

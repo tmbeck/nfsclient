@@ -550,9 +550,24 @@ fn decode_open_delegation(d: &mut Decoder<'_>) -> Result<Option<StateId>> {
             skip_nfsace4(d)?;
             Ok(Some(sid))
         }
+        3 => {
+            // OPEN_DELEGATE_NONE_EXT (NFSv4.1, RFC 8881 §18.16.2): why_no_delegation4,
+            // plus a boolean for WND4_CONTENTION (7) and WND4_RESOURCE (8).
+            match d.get_u32()? {
+                WND4_CONTENTION | WND4_RESOURCE => {
+                    d.get_bool()?;
+                }
+                _ => {}
+            }
+            Ok(None)
+        }
         other => Err(Error::Xdr(format!("unsupported delegation type {other}"))),
     }
 }
+
+/// why_no_delegation4 values that carry an extra boolean.
+const WND4_CONTENTION: u32 = 7;
+const WND4_RESOURCE: u32 = 8;
 
 impl Unpack for ResOp {
     fn unpack(d: &mut Decoder<'_>) -> Result<Self> {

@@ -312,3 +312,39 @@ fn connection_refused_is_version_unsupported() {
         .unwrap();
     assert!(err.is_version_unsupported(), "got {err}");
 }
+
+/// COMPOUND reply: OPEN (with the given open_delegation4 words) followed by
+/// GETFH, so a mis-sized delegation decode shows up as a broken GETFH.
+fn open_then_getfh(deleg: &[u32]) -> Vec<u8> {
+    let mut b = words(&[0, 0, 2]); // OK, empty tag, two results
+    b.extend(words(&[18, 0, 1])); // OPEN OK, stateid.seqid
+    b.extend([9; 12]);
+    b.extend(words(&[1, 0, 1, 0, 2])); // change_info4: atomic, before, after
+    b.extend(words(&[4, 0])); // rflags LOCKTYPE_POSIX, empty attrset
+    b.extend(words(deleg));
+    b.extend(words(&[10, 0, 2])); // GETFH OK, fh length 2
+    b.extend([0xfe, 0xed, 0, 0]);
+    b
+}
+
+#[test]
+fn open_delegate_none_ext_decodes() {
+    // OPEN_DELEGATE_NONE_EXT with WND4_CONTENTION (carries a bool),
+    // WND4_RESOURCE (carries a bool), and WND4_NOT_WANTED (no extra field).
+    for deleg in [&[3, 7, 1][..], &[3, 8, 0], &[3, 0]] {
+        let res: CompoundRes = from_bytes(&open_then_getfh(deleg)).unwrap();
+        assert_eq!(res.results.len(), 2, "{deleg:?}");
+        assert_eq!(
+            res.results[0].body,
+            Res::Open {
+                stateid: StateId {
+                    seqid: 1,
+                    other: [9; 12]
+                },
+                rflags: 4,
+                deleg: None
+            }
+        );
+        assert_eq!(res.results[1].body, Res::Fh(vec![0xfe, 0xed]), "{deleg:?}");
+    }
+}
