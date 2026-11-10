@@ -702,6 +702,13 @@ impl Filesystem for Nfs3 {
     }
 }
 
+/// Compile-time check: the backend can move between threads (see
+/// [`crate::fs::Connected::fs`]).
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<Nfs3>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

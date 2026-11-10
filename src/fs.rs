@@ -471,7 +471,10 @@ pub struct ConnectOptions {
 
 /// Result of connecting: the backend plus where in it the requested path lands.
 pub struct Connected {
-    pub fs: Box<dyn Filesystem>,
+    /// The backend. Every NFS backend is [`Send`], so a connection can be
+    /// moved to another thread (for example a worker doing the transfer).
+    /// It coerces to a plain `Box<dyn Filesystem>` where one is expected.
+    pub fs: Box<dyn Filesystem + Send>,
     /// The export (v2/v3) or pseudo-fs path (v4) that `fs.root()` corresponds to.
     pub export: Vec<u8>,
     /// Remaining path components below the export root (already split on '/').
@@ -482,6 +485,16 @@ pub struct Connected {
 /// (4.2, 4.1, 4.0), then v3, then v2, returning the first that succeeds; if all
 /// fail, returns the error from the highest version attempted unless a lower one
 /// failed for a more specific reason than "not supported".
+///
+/// A server that is down or rebooting (connections refused, reset or timing
+/// out, host unreachable, NFS4ERR_GRACE) is waited for under
+/// [`RpcOptions::retry`](crate::rpc::RpcOptions::retry): the whole
+/// negotiation is retried with backoff until some version answers, and when
+/// the budget runs out the error is [`Error::GaveUp`](crate::error::Error::GaveUp)
+/// with op `"connect"` (the retry hook sees the same op name). Answers that
+/// mean "this version is not offered" still fall through to the next version
+/// at once, and permanent errors (no such export, permission denied) are
+/// returned without retrying.
 pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Connected> {
     crate::client::connect(host, path, opts)
 }
@@ -489,6 +502,17 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Connections, and therefore every backend, can move between threads.
+    #[test]
+    fn backends_and_connections_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Connected>();
+        assert_send::<Box<dyn Filesystem + Send>>();
+        assert_send::<crate::nfs3::backend::Nfs3>();
+        assert_send::<crate::memfs::MemFs>();
+        assert_send::<crate::error::Error>();
+    }
 
     /// A backend whose READ and WRITE replies disagree with their requests.
     /// Every other operation is unused by the tests below.

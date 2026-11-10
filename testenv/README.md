@@ -7,7 +7,7 @@ touches a real export or any LAN host.
 
 | server   | image                          | exports (same paths for v3 and v4)           |
 |----------|--------------------------------|----------------------------------------------|
-| knfsd    | `localhost/nfsc-testenv-knfsd` | `/export/rw` (tmpfs, no_root_squash), `/export/ro` (tmpfs, root_squash) |
+| knfsd    | `localhost/nfsc-testenv-knfsd` | `/export/rw` (tmpfs, no_root_squash), `/export/ro` (tmpfs, root_squash); v4 pseudo-root (fsid=0) is a tmpfs `/srv/nfsroot` with bind mounts so v3 and v4 paths match |
 | ganesha  | `localhost/nfsc-testenv-ganesha` | `/export/rw` (RW, No_Root_Squash), `/export/ro` (RO, Root_Squash) |
 
 Both run `--privileged`. Both seed `/export/ro` with the same deterministic

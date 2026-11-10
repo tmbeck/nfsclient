@@ -42,6 +42,9 @@ pub(super) const CB_PROGRAM: u32 = 0x4000_0000;
 /// Bounds on how long to keep retrying NFS4ERR_GRACE / NFS4ERR_DELAY; see [`grace_wait`].
 const GRACE_WAIT_MIN: Duration = Duration::from_secs(30);
 const GRACE_WAIT_MAX: Duration = Duration::from_secs(300);
+/// Longest wait between two client / session setup attempts that got
+/// NFS4ERR_DELAY or NFS4ERR_GRACE.
+const SETUP_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// Lease used until the server reports lease_time.
 const DEFAULT_LEASE: Duration = Duration::from_secs(90);
 /// Cap on remembered (parent, name) pairs used to open files by name in NFSv4.0.
@@ -57,6 +60,52 @@ pub(crate) struct Session {
     pub busy: Vec<bool>,
     pub max_req: u32,
     pub max_resp: u32,
+    /// Slots whose last request may or may not have been executed: its reply
+    /// was lost (connection failure, timeout, undecodable reply) or the
+    /// server reported a seqid mix-up, so the server's seqid for the slot is
+    /// `slot_seq` or one past it. Not used for new requests until
+    /// [`Nfs4Backend::resume`] has probed them: reusing the seqid blindly
+    /// could get the cached reply of the lost request (data for another
+    /// offset) or NFS4ERR_RETRY_UNCACHED_REP.
+    pub uncertain: Vec<bool>,
+}
+
+impl Session {
+    /// A session with `slots` slots, each expecting seqid 1.
+    pub(crate) fn new(id: [u8; 16], slots: usize, max_req: u32, max_resp: u32) -> Self {
+        Session {
+            id,
+            slot_seq: vec![1; slots],
+            busy: vec![false; slots],
+            max_req,
+            max_resp,
+            uncertain: vec![false; slots],
+        }
+    }
+
+    /// First slot free for a new request.
+    fn usable_slot(&self) -> Option<usize> {
+        (0..self.busy.len()).find(|&i| !self.busy[i] && !self.uncertain[i])
+    }
+
+    /// Slots that may carry requests: all but the uncertain ones.
+    fn usable_count(&self) -> usize {
+        self.uncertain.iter().filter(|u| !**u).count()
+    }
+
+    fn mark_uncertain(&mut self, slot: usize) {
+        if let Some(u) = self.uncertain.get_mut(slot) {
+            *u = true;
+        }
+    }
+}
+
+/// SEQUENCE statuses that leave the slot's server-side seqid unknown.
+fn slot_confused(status: u32) -> bool {
+    matches!(
+        status,
+        code::SEQ_MISORDERED | code::RETRY_UNCACHED_REP | code::SEQ_FALSE_RETRY
+    )
 }
 
 /// A COMPOUND sent by [`Nfs4Backend::issue_compound`] whose reply is still due.
@@ -93,6 +142,15 @@ pub(crate) struct Nfs4Backend {
     readdir_max: u32,
     /// Client owner string, fixed for this connection.
     pub(super) owner_id: Vec<u8>,
+    /// Client verifier for EXCHANGE_ID / SETCLIENTID, fixed for the life of
+    /// the backend. Re-establishing with the same verifier tells the server
+    /// this is the same client instance (not a reboot), so it hands back the
+    /// same client ID with its open state when it still has it.
+    pub(super) verifier: [u8; 8],
+    /// NFSv4.0: an open-owner was abandoned after NFS4ERR_BAD_SEQID while it
+    /// still had opens, which can no longer be CLOSEd (their seqid is
+    /// unknown). See [`Nfs4Backend::new_open_owner`].
+    pub(super) leaked_opens: bool,
     disconnected: bool,
 }
 
@@ -116,7 +174,7 @@ fn hostname() -> String {
 }
 
 /// Map a failure to open the TCP connection into "NFSv4 is not offered here".
-fn map_connect_err(e: Error) -> Error {
+pub(super) fn map_connect_err(e: Error) -> Error {
     match e {
         Error::Io(ref io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
             Error::VersionUnsupported("nothing listening for NFS on the NFSv4 port".into())
@@ -127,15 +185,24 @@ fn map_connect_err(e: Error) -> Error {
 
 /// Connect with the given minor version, or negotiate the highest supported
 /// (2, then 1, then 0) when `minor` is None. Walks `path` from PUTROOTFH.
+///
+/// With `quick_setup`, the setup calls run without retries and the backend
+/// gets `opts.rpc.retry` only once it is connected (the caller retries the
+/// whole setup).
 pub(crate) fn connect(
     host: IpAddr,
     path: &[u8],
     minor: Option<u32>,
     opts: &ConnectOptions,
+    quick_setup: bool,
 ) -> Result<Connected> {
     let addr = SocketAddr::new(host, opts.nfs_port.unwrap_or(DEFAULT_PORT));
-    let rpc = RpcClient::connect(addr, PROGRAM, VERSION, &opts.rpc).map_err(map_connect_err)?;
-    let mut be = Nfs4Backend::new(addr, opts.rpc.clone(), rpc);
+    let mut setup = opts.rpc.clone();
+    if quick_setup {
+        setup.retry = crate::rpc::RetryPolicy::none();
+    }
+    let rpc = RpcClient::connect(addr, PROGRAM, VERSION, &setup)?;
+    let mut be = Nfs4Backend::new(addr, setup, rpc);
     let minors: Vec<u32> = match minor {
         Some(m) => vec![m],
         None => vec![2, 1, 0],
@@ -160,6 +227,10 @@ pub(crate) fn connect(
         ));
     }
     be.walk(path)?;
+    if quick_setup {
+        be.opts.retry = opts.rpc.retry.clone();
+        be.rpc.set_retry_policy(opts.rpc.retry.clone());
+    }
     Ok(Connected {
         fs: Box::new(be),
         export: path.to_vec(),
@@ -172,12 +243,6 @@ pub(crate) fn connect(
 /// leases, within fixed bounds.
 pub(super) fn grace_wait(lease: Duration) -> Duration {
     (lease * 2).clamp(GRACE_WAIT_MIN, GRACE_WAIT_MAX)
-}
-
-/// Exponential backoff for the `n`th (1-based) NFS4ERR_DELAY retry:
-/// 100 ms, doubling up to 1.6 s.
-pub(super) fn backoff(n: u32) -> Duration {
-    Duration::from_millis(50u64 << n.clamp(1, 5))
 }
 
 /// Whether an open-owner seqid-mutating operation (OPEN, OPEN_CONFIRM, CLOSE)
@@ -201,8 +266,12 @@ pub(super) fn seqid_advances(status: u32) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fix {
     None,
-    /// Open a new TCP connection and re-establish client state.
+    /// Open a new TCP connection and resume client state on it
+    /// ([`Nfs4Backend::resume`]).
     Reconnect,
+    /// Resume client state on the current connection: probe session slots
+    /// whose last request was lost ([`Nfs4Backend::resume`]).
+    Resume,
     /// Re-establish the client ID and session on the current connection.
     Recover,
     /// New session on the existing client ID, else a full recovery.
@@ -252,6 +321,7 @@ pub(super) fn compound_name(ops: &[Op]) -> &'static str {
                 Op::ExchangeId { .. } => "EXCHANGE_ID",
                 Op::CreateSession { .. } => "CREATE_SESSION",
                 Op::DestroySession(_) => "DESTROY_SESSION",
+                Op::BindConnToSession(_) => "BIND_CONN_TO_SESSION",
                 Op::DestroyClientid(_) => "DESTROY_CLIENTID",
                 Op::ReclaimComplete => "RECLAIM_COMPLETE",
                 Op::Setclientid { .. } => "SETCLIENTID",
@@ -318,6 +388,8 @@ impl Nfs4Backend {
             readdir_max: 32 * 1024,
             owner_id: format!("nfsc {} {} {:x}", hostname(), std::process::id(), rand64())
                 .into_bytes(),
+            verifier: rand64().to_be_bytes(),
+            leaked_opens: false,
             disconnected: false,
         }
     }
@@ -357,9 +429,7 @@ impl Nfs4Backend {
                 .as_ref()
                 .ok_or_else(|| Error::Protocol("NFSv4.1 operation without a session".into()))?;
             let free = s
-                .busy
-                .iter()
-                .position(|b| !b)
+                .usable_slot()
                 .ok_or_else(|| Error::Protocol("no free session slot".into()))?;
             all.push(Op::Sequence {
                 session: s.id,
@@ -374,19 +444,32 @@ impl Nfs4Backend {
             minor: self.minor,
             ops: all,
         };
-        let res: CompoundRes = self.rpc.call(PROC_COMPOUND, &args)?;
+        let res: CompoundRes = match self.rpc.call(PROC_COMPOUND, &args) {
+            Ok(r) => r,
+            Err(e) => {
+                if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
+                    s.mark_uncertain(i);
+                }
+                return Err(e);
+            }
+        };
         if renews && res.status == code::OK {
             self.last_activity = Instant::now();
         }
         let mut results = res.results;
         if let Some(free) = slot {
             let seq_ok = matches!(results.first(), Some(r) if r.status == code::OK);
+            let confused = results.first().is_some_and(|r| slot_confused(r.status));
             if !results.is_empty() {
                 results.remove(0);
             }
-            if let Some(s) = self.session.as_mut().filter(|_| seq_ok) {
-                s.slot_seq[free] = next_seqid(s.slot_seq[free]);
-                self.last_activity = Instant::now();
+            if let Some(s) = self.session.as_mut() {
+                if seq_ok {
+                    s.slot_seq[free] = next_seqid(s.slot_seq[free]);
+                    self.last_activity = Instant::now();
+                } else if confused {
+                    s.mark_uncertain(free);
+                }
             }
         }
         for r in &results {
@@ -414,9 +497,7 @@ impl Nfs4Backend {
                 .as_ref()
                 .ok_or_else(|| Error::Protocol("NFSv4.1 operation without a session".into()))?;
             let free = s
-                .busy
-                .iter()
-                .position(|b| !b)
+                .usable_slot()
                 .ok_or_else(|| Error::Protocol("no free session slot".into()))?;
             all.push(Op::Sequence {
                 session: s.id,
@@ -431,7 +512,15 @@ impl Nfs4Backend {
             minor: self.minor,
             ops: all,
         };
-        let xid = self.rpc.send_call(PROC_COMPOUND, &args)?;
+        let xid = match self.rpc.send_call(PROC_COMPOUND, &args) {
+            Ok(x) => x,
+            Err(e) => {
+                if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
+                    s.mark_uncertain(i);
+                }
+                return Err(e);
+            }
+        };
         if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
             s.busy[i] = true;
         }
@@ -445,6 +534,13 @@ impl Nfs4Backend {
         let reply = self.rpc.recv_reply::<CompoundRes>(p.xid);
         if let (Some(i), Some(s)) = (p.slot, self.session.as_mut()) {
             s.busy[i] = false;
+            let confused = match &reply {
+                Err(_) => true,
+                Ok(r) => r.results.first().is_some_and(|r| slot_confused(r.status)),
+            };
+            if confused {
+                s.mark_uncertain(i);
+            }
         }
         let res = reply?;
         if p.renews && res.status == code::OK {
@@ -475,7 +571,7 @@ impl Nfs4Backend {
             return 1;
         }
         match &self.session {
-            Some(s) if self.minor >= 1 => s.busy.len().min(DEFAULT_WINDOW),
+            Some(s) if self.minor >= 1 => s.usable_count().clamp(1, DEFAULT_WINDOW),
             _ => DEFAULT_WINDOW,
         }
     }
@@ -515,6 +611,15 @@ impl Nfs4Backend {
         let policy = self.opts.retry.clone();
         let mut retry = Retrier::new(&policy, "COMPOUND");
         let mut fix = Fix::None;
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.uncertain.iter().any(|u| *u) && !s.busy.iter().any(|b| *b))
+        {
+            // A slot lost its reply earlier: learn its seqid before using
+            // the session again, so the pipeline gets its full window back.
+            fix = Fix::Resume;
+        }
         // Session / client recoveries so far; the first one does not back off.
         let mut recoveries = 0u32;
         // A non-idempotent compound was already resent after a transport failure.
@@ -524,6 +629,7 @@ impl Nfs4Backend {
             if fix != Fix::None {
                 let r = match fix {
                     Fix::Reconnect => self.reconnect(),
+                    Fix::Resume => self.resume(),
                     Fix::Recover => self.recover(),
                     Fix::RecoverSession => self.recover_session(),
                     Fix::None => Ok(()),
@@ -554,7 +660,12 @@ impl Nfs4Backend {
                             "NFSv4.1 operation without a session".into(),
                         ));
                     }
-                    Some(s) if s.busy.iter().all(|b| *b) => {
+                    Some(s) if s.usable_slot().is_none() => {
+                        if s.uncertain.iter().any(|u| *u) && !s.busy.iter().any(|b| *b) {
+                            // Only slots with a lost request are left: probe them.
+                            fix = Fix::Resume;
+                            continue;
+                        }
                         return Err(Error::Protocol("no free session slot".into()));
                     }
                     Some(_) => {}
@@ -562,6 +673,12 @@ impl Nfs4Backend {
             }
             let ops = build(&*self);
             let idem = idempotent(&ops);
+            // CLOSE / OPEN_CONFIRM carry a stateid of the current open-owner;
+            // after BAD_SEQID that owner is gone, so a rebuilt one would mix
+            // the new owner's seqid with the old owner's stateid.
+            let owner_bound = ops
+                .iter()
+                .any(|op| matches!(op, Op::Close { .. } | Op::OpenConfirm { .. }));
             retry.set_op(compound_name(&ops));
             let res = match self.send(ops, true) {
                 Ok(r) => r,
@@ -584,6 +701,10 @@ impl Nfs4Backend {
             }
             match res.status {
                 code::DELAY | code::GRACE => retry.backoff(self.status_err(res.status))?,
+                code::BAD_SEQID if self.minor == 0 && owner_bound => {
+                    self.new_open_owner();
+                    return Err(self.status_err(res.status));
+                }
                 code::BAD_SEQID if self.minor == 0 && !new_owner => {
                     new_owner = true;
                     self.new_open_owner();
@@ -595,11 +716,19 @@ impl Nfs4Backend {
                     recoveries += 1;
                     fix = Fix::RecoverSession;
                 }
-                code::STALE_CLIENTID
-                | code::EXPIRED
-                | code::BADSLOT
-                | code::SEQ_MISORDERED
-                | code::BAD_HIGH_SLOT => {
+                code::SEQ_MISORDERED | code::RETRY_UNCACHED_REP | code::SEQ_FALSE_RETRY
+                    if self.minor >= 1 =>
+                {
+                    // `send` marked the slot uncertain; probing it (or, if
+                    // that fails, a new session on the same client ID)
+                    // brings it back without losing open state.
+                    if recoveries > 0 {
+                        retry.backoff(self.status_err(res.status))?;
+                    }
+                    recoveries += 1;
+                    fix = Fix::Resume;
+                }
+                code::STALE_CLIENTID | code::EXPIRED | code::BADSLOT | code::BAD_HIGH_SLOT => {
                     if recoveries > 0 {
                         retry.backoff(self.status_err(res.status))?;
                     }
@@ -618,33 +747,181 @@ impl Nfs4Backend {
     where
         F: Fn(&Nfs4Backend) -> Vec<Op>,
     {
-        let started = Instant::now();
-        let mut tries = 0u32;
+        // The connection's retry policy, but never longer than a grace period.
+        let mut policy = self.opts.retry.clone();
+        policy.budget = policy.budget.min(grace_wait(self.lease));
+        policy.max_backoff = policy.max_backoff.min(SETUP_MAX_BACKOFF);
+        let mut retry = Retrier::new(&policy, "COMPOUND");
         loop {
-            let res = self.send(build(&*self), sequenced)?;
-            if !matches!(res.status, code::DELAY | code::GRACE)
-                || started.elapsed() > grace_wait(self.lease)
-            {
+            let ops = build(&*self);
+            retry.set_op(compound_name(&ops));
+            let res = self.send(ops, sequenced)?;
+            if !matches!(res.status, code::DELAY | code::GRACE) || !policy.enabled() {
+                retry.succeeded();
                 return Ok(res);
             }
-            tries += 1;
-            std::thread::sleep(backoff(tries));
+            retry.backoff(self.status_err(res.status))?;
         }
     }
 
-    /// Reopen the TCP connection and re-establish client state.
+    /// Reopen the TCP connection and resume client state on it.
     fn reconnect(&mut self) -> Result<()> {
         self.rpc = RpcClient::connect(self.addr, PROGRAM, VERSION, &self.opts)?;
-        self.recover()
+        self.resume()
     }
 
-    /// Re-establish client ID / session after the server dropped our state.
-    /// Open stateids from the old client are discarded.
+    /// Keep as much client state as the server still has after the
+    /// connection was lost (and re-established), cheapest step first:
+    ///
+    /// - NFSv4.1+: keep using the session. With SP4_NONE a SEQUENCE on the
+    ///   new connection binds it to the session (RFC 8881 §2.10.11.1);
+    ///   BIND_CONN_TO_SESSION is sent if the server asks for it. Slots whose
+    ///   request was lost with the old connection are probed first, so their
+    ///   seqids are known again. Then CREATE_SESSION on the existing client
+    ///   ID, and only then a new EXCHANGE_ID ([`Nfs4Backend::recover`]).
+    /// - NFSv4.0: RENEW the client ID on the new connection; only if the
+    ///   server no longer knows it, SETCLIENTID again.
+    ///
+    /// Open stateids stay valid in every case where the server kept the
+    /// client ID. Errors that mean "try again later" (a broken connection,
+    /// NFS4ERR_DELAY) are returned for the caller to back off and retry.
+    pub(super) fn resume(&mut self) -> Result<()> {
+        if self.clientid == 0 {
+            return self.recover();
+        }
+        if self.minor == 0 {
+            let res = self.send(vec![Op::Renew(self.clientid)], false)?;
+            return match res.status {
+                // CB_PATH_DOWN still renews the lease (RFC 7530 §16.29.4); no
+                // callbacks are ever served, so Linux reports it routinely.
+                code::OK | code::CB_PATH_DOWN => Ok(()),
+                code::DELAY => Err(self.status_err(res.status)),
+                _ => self.recover(),
+            };
+        }
+        if self.session.is_some() {
+            match self.resume_session() {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_retryable() || broken_connection(&e) => return Err(e),
+                Err(_) => {}
+            }
+        }
+        self.recover_session()
+    }
+
+    /// NFSv4.1+: make the current session usable on the current connection.
+    /// Probes every uncertain slot (see [`Session::uncertain`]), or sends one
+    /// empty SEQUENCE when there is none.
+    fn resume_session(&mut self) -> Result<()> {
+        let uncertain: Vec<usize> = match &self.session {
+            Some(s) => (0..s.uncertain.len()).filter(|&i| s.uncertain[i]).collect(),
+            None => return Err(Error::Protocol("no session to resume".into())),
+        };
+        if uncertain.is_empty() {
+            let slot = self
+                .session
+                .as_ref()
+                .and_then(Session::usable_slot)
+                .ok_or_else(|| Error::Protocol("no free session slot".into()))?;
+            let seqid = self.session.as_ref().map_or(1, |s| s.slot_seq[slot]);
+            let st = self.probe_slot(slot, seqid)?;
+            if st != code::OK {
+                return Err(self.status_err(st));
+            }
+            if let Some(s) = self.session.as_mut() {
+                s.slot_seq[slot] = next_seqid(seqid);
+            }
+            return Ok(());
+        }
+        for slot in uncertain {
+            self.resolve_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Learn the server's seqid for a slot whose last request (seqid N) was
+    /// lost. A SEQUENCE with N+1 succeeds if the server executed N; if it
+    /// answers NFS4ERR_SEQ_MISORDERED, N never ran, and N is sent again as a
+    /// new (empty) request. Either way the slot is usable afterwards.
+    fn resolve_slot(&mut self, slot: usize) -> Result<()> {
+        let n = match &self.session {
+            Some(s) => s.slot_seq[slot],
+            None => return Err(Error::Protocol("no session to resume".into())),
+        };
+        let mut used = next_seqid(n);
+        let mut st = self.probe_slot(slot, used)?;
+        if st == code::SEQ_MISORDERED {
+            used = n;
+            st = self.probe_slot(slot, used)?;
+        }
+        if st != code::OK {
+            return Err(self.status_err(st));
+        }
+        if let Some(s) = self.session.as_mut() {
+            s.slot_seq[slot] = next_seqid(used);
+            s.uncertain[slot] = false;
+        }
+        Ok(())
+    }
+
+    /// One COMPOUND holding only SEQUENCE(`slot`, `seqid`) on the current
+    /// session; returns its status. When the server wants the connection
+    /// bound first (NFS4ERR_CONN_NOT_BOUND_TO_SESSION), sends
+    /// BIND_CONN_TO_SESSION and tries once more.
+    fn probe_slot(&mut self, slot: usize, seqid: u32) -> Result<u32> {
+        let Some((id, highest)) = self.session.as_ref().map(|s| (s.id, s.busy.len() - 1)) else {
+            return Err(Error::Protocol("no session to resume".into()));
+        };
+        let mut bound = false;
+        loop {
+            let args = CompoundArgs {
+                minor: self.minor,
+                ops: vec![Op::Sequence {
+                    session: id,
+                    seqid,
+                    slot: slot as u32,
+                    highest: highest as u32,
+                }],
+            };
+            let res: CompoundRes = self.rpc.call(PROC_COMPOUND, &args)?;
+            if res.status == code::CONN_NOT_BOUND_TO_SESSION && !bound {
+                bound = true;
+                let r = self.send(vec![Op::BindConnToSession(id)], false)?;
+                if r.status != code::OK {
+                    return Ok(r.status);
+                }
+                continue;
+            }
+            if res.status == code::OK {
+                self.last_activity = Instant::now();
+            }
+            return Ok(res.status);
+        }
+    }
+
+    /// Re-establish client ID / session after the server dropped our state
+    /// (or a resume failed). Uses the backend's fixed verifier, so a server
+    /// that still has the client ID returns it unchanged; open stateids are
+    /// kept in that case and discarded when the client ID changed.
     pub(super) fn recover(&mut self) -> Result<()> {
+        let old = self.clientid;
+        let opens = std::mem::take(&mut self.opens);
+        let seqid = self.open_seqid;
         self.session = None;
-        self.opens.clear();
-        self.open_seqid = 0;
-        self.establish()
+        match self.establish() {
+            Ok(()) if old != 0 && self.clientid == old => {
+                self.opens = opens;
+                self.open_seqid = seqid;
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Nothing is known yet; the next attempt decides.
+                self.opens = opens;
+                self.open_seqid = seqid;
+                Err(e)
+            }
+        }
     }
 
     /// The session is gone but the client ID may not be: try CREATE_SESSION on
@@ -661,8 +938,17 @@ impl Nfs4Backend {
     /// Abandon the open-owner after NFS4ERR_BAD_SEQID: its seqid is unknown,
     /// so its opens can no longer be closed and are forgotten. The next OPEN
     /// uses a new owner, whose first seqid the server accepts as given.
+    ///
+    /// The abandoned owner's opens cannot be released one by one: CLOSE needs
+    /// the owner's seqid, and RELEASE_LOCKOWNER only covers lock owners. If
+    /// there were any, disconnecting releases them all at once with a
+    /// SETCLIENTID / SETCLIENTID_CONFIRM under a new verifier (the server
+    /// then drops the old client's state, as after a client reboot);
+    /// otherwise they would only expire with the lease.
     pub(super) fn new_open_owner(&mut self) {
-        self.opens.clear();
+        if self.minor == 0 && !self.opens.drain().is_empty() {
+            self.leaked_opens = true;
+        }
         let mut owner = super::state40::OPEN_OWNER.to_vec();
         owner.extend_from_slice(format!(" {:x}", rand64()).as_bytes());
         self.open_owner = owner;
@@ -817,6 +1103,9 @@ impl Nfs4Backend {
                 true,
             );
         }
+        if self.minor == 0 && self.leaked_opens {
+            let _ = self.release_client_40();
+        }
         if self.minor >= 1 {
             if let Some(id) = self.session.as_ref().map(|s| s.id) {
                 let _ = self.send(vec![Op::DestroySession(id)], true);
@@ -833,12 +1122,9 @@ impl Drop for Nfs4Backend {
     }
 }
 
-/// Sequence id after `s` (never 0, which is reserved for "no request yet").
+/// Slot sequence id after `s`; wraps through 0 (RFC 8881 §2.10.6.1).
 fn next_seqid(s: u32) -> u32 {
-    match s.wrapping_add(1) {
-        0 => 1,
-        n => n,
-    }
+    s.wrapping_add(1)
 }
 
 /// READ pipeline: one COMPOUND per request, sequenced on a free slot (4.1+).
@@ -1482,10 +1768,20 @@ pub(super) fn back_channel_request() -> ChannelAttrs {
     }
 }
 
+/// Compile-time check: the backend can move between threads (see
+/// [`crate::fs::Connected::fs`]).
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<Nfs4Backend>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nfs4::ops::{OP_CREATE_SESSION, OP_EXCHANGE_ID, OP_PUTFH, OP_PUTROOTFH};
+    use crate::nfs4::ops::{
+        OP_BIND_CONN_TO_SESSION, OP_CREATE_SESSION, OP_EXCHANGE_ID, OP_PUTFH, OP_PUTROOTFH,
+        OP_READ, OP_RENEW,
+    };
     use crate::rpc::PortMode;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1603,9 +1899,10 @@ mod tests {
     }
 
     #[test]
-    fn seqids_advance_and_skip_zero() {
+    fn slot_seqids_advance_and_wrap_through_zero() {
         assert_eq!(next_seqid(1), 2);
-        assert_eq!(next_seqid(u32::MAX), 1);
+        assert_eq!(next_seqid(u32::MAX), 0);
+        assert_eq!(next_seqid(0), 1);
     }
 
     #[test]
@@ -1689,19 +1986,22 @@ mod tests {
 
     #[test]
     fn bad_seqid_switches_to_a_new_open_owner_and_retries() {
+        let mut open_ok = stateid_bytes(sid(3));
+        open_ok.extend(w(&[0, 0, 0, 0, 0])); // change_info4
+        open_ok.extend(w(&[0, 0, 0])); // rflags, empty attrset, no delegation
         let (addr, calls) = fake_server(vec![
             compound(
                 code::BAD_SEQID,
                 &[
                     (OP_PUTFH, code::OK, Vec::new()),
-                    (OP_CLOSE, code::BAD_SEQID, Vec::new()),
+                    (OP_OPEN, code::BAD_SEQID, Vec::new()),
                 ],
             ),
             compound(
                 code::OK,
                 &[
                     (OP_PUTFH, code::OK, Vec::new()),
-                    (OP_CLOSE, code::OK, stateid_bytes(sid(3))),
+                    (OP_OPEN, code::OK, open_ok),
                 ],
             ),
         ]);
@@ -1712,11 +2012,13 @@ mod tests {
             .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
         let res = be.exec(|s| {
             vec![
-                Op::Putfh(vec![1]),
-                Op::Close {
-                    seqid: s.open_seqid,
-                    stateid: sid(1),
-                },
+                Op::Putfh(vec![2]),
+                Op::Open(super::super::state40::open_args(
+                    s,
+                    OPEN4_SHARE_ACCESS_BOTH,
+                    OpenHow::NoCreate,
+                    Claim::Fh,
+                )),
             ]
         });
         assert!(res.is_ok(), "{res:?}");
@@ -1724,6 +2026,36 @@ mod tests {
         assert_ne!(be.open_owner, super::super::state40::OPEN_OWNER);
         assert_eq!(be.open_seqid, 1);
         assert!(be.opens.get(&FileHandle(vec![1]), false).is_none());
+        assert!(
+            be.leaked_opens,
+            "the old owner's open is remembered as leaked"
+        );
+    }
+
+    #[test]
+    fn close_after_bad_seqid_is_not_rebuilt_for_the_new_owner() {
+        let (addr, calls) = fake_server(vec![compound(
+            code::BAD_SEQID,
+            &[
+                (OP_PUTFH, code::OK, Vec::new()),
+                (OP_CLOSE, code::BAD_SEQID, Vec::new()),
+            ],
+        )]);
+        let mut be = backend(addr, 0);
+        be.clientid = 9;
+        be.open_seqid = 7;
+        let res = be.exec(|s| {
+            vec![
+                Op::Putfh(vec![1]),
+                Op::Close {
+                    seqid: s.open_seqid,
+                    stateid: sid(1),
+                },
+            ]
+        });
+        assert!(res.is_err(), "{res:?}");
+        assert_eq!(*calls.lock().unwrap(), 1, "CLOSE was not resent");
+        assert_ne!(be.open_owner, super::super::state40::OPEN_OWNER);
     }
 
     #[test]
@@ -1792,11 +2124,8 @@ mod tests {
         be.clientid = 0x55;
         be.create_seq = 3;
         be.session = Some(Session {
-            id: old,
             slot_seq: vec![9],
-            busy: vec![false],
-            max_req: 4096,
-            max_resp: 4096,
+            ..Session::new(old, 1, 4096, 4096)
         });
         be.opens
             .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
@@ -1981,9 +2310,14 @@ mod tests {
         (addr, log)
     }
 
-    /// SETCLIENTID / SETCLIENTID_CONFIRM replies for a v4.0 recovery.
+    /// Replies for a v4.0 recovery after a server reboot: RENEW of the old
+    /// client ID fails with STALE_CLIENTID, then SETCLIENTID / _CONFIRM.
     fn setclientid_reply(op: u32) -> Option<Vec<u8>> {
         match op {
+            OP_RENEW => Some(compound(
+                code::STALE_CLIENTID,
+                &[(OP_RENEW, code::STALE_CLIENTID, Vec::new())],
+            )),
             OP_SETCLIENTID => {
                 let mut sc = w(&[0, 0x42]);
                 sc.extend_from_slice(&[7; 8]);
@@ -2020,6 +2354,7 @@ mod tests {
             *log.lock().unwrap(),
             [
                 OP_PUTROOTFH,
+                OP_RENEW,
                 OP_SETCLIENTID,
                 OP_SETCLIENTID_CONFIRM,
                 OP_PUTROOTFH
@@ -2086,16 +2421,454 @@ mod tests {
         let (addr, calls) = fake_server(Vec::new());
         let mut be = backend(addr, 1);
         be.session = Some(Session {
-            id: [1; 16],
-            slot_seq: vec![1],
             busy: vec![true],
-            max_req: 4096,
-            max_resp: 4096,
+            ..Session::new([1; 16], 1, 4096, 4096)
         });
         match be.exec(|_| vec![Op::Putrootfh]) {
             Err(Error::Protocol(m)) => assert!(m.contains("slot"), "{m}"),
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    /// Byte `i` of the fake file served by [`SessionServer`].
+    fn file_byte(i: u64) -> u8 {
+        (i % 251) as u8
+    }
+
+    /// What the [`SessionServer`] saw in one call.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Seen {
+        /// SEQUENCE (slot, seqid) followed by the opcode of the next
+        /// operation (0 when SEQUENCE was alone).
+        Seq { slot: u32, seqid: u32, next: u32 },
+        /// A COMPOUND not starting with SEQUENCE: its first opcode.
+        Other(u32),
+        /// A SEQUENCE that reused the last seqid of its slot (a replay).
+        Replay { slot: u32, seqid: u32 },
+    }
+
+    /// Knobs for [`session_server`].
+    #[derive(Default)]
+    struct SessionScript {
+        /// Drop the connection, after executing it, on the READ of this
+        /// offset (the first time only).
+        drop_after_read_at: Option<u64>,
+        /// Answer SEQUENCE on a new connection with
+        /// NFS4ERR_CONN_NOT_BOUND_TO_SESSION until BIND_CONN_TO_SESSION.
+        require_bind: bool,
+        /// The session is gone once the first connection drops: SEQUENCE
+        /// gets NFS4ERR_BADSESSION until CREATE_SESSION.
+        forget_session_on_drop: bool,
+    }
+
+    /// Fake NFSv4.1 server with a real slot table (seqid checks like
+    /// knfsd: next seqid executes, the same seqid is an uncached replay,
+    /// anything else is misordered). Serves PUTFH + READ of a 1 MiB file,
+    /// SEQUENCE-only probes, BIND_CONN_TO_SESSION and CREATE_SESSION; any
+    /// other COMPOUND drops the connection. Returns the address and a log.
+    fn session_server(
+        session: [u8; 16],
+        slot_seq: Vec<u32>,
+        script: SessionScript,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let mut session = session;
+            // Last executed seqid per slot.
+            let mut last: Vec<u32> = slot_seq.iter().map(|s| s.wrapping_sub(1)).collect();
+            let mut dropped_once = false;
+            let mut session_ok = true;
+            let mut first_conn = true;
+            loop {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut bound = first_conn || !script.require_bind;
+                first_conn = false;
+                while let Some(call) = read_record(&mut s) {
+                    let at = |o: usize| u32::from_be_bytes(call[o..o + 4].try_into().unwrap());
+                    let mut off = 24;
+                    for _ in 0..2 {
+                        off += 8 + (at(off + 4) as usize).div_ceil(4) * 4;
+                    }
+                    off += 4 + (at(off) as usize).div_ceil(4) * 4; // tag; now at minorversion
+                    let nops = at(off + 4);
+                    let op = at(off + 8);
+                    let reply = if op == OP_SEQUENCE {
+                        let id: [u8; 16] = call[off + 12..off + 28].try_into().unwrap();
+                        let seqid = at(off + 28);
+                        let slot = at(off + 32);
+                        let next_off = off + 44;
+                        let next = if nops > 1 { at(next_off) } else { 0 };
+                        let seq_err = |st: u32| compound(st, &[(OP_SEQUENCE, st, Vec::new())]);
+                        if !bound {
+                            seen.lock().unwrap().push(Seen::Seq { slot, seqid, next });
+                            Some(seq_err(code::CONN_NOT_BOUND_TO_SESSION))
+                        } else if !session_ok || id != session {
+                            seen.lock().unwrap().push(Seen::Seq { slot, seqid, next });
+                            Some(seq_err(code::BADSESSION))
+                        } else if seqid == last[slot as usize] {
+                            seen.lock().unwrap().push(Seen::Replay { slot, seqid });
+                            Some(seq_err(code::RETRY_UNCACHED_REP))
+                        } else if seqid != last[slot as usize].wrapping_add(1) {
+                            seen.lock().unwrap().push(Seen::Seq { slot, seqid, next });
+                            Some(seq_err(code::SEQ_MISORDERED))
+                        } else {
+                            seen.lock().unwrap().push(Seen::Seq { slot, seqid, next });
+                            last[slot as usize] = seqid;
+                            if nops == 1 {
+                                Some(compound(code::OK, &[sequence_ok(session)]))
+                            } else if next == OP_PUTFH && nops == 3 {
+                                let fhlen = at(next_off + 4) as usize;
+                                let r = next_off + 8 + fhlen.div_ceil(4) * 4;
+                                assert_eq!(at(r), OP_READ);
+                                let offset = u64::from(at(r + 20)) << 32 | u64::from(at(r + 24));
+                                let count = at(r + 28);
+                                if script.drop_after_read_at == Some(offset) && !dropped_once {
+                                    dropped_once = true;
+                                    if script.forget_session_on_drop {
+                                        session_ok = false;
+                                    }
+                                    None
+                                } else {
+                                    let end = (offset + u64::from(count)).min(1 << 20);
+                                    let data: Vec<u8> = (offset..end).map(file_byte).collect();
+                                    let mut body =
+                                        w(&[u32::from(end == 1 << 20), data.len() as u32]);
+                                    body.extend_from_slice(&data);
+                                    body.resize(body.len().div_ceil(4) * 4, 0);
+                                    Some(compound(
+                                        code::OK,
+                                        &[
+                                            sequence_ok(session),
+                                            (OP_PUTFH, code::OK, Vec::new()),
+                                            (OP_READ, code::OK, body),
+                                        ],
+                                    ))
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    } else {
+                        seen.lock().unwrap().push(Seen::Other(op));
+                        match op {
+                            OP_BIND_CONN_TO_SESSION => {
+                                bound = true;
+                                let mut body = session.to_vec();
+                                body.extend(w(&[1, 0]));
+                                Some(compound(
+                                    code::OK,
+                                    &[(OP_BIND_CONN_TO_SESSION, code::OK, body)],
+                                ))
+                            }
+                            OP_CREATE_SESSION => {
+                                session = [0x5e; 16];
+                                session_ok = true;
+                                last = vec![0; 16];
+                                Some(create_session_ok(session, 0))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some(body) = reply else { break };
+                    let mut msg = call[0..4].to_vec();
+                    msg.extend(w(&[1, 0, 0, 0, 0]));
+                    msg.extend(body);
+                    let mut rec = (0x8000_0000u32 | msg.len() as u32).to_be_bytes().to_vec();
+                    rec.extend(msg);
+                    if s.write_all(&rec).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    /// A 4.1 backend with an established session of `slots` slots and an
+    /// open of file handle [1] cached.
+    fn session_backend(addr: SocketAddr, id: [u8; 16], slot_seq: Vec<u32>) -> Nfs4Backend {
+        let mut be = with_retry(backend(addr, 1), fast_retry(Duration::from_secs(10)));
+        be.clientid = 0x55;
+        be.create_seq = 3;
+        let n = slot_seq.len();
+        be.session = Some(Session {
+            slot_seq,
+            ..Session::new(id, n, CHAN_REQUEST, CHAN_REQUEST)
+        });
+        be.max_read = 4096;
+        be.opens
+            .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
+        be
+    }
+
+    fn no_client_setup(log: &[Seen]) {
+        for s in log {
+            assert!(
+                !matches!(
+                    s,
+                    Seen::Other(OP_EXCHANGE_ID) | Seen::Other(OP_CREATE_SESSION)
+                ),
+                "client state was re-established: {log:?}"
+            );
+            assert!(
+                !matches!(s, Seen::Replay { .. }),
+                "a lost slot's seqid was reused: {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_survives_a_dropped_connection_and_keeps_the_open() {
+        let id = [0x51; 16];
+        let (addr, log) = session_server(
+            id,
+            vec![5, 1],
+            SessionScript {
+                drop_after_read_at: Some(0),
+                ..SessionScript::default()
+            },
+        );
+        let mut be = session_backend(addr, id, vec![5, 1]);
+        let (data, _) = be.read(&FileHandle(vec![1]), 0, 100).unwrap();
+        assert_eq!(data, (0..100).map(file_byte).collect::<Vec<_>>());
+        let log = log.lock().unwrap().clone();
+        no_client_setup(&log);
+        assert_eq!(
+            log,
+            [
+                Seen::Seq {
+                    slot: 0,
+                    seqid: 5,
+                    next: OP_PUTFH
+                },
+                // Slot 0's READ was executed but its reply lost: probing
+                // with the next seqid succeeds, so the slot moves on.
+                Seen::Seq {
+                    slot: 0,
+                    seqid: 6,
+                    next: 0
+                },
+                Seen::Seq {
+                    slot: 0,
+                    seqid: 7,
+                    next: OP_PUTFH
+                },
+            ]
+        );
+        let s = be.session.as_ref().unwrap();
+        assert_eq!(s.id, id, "same session");
+        assert_eq!(s.slot_seq, [8, 1]);
+        assert_eq!(be.clientid, 0x55);
+        assert_eq!(be.opens.get(&FileHandle(vec![1]), false), Some(sid(1)));
+    }
+
+    #[test]
+    fn lost_unexecuted_request_is_resent_on_the_same_seqid() {
+        // An earlier request on slot 0 (seqid 9) was lost before the server
+        // saw it, so the slot is uncertain and the server is still at 8.
+        let id = [0x52; 16];
+        let (addr, log) = session_server(id, vec![9], SessionScript::default());
+        let mut be = session_backend(addr, id, vec![9]);
+        be.session.as_mut().unwrap().mark_uncertain(0);
+        let (data, _) = be.read(&FileHandle(vec![1]), 4096, 10).unwrap();
+        assert_eq!(data, (4096..4106).map(file_byte).collect::<Vec<_>>());
+        let log = log.lock().unwrap().clone();
+        no_client_setup(&log);
+        assert_eq!(
+            log,
+            [
+                Seen::Seq {
+                    slot: 0,
+                    seqid: 10,
+                    next: 0
+                }, // misordered: 9 never ran
+                Seen::Seq {
+                    slot: 0,
+                    seqid: 9,
+                    next: 0
+                },
+                Seen::Seq {
+                    slot: 0,
+                    seqid: 10,
+                    next: OP_PUTFH
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn new_connection_is_bound_to_the_session_when_the_server_asks() {
+        let id = [0x53; 16];
+        let (addr, log) = session_server(
+            id,
+            vec![1],
+            SessionScript {
+                drop_after_read_at: Some(0),
+                require_bind: true,
+                ..SessionScript::default()
+            },
+        );
+        let mut be = session_backend(addr, id, vec![1]);
+        be.read(&FileHandle(vec![1]), 0, 10).unwrap();
+        let log = log.lock().unwrap().clone();
+        no_client_setup(&log);
+        assert!(
+            log.contains(&Seen::Other(OP_BIND_CONN_TO_SESSION)),
+            "{log:?}"
+        );
+        assert_eq!(be.session.as_ref().unwrap().id, id);
+        assert_eq!(be.opens.get(&FileHandle(vec![1]), false), Some(sid(1)));
+    }
+
+    #[test]
+    fn lost_session_is_recreated_on_the_same_client_id() {
+        let id = [0x54; 16];
+        let (addr, log) = session_server(
+            id,
+            vec![1, 1],
+            SessionScript {
+                drop_after_read_at: Some(0),
+                forget_session_on_drop: true,
+                ..SessionScript::default()
+            },
+        );
+        let mut be = session_backend(addr, id, vec![1, 1]);
+        let (data, _) = be.read(&FileHandle(vec![1]), 0, 10).unwrap();
+        assert_eq!(data, (0..10).map(file_byte).collect::<Vec<_>>());
+        let log = log.lock().unwrap().clone();
+        assert!(log.contains(&Seen::Other(OP_CREATE_SESSION)), "{log:?}");
+        assert!(!log.contains(&Seen::Other(OP_EXCHANGE_ID)), "{log:?}");
+        assert_eq!(be.session.as_ref().unwrap().id, [0x5e; 16]);
+        assert_eq!(be.clientid, 0x55);
+        assert_eq!(be.opens.get(&FileHandle(vec![1]), false), Some(sid(1)));
+    }
+
+    #[test]
+    fn pipelined_read_survives_a_lost_reply_mid_window() {
+        let id = [0x55; 16];
+        let (addr, log) = session_server(
+            id,
+            vec![1; 4],
+            SessionScript {
+                drop_after_read_at: Some(3 * 4096),
+                ..SessionScript::default()
+            },
+        );
+        let mut be = session_backend(addr, id, vec![1; 4]);
+        let len = 64 * 1024u64;
+        let mut got = Vec::new();
+        let n = be
+            .read_stream(&FileHandle(vec![1]), 0, Some(len), &mut |c: &[u8]| {
+                got.extend_from_slice(c);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(n, len);
+        assert!(
+            got == (0..len).map(file_byte).collect::<Vec<_>>(),
+            "wrong data after recovery"
+        );
+        let log = log.lock().unwrap().clone();
+        no_client_setup(&log);
+        assert!(
+            log.iter().any(|s| matches!(s, Seen::Seq { next: 0, .. })),
+            "the lost slots were probed: {log:?}"
+        );
+        assert_eq!(be.session.as_ref().unwrap().id, id);
+        assert!(
+            be.session.as_ref().unwrap().uncertain.iter().all(|u| !u),
+            "every slot was resolved"
+        );
+    }
+
+    #[test]
+    fn v40_reconnect_renews_and_keeps_the_client_id() {
+        let mut first = true;
+        let (addr, log) = outage_server(Duration::from_millis(50), move |op| match op {
+            OP_PUTROOTFH if std::mem::take(&mut first) => None,
+            OP_PUTROOTFH => Some(compound(code::OK, &[(OP_PUTROOTFH, code::OK, Vec::new())])),
+            OP_RENEW => Some(compound(code::OK, &[(OP_RENEW, code::OK, Vec::new())])),
+            _ => None,
+        });
+        let mut be = with_retry(backend(addr, 0), fast_retry(Duration::from_secs(10)));
+        be.clientid = 9;
+        be.open_seqid = 4;
+        be.opens
+            .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
+        be.exec(|_| vec![Op::Putrootfh]).unwrap();
+        assert_eq!(*log.lock().unwrap(), [OP_PUTROOTFH, OP_RENEW, OP_PUTROOTFH]);
+        assert_eq!(be.clientid, 9);
+        assert_eq!(be.open_seqid, 4);
+        assert_eq!(be.opens.get(&FileHandle(vec![1]), false), Some(sid(1)));
+    }
+
+    #[test]
+    fn recovery_that_gets_the_same_client_id_back_keeps_opens() {
+        // EXCHANGE_ID with the backend's fixed verifier: the server still
+        // knows the client and returns the same client ID.
+        let xid = w(&[0, 0x55, 4, 0, 0, 0, 0, 0, 0, 0]);
+        let sess = [0xcd; 16];
+        let (addr, _) = fake_server(vec![
+            compound(code::OK, &[(OP_EXCHANGE_ID, code::OK, xid)]),
+            create_session_ok(sess, 4),
+            compound(
+                code::COMPLETE_ALREADY,
+                &[
+                    sequence_ok(sess),
+                    (OP_RECLAIM_COMPLETE, code::COMPLETE_ALREADY, Vec::new()),
+                ],
+            ),
+        ]);
+        let mut be = backend(addr, 1);
+        be.clientid = 0x55;
+        let verifier = be.verifier;
+        be.opens
+            .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
+        be.recover().unwrap();
+        assert_eq!(be.verifier, verifier);
+        assert_eq!(be.opens.get(&FileHandle(vec![1]), false), Some(sid(1)));
+    }
+
+    #[test]
+    fn recovery_with_a_new_client_id_drops_opens() {
+        let xid = w(&[0, 0x66, 4, 0, 0, 0, 0, 0, 0, 0]);
+        let sess = [0xce; 16];
+        let (addr, _) = fake_server(vec![
+            compound(code::OK, &[(OP_EXCHANGE_ID, code::OK, xid)]),
+            create_session_ok(sess, 4),
+            compound(
+                code::OK,
+                &[
+                    sequence_ok(sess),
+                    (OP_RECLAIM_COMPLETE, code::OK, Vec::new()),
+                ],
+            ),
+        ]);
+        let mut be = backend(addr, 1);
+        be.clientid = 0x55;
+        be.opens
+            .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
+        be.recover().unwrap();
+        assert_eq!(be.clientid, 0x66);
+        assert!(be.opens.get(&FileHandle(vec![1]), false).is_none());
+    }
+
+    #[test]
+    fn setup_delay_wait_honors_a_zero_budget() {
+        let (addr, calls) = fake_server(vec![
+            compound(code::DELAY, &[(OP_EXCHANGE_ID, code::DELAY, Vec::new())]),
+            compound(code::DELAY, &[(OP_EXCHANGE_ID, code::DELAY, Vec::new())]),
+        ]);
+        let mut be = with_retry(backend(addr, 1), crate::rpc::RetryPolicy::none());
+        let r = be.establish_41();
+        assert!(
+            matches!(r, Err(Error::Nfs(crate::fs::Status::Jukebox))),
+            "{r:?}"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 }

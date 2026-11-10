@@ -30,6 +30,7 @@ pub const OP_SETATTR: u32 = 34;
 pub const OP_SETCLIENTID: u32 = 35;
 pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 pub const OP_WRITE: u32 = 38;
+pub const OP_BIND_CONN_TO_SESSION: u32 = 41;
 pub const OP_EXCHANGE_ID: u32 = 42;
 pub const OP_CREATE_SESSION: u32 = 43;
 pub const OP_DESTROY_SESSION: u32 = 44;
@@ -140,6 +141,8 @@ pub enum Op {
         cb_program: u32,
     },
     DestroySession([u8; 16]),
+    /// BIND_CONN_TO_SESSION for the fore channel (CDFC4_FORE), no RDMA.
+    BindConnToSession([u8; 16]),
     DestroyClientid(u64),
     ReclaimComplete,
     Setclientid {
@@ -298,6 +301,12 @@ impl Pack for Op {
             }
             Op::DestroySession(id) => {
                 e.put_u32(OP_DESTROY_SESSION).put_opaque_fixed(id);
+            }
+            Op::BindConnToSession(id) => {
+                e.put_u32(OP_BIND_CONN_TO_SESSION)
+                    .put_opaque_fixed(id)
+                    .put_u32(1) // CDFC4_FORE
+                    .put_bool(false); // bctsa_use_conn_in_rdma_mode
             }
             Op::DestroyClientid(id) => {
                 e.put_u32(OP_DESTROY_CLIENTID).put_u64(*id);
@@ -682,6 +691,12 @@ impl Unpack for ResOp {
                 let _highest = d.get_u32()?;
                 let _target = d.get_u32()?;
                 let _flags = d.get_u32()?;
+                Res::Empty
+            }
+            OP_BIND_CONN_TO_SESSION => {
+                let _session = get_session_id(d)?;
+                let _dir = d.get_u32()?;
+                let _rdma = d.get_bool()?;
                 Res::Empty
             }
             OP_SETCLIENTID => {

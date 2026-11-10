@@ -16,7 +16,7 @@ impl Nfs4Backend {
     /// Leaves the backend with a new clientid, session and seqid 1 on slot 0.
     /// NFS4ERR_DELAY and NFS4ERR_GRACE are retried with backoff.
     pub(super) fn establish_41(&mut self) -> Result<()> {
-        let verifier = self.new_verifier();
+        let verifier = self.verifier;
         let owner = self.owner_id.clone();
         let res = self.send_setup(false, |_| {
             vec![Op::ExchangeId {
@@ -63,13 +63,12 @@ impl Nfs4Backend {
         self.create_seq = sequence.wrapping_add(1);
         // The server grants at most `fore.maxrequests` slots; each starts at seqid 1.
         let slots = fore.maxrequests.clamp(1, MAX_SLOTS) as usize;
-        self.session = Some(Session {
+        self.session = Some(Session::new(
             id,
-            slot_seq: vec![1; slots],
-            busy: vec![false; slots],
-            max_req: fore.maxrequestsize.min(CHAN_REQUEST),
-            max_resp: fore.maxresponsesize.min(CHAN_REQUEST),
-        });
+            slots,
+            fore.maxrequestsize.min(CHAN_REQUEST),
+            fore.maxresponsesize.min(CHAN_REQUEST),
+        ));
         Ok(())
     }
 }

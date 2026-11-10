@@ -31,6 +31,10 @@ pub mod code {
     pub const SEQ_MISORDERED: u32 = 10063;
     pub const BAD_HIGH_SLOT: u32 = 10077;
     pub const DEADSESSION: u32 = 10078;
+    pub const CONN_NOT_BOUND_TO_SESSION: u32 = 10055;
+    pub const RETRY_UNCACHED_REP: u32 = 10068;
+    pub const SEQ_FALSE_RETRY: u32 = 10076;
+    pub const CB_PATH_DOWN: u32 = 10048;
 }
 
 /// Share access bits for OPEN.

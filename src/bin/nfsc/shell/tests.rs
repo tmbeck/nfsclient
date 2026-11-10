@@ -378,7 +378,7 @@ fn help_lists_the_commands_and_exit_ends_the_script() {
     assert!(help.contains("help <cmd>"), "{help}");
     let get = ok(&mut s, "help get");
     assert!(
-        get.starts_with("get [-rcknV] remote... [local]\n")
+        get.starts_with("get [-rcknpV] remote... [local]\n")
             && get.contains("-c  resume")
             && get.contains("-V  verify"),
         "{get}"
@@ -400,7 +400,7 @@ fn unknown_commands_and_bad_options_are_reported() {
     assert_eq!(fails(&mut s, "ls -z"), "nfsc: ls: invalid option -- 'z'");
     assert_eq!(
         fails(&mut s, "get"),
-        "nfsc: get: usage: get [-rcknV] remote... [local]"
+        "nfsc: get: usage: get [-rcknpV] remote... [local]"
     );
 }
 
@@ -795,6 +795,10 @@ struct Tripwire {
     /// The byte at this offset of this file comes back flipped in the next
     /// `n` reads that cover it, as if data were damaged on the way.
     corrupt_reads: Option<(FileHandle, u64, usize)>,
+    /// Writes (to any file) at or past this offset fail with an I/O error.
+    fail_writes: Option<u64>,
+    /// The byte at this offset is flipped in the next `n` writes covering it.
+    corrupt_writes: Option<(u64, usize)>,
 }
 
 impl Tripwire {
@@ -806,6 +810,8 @@ impl Tripwire {
             trip_after,
             fail_reads: None,
             corrupt_reads: None,
+            fail_writes: None,
+            corrupt_writes: None,
         }
     }
 
@@ -897,6 +903,22 @@ impl Filesystem for Tripwire {
     }
     fn write(&mut self, fh: &FileHandle, offset: u64, data: &[u8]) -> nfsc::Result<u32> {
         self.tick();
+        if self
+            .fail_writes
+            .is_some_and(|from| offset + data.len() as u64 > from)
+        {
+            return Err(nfsc::Error::Nfs(nfsc::fs::Status::Io));
+        }
+        if let Some((at, left)) = &mut self.corrupt_writes
+            && *left > 0
+            && *at >= offset
+            && *at < offset + data.len() as u64
+        {
+            let mut bad = data.to_vec();
+            bad[(*at - offset) as usize] ^= 0xFF;
+            *left -= 1;
+            return self.fs.borrow_mut().write(fh, offset, &bad);
+        }
         self.fs.borrow_mut().write(fh, offset, data)
     }
     fn create(
@@ -1079,6 +1101,7 @@ fn flags_complete_after_a_dash() {
             pair("-c", "-c"),
             pair("-k", "-k"),
             pair("-n", "-n"),
+            pair("-p", "-p"),
             pair("-r", "-r")
         ]
     );
@@ -1156,13 +1179,14 @@ fn ctrl_c_during_get_removes_the_partial_file() {
 }
 
 #[test]
-fn ctrl_c_during_put_leaves_a_partial_remote_file_that_put_c_completes() {
-    let dir = scratch("ctrl_c_put");
+fn ctrl_c_during_put_removes_the_remote_part_and_put_c_keeps_it() {
+    let dir = scratch("cli3-ctrl_c_put");
     let data = pattern(8192);
     fs::write(dir.join("up.bin"), &data).unwrap();
     let mut inner = MemFs::new();
     inner.clock = NOW;
     inner.max_write = 512;
+    inner.add_file("up.bin", b"old good copy").unwrap();
     let backend = Rc::new(RefCell::new(inner));
     let flag = Arc::new(AtomicBool::new(false));
     let mut s = session_with(
@@ -1174,17 +1198,351 @@ fn ctrl_c_during_put_leaves_a_partial_remote_file_that_put_c_completes() {
     assert_eq!(r.failure.as_deref(), Some("nfsc: put: up.bin: interrupted"));
     assert!(
         r.err
-            .contains("partial (1024 of 8192 bytes); put -c continues it"),
+            .contains("removed partial remote file up.bin.nfsc-part"),
         "{}",
         r.err
     );
-    assert_eq!(backend.borrow().attr_at("up.bin").unwrap().size, 1024);
+    assert!(backend.borrow().attr_at("up.bin.nfsc-part").is_none());
+    assert_eq!(
+        backend.borrow().read_file("up.bin").unwrap(),
+        b"old good copy",
+        "an interrupted put leaves the existing remote file alone"
+    );
+
+    // With -c the part stays for the next put -c.
+    flag.store(false, Ordering::SeqCst);
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), 2)),
+        flag.clone(),
+    );
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put -c up.bin new.bin");
+    assert_eq!(r.failure.as_deref(), Some("nfsc: put: up.bin: interrupted"));
+    assert!(
+        r.err
+            .contains("partial remote file new.bin.nfsc-part kept (up to 1024 of 8192 bytes sent); put -c checks it and continues"),
+        "{}",
+        r.err
+    );
+    let kept = backend.borrow().attr_at("new.bin.nfsc-part").unwrap().size;
+    assert_eq!(kept, 1024);
+    assert!(backend.borrow().attr_at("new.bin").is_none());
 
     flag.store(false, Ordering::SeqCst);
-    let r = run(&mut s, "put -c up.bin");
+    let r = run(&mut s, "put -c up.bin new.bin");
     assert!(r.failure.is_none(), "{:?}", r.failure);
     assert!(r.err.contains("resumed at 1024"), "{}", r.err);
+    assert_eq!(backend.borrow().read_file("new.bin"), Some(data));
+    assert!(backend.borrow().attr_at("new.bin.nfsc-part").is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A session whose WRITEs fail from `offset` on, over `inner`.
+fn failing_put(inner: MemFs, offset: u64) -> (Session, Rc<RefCell<MemFs>>) {
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut wire = Tripwire::new(backend.clone(), flag.clone(), usize::MAX);
+    wire.fail_writes = Some(offset);
+    (session_with(Box::new(wire), flag), backend)
+}
+
+#[test]
+fn a_failed_put_leaves_no_final_file_and_keeps_an_existing_one() {
+    let dir = scratch("cli3-put_fail");
+    let data = pattern(8192);
+    fs::write(dir.join("big.bin"), &data).unwrap();
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.max_write = 512;
+    inner.add_file("old.bin", b"good remote copy").unwrap();
+    let (mut s, backend) = failing_put(inner, 4096);
+    lcd(&mut s, &dir);
+
+    let msg = fails(&mut s, "put big.bin");
+    assert!(msg.starts_with("nfsc: put: big.bin: "), "{msg}");
+    assert!(
+        backend.borrow().attr_at("big.bin").is_none(),
+        "no final name"
+    );
+    assert!(backend.borrow().attr_at("big.bin.nfsc-part").is_none());
+
+    let r = run(&mut s, "put big.bin old.bin");
+    assert!(r.failure.is_some());
+    assert!(
+        r.err
+            .contains("removed partial remote file old.bin.nfsc-part"),
+        "{}",
+        r.err
+    );
+    assert_eq!(
+        backend.borrow().read_file("old.bin").unwrap(),
+        b"good remote copy",
+        "never truncated or replaced"
+    );
+
+    // With -c the part is kept, and the existing file is still untouched.
+    let r = run(&mut s, "put -c big.bin fresh.bin");
+    assert!(r.failure.is_some());
+    assert!(
+        r.err.contains("put -c checks it and continues"),
+        "{}",
+        r.err
+    );
+    assert!(backend.borrow().attr_at("fresh.bin").is_none());
+    assert_eq!(
+        backend
+            .borrow()
+            .attr_at("fresh.bin.nfsc-part")
+            .unwrap()
+            .size,
+        4096
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_replaces_through_a_rename_and_keeps_the_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("cli3-put_rename");
+    fs::write(dir.join("ro.txt"), b"read only").unwrap();
+    fs::set_permissions(dir.join("ro.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+    let backend = Rc::new(RefCell::new(fixture()));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+    ok(&mut s, "put ro.txt b.txt");
+    let b = backend.borrow();
+    assert_eq!(b.read_file("b.txt").unwrap(), b"read only");
+    assert_eq!(b.attr_at("b.txt").unwrap().mode & 0o7777, 0o444);
+    assert!(b.attr_at("b.txt.nfsc-part").is_none());
+    drop(b);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_c_resumes_from_the_remote_part() {
+    let dir = scratch("cli3-put_resume_part");
+    let data = pattern(8192);
+    fs::write(dir.join("up.bin"), &data).unwrap();
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.add_file("up.bin", b"previous version").unwrap();
+    inner.add_file("up.bin.nfsc-part", &data[..3000]).unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put -c up.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 3000"), "{}", r.err);
     assert_eq!(backend.borrow().read_file("up.bin"), Some(data));
+    assert!(backend.borrow().attr_at("up.bin.nfsc-part").is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_c_refuses_a_part_that_differs_from_the_local_file() {
+    let dir = scratch("cli3-put_resume_tail");
+    let data = pattern(8192);
+    fs::write(dir.join("up.bin"), &data).unwrap();
+    let mut tail_differs = data[..3000].to_vec();
+    tail_differs[2990] ^= 1;
+    // A failed pipelined upload: a later chunk landed, an earlier one did not.
+    let mut gap = data[..6000].to_vec();
+    gap[1024..1536].fill(0);
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.add_file("up.bin.nfsc-part", &tail_differs).unwrap();
+    inner.add_file("gap.bin.nfsc-part", &gap).unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend.clone(), flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+
+    let msg = fails(&mut s, "put -c up.bin");
+    assert!(
+        msg.contains("remote file up.bin.nfsc-part differs from") && msg.contains("at offset 2990"),
+        "{msg}"
+    );
+    assert!(msg.contains("put without -c"), "{msg}");
+    assert_eq!(
+        backend.borrow().read_file("up.bin.nfsc-part").unwrap(),
+        tail_differs,
+        "the part is left as it was"
+    );
+    assert!(backend.borrow().attr_at("up.bin").is_none());
+
+    let msg = fails(&mut s, "put -c up.bin gap.bin");
+    assert!(msg.contains("at offset 1024"), "the gap is found: {msg}");
+    assert!(backend.borrow().attr_at("gap.bin").is_none());
+
+    // Without -c the upload starts over and succeeds.
+    ok(&mut s, "put up.bin");
+    assert_eq!(backend.borrow().read_file("up.bin"), Some(data));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn put_verify_detects_data_damaged_on_the_way() {
+    let dir = scratch("cli3-put_verify");
+    let data = pattern(8192);
+    fs::write(dir.join("big.bin"), &data).unwrap();
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.max_write = 512;
+    inner.add_file("big.bin", b"good remote copy").unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let mk = |times| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut wire = Tripwire::new(backend.clone(), flag.clone(), usize::MAX);
+        wire.corrupt_writes = Some((5000, times));
+        session_with(Box::new(wire), flag)
+    };
+
+    let mut s = mk(1);
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put --verify big.bin");
+    let msg = r.failure.expect("the mismatch fails the put");
+    assert!(msg.contains("verification failed"), "{msg}");
+    assert!(
+        r.err.contains("removed big.bin.nfsc-part from the server"),
+        "{}",
+        r.err
+    );
+    assert!(backend.borrow().attr_at("big.bin.nfsc-part").is_none());
+    assert_eq!(
+        backend.borrow().read_file("big.bin").unwrap(),
+        b"good remote copy",
+        "damaged data never replaces the remote file"
+    );
+
+    // Undamaged: verified and in place.
+    let mut s = mk(0);
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "put -V big.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(
+        r.err
+            .contains(&format!("verified sha256 {}", sha256_hex(&data))),
+        "{}",
+        r.err
+    );
+    assert_eq!(backend.borrow().read_file("big.bin"), Some(data.clone()));
+
+    // Without -V the same damage goes unnoticed.
+    let mut s = mk(1);
+    lcd(&mut s, &dir);
+    ok(&mut s, "put big.bin");
+    assert_ne!(backend.borrow().read_file("big.bin"), Some(data));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_applies_the_umask_unless_p() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("cli3-umask");
+    let mut fs_ = fixture();
+    let root = fs_.root();
+    for (name, mode) in [(&b"b.txt"[..], 0o666), (&b"a"[..], 0o777)] {
+        let (fh, _) = fs_.lookup(&root, name).unwrap();
+        fs_.setattr(
+            &fh,
+            &SetAttr {
+                mode: Some(mode),
+                ..SetAttr::default()
+            },
+        )
+        .unwrap();
+    }
+    let mut s = session(fs_);
+    s.umask = 0o027;
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+    lcd(&mut s, &dir);
+    ok(&mut s, "get b.txt");
+    assert_eq!(mode(&dir.join("b.txt")), 0o640);
+    ok(&mut s, "get -r a");
+    assert_eq!(mode(&dir.join("a")), 0o750);
+
+    let keep = dir.join("keep");
+    fs::create_dir(&keep).unwrap();
+    lcd(&mut s, &keep);
+    ok(&mut s, "get -p b.txt");
+    assert_eq!(mode(&keep.join("b.txt")), 0o666);
+    ok(&mut s, "get --preserve -r a");
+    assert_eq!(mode(&keep.join("a")), 0o777);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_c_does_not_resume_an_older_local_file_in_place() {
+    let dir = scratch("cli3-get_old_inplace");
+    let data = pattern(8192);
+    let mut backend = MemFs::new();
+    backend.clock = NOW;
+    backend.add_file("big.bin", &data).unwrap();
+    let mut s = session(backend);
+    lcd(&mut s, &dir);
+    // An older complete copy whose start matches: the tail check passes,
+    // but the file predates the remote one.
+    let local = dir.join("big.bin");
+    fs::write(&local, &data[..3000]).unwrap();
+    File::options()
+        .write(true)
+        .open(&local)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(NOW as u64 - 3600))
+        .unwrap();
+    let msg = fails(&mut s, "get -c big.bin");
+    assert!(msg.contains("older than the remote file"), "{msg}");
+    assert_eq!(fs::read(&local).unwrap(), &data[..3000], "left alone");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_c_refuses_when_only_zeros_could_be_compared() {
+    const MIB: u64 = 1 << 20;
+    let dir = scratch("cli3-get_zero_tail");
+    let mut backend = MemFs::new();
+    backend.clock = NOW;
+    backend.add_sparse_file("disk.img", 80 * MIB, 0).unwrap();
+    backend.add_sparse_file("small.img", 3 * MIB, 0).unwrap();
+    let mut s = session(backend);
+    lcd(&mut s, &dir);
+    File::create(dir.join("disk.img.nfsc-part"))
+        .unwrap()
+        .set_len(70 * MIB)
+        .unwrap();
+    let msg = fails(&mut s, "get -c disk.img");
+    assert!(msg.contains("are all zeros"), "{msg}");
+    assert!(msg.contains("get -cV"), "{msg}");
+    assert_eq!(
+        fs::metadata(dir.join("disk.img.nfsc-part")).unwrap().len(),
+        70 * MIB
+    );
+    // -V checks the whole file afterwards, so it may resume.
+    let r = run(&mut s, "get -cV disk.img");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at"), "{}", r.err);
+    assert_eq!(fs::metadata(dir.join("disk.img")).unwrap().len(), 80 * MIB);
+
+    // A zero prefix short enough to compare in full is proof enough.
+    File::create(dir.join("small.img.nfsc-part"))
+        .unwrap()
+        .set_len(2 * MIB)
+        .unwrap();
+    let r = run(&mut s, "get -c small.img");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 2097152"), "{}", r.err);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1418,8 +1776,9 @@ fn get_strips_setuid_setgid_and_sticky_from_server_modes() {
     )
     .unwrap();
     let mut s = session(fs_);
+    s.umask = 0o022;
     lcd(&mut s, &dir);
-    ok(&mut s, "get b.txt");
+    ok(&mut s, "get -p b.txt");
     let mode = fs::metadata(dir.join("b.txt"))
         .unwrap()
         .permissions()
@@ -1429,7 +1788,7 @@ fn get_strips_setuid_setgid_and_sticky_from_server_modes() {
         0,
         "special bits from the server reached the local file"
     );
-    assert_eq!(mode & 0o777, 0o777);
+    assert_eq!(mode & 0o777, 0o777, "-p keeps the server's bits");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1586,7 +1945,11 @@ fn get_r_stops_at_the_first_error_without_keep_going() {
     let mut s = failing_tree();
     lcd(&mut s, &dir);
     let r = run(&mut s, "get -r t");
-    assert!(r.failure.is_some());
+    let msg = r.failure.expect("the tree fails");
+    assert!(
+        msg.starts_with("nfsc: get: t: ") && msg.contains("t/b.bin: "),
+        "the failure names the file: {msg}"
+    );
     assert!(dir.join("t/a.bin").exists());
     assert!(!dir.join("t/b.bin").exists());
     assert!(!dir.join("t/c.bin").exists(), "stopped at b.bin");

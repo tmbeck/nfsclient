@@ -468,6 +468,13 @@ impl Filesystem for Nfs2 {
     }
 }
 
+/// Compile-time check: the backend can move between threads (see
+/// [`crate::fs::Connected::fs`]).
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<Nfs2>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
