@@ -59,45 +59,94 @@ pub fn parse_owner(spec: &str) -> std::result::Result<(Option<u32>, Option<u32>)
     Ok((uid, gid))
 }
 
-pub fn write_help(out: &mut dyn Write) -> std::io::Result<()> {
-    out.write_all(HELP.as_bytes())
+/// Command summary shared by `nfsc shell --help` and the in-shell `help`.
+const SUMMARY: &str = shell_summary!();
+
+/// Per-command details for `help CMD`.
+const DETAILS: &[(&[&str], &str)] = &[
+    (
+        &["ls", "dir"],
+        "ls [-l] [path]\n  List a directory or show a file. -l: long format with mode, owner, size,\n  mtime and link targets. * and ? match in the last path component.",
+    ),
+    (
+        &["cd"],
+        "cd [path]\n  Change the remote directory; no argument returns to the export root.\n  Symbolic links are followed; .. never leaves the export root.",
+    ),
+    (&["pwd"], "pwd\n  Print the remote working directory."),
+    (
+        &["lcd"],
+        "lcd [path]\n  Change the local directory used by get and put (no argument: $HOME).",
+    ),
+    (
+        &["stat"],
+        "stat path...\n  Show all attributes. Symbolic links are shown, not followed.",
+    ),
+    (&["cat"], "cat path\n  Write a remote file to stdout."),
+    (
+        &["get"],
+        "get [-r] [-c] remote [local]\n  Download. local defaults to the local directory; - writes to stdout.\n  -r  download a directory tree (symlinks and special files are skipped)\n  -c  resume a partial local file from its current size\n  Keeps the remote mtime and mode (without setuid/setgid/sticky). Ctrl-C\n  removes a partial download unless -c is given.",
+    ),
+    (
+        &["put"],
+        "put [-r] [-c] local [remote]\n  Upload. remote defaults to the local file name in the remote directory.\n  -r  upload a directory tree\n  -c  resume a partial remote file from its current size\n  Ctrl-C leaves the partial remote file; put -c continues it.",
+    ),
+    (
+        &["mkdir"],
+        "mkdir path...\n  Create directories (mode 755).",
+    ),
+    (
+        &["rm"],
+        "rm path...\n  Remove files and symbolic links (not directories; see rmdir).",
+    ),
+    (&["rmdir"], "rmdir path...\n  Remove empty directories."),
+    (
+        &["mv"],
+        "mv src dst\n  Rename or move; into dst if dst is a directory.",
+    ),
+    (
+        &["ln"],
+        "ln [-s] target name\n  Hard link, or symbolic link with -s (target is stored as given).",
+    ),
+    (
+        &["chmod"],
+        "chmod mode path...\n  Change permissions; mode is octal (e.g. 644).",
+    ),
+    (
+        &["chown"],
+        "chown uid[:gid] path...\n  Change owner and group (numeric ids).",
+    ),
+    (
+        &["df"],
+        "df [path]\n  Show size, used and available space of the file system.",
+    ),
+    (
+        &["help"],
+        "help [cmd]\n  Command summary, or details for one command.",
+    ),
+    (
+        &["exit", "quit"],
+        "exit | quit\n  Leave the shell (Ctrl-D also works).",
+    ),
+];
+
+/// `help` and `help CMD`.
+pub fn write_help(args: &[String], out: &mut dyn Write) -> std::result::Result<(), String> {
+    let text = match args {
+        [] => format!(
+            "{SUMMARY}\nQuote names with spaces; ';' separates commands. Ctrl-C stops a transfer.\n\
+             Details: help <cmd>\n"
+        ),
+        [cmd] => match DETAILS
+            .iter()
+            .find(|(names, _)| names.contains(&cmd.as_str()))
+        {
+            Some((_, d)) => format!("{d}\n"),
+            None => return Err(format!("no such command: {cmd} (try help)")),
+        },
+        _ => return Err("usage: help [cmd]".to_string()),
+    };
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())
 }
-
-const HELP: &str = "\
-Paths: a leading / is the export root; others are relative to the remote
-working directory. Quote a name with spaces in \"double\" or 'single' quotes,
-or escape one character with a backslash. Separate commands on one line with
-';'. Tab completes command names, remote and local paths, and flags.
-
-  ls [-l] [path]            list a directory, or show a file (* and ? match names)
-  dir [-l] [path]           same as ls
-  cd [path]                 change the remote directory (no argument: export root)
-  pwd                       print the remote working directory
-  lcd [path]                change the local directory (no argument: $HOME)
-  stat path...              show attributes; symbolic links are shown, not followed
-  get [-r] [-c] remote [local]
-                            download; local defaults to the local directory, - is
-                            stdout. -r downloads a directory tree. -c resumes a
-                            partial local file from its current size
-  put [-r] [-c] local [remote]
-                            upload. -r uploads a directory tree. -c resumes a
-                            partial remote file from its current size
-  cat path                  write a file to stdout
-  mkdir path...             create directories
-  rm path...                remove files and symbolic links (not directories)
-  rmdir path...             remove empty directories
-  mv src dst                rename or move (into dst if dst is a directory)
-  ln [-s] target name       hard link, or symbolic link with -s
-  chmod mode path...        change permissions (octal, e.g. 644)
-  chown uid[:gid] path...   change owner and group (numeric ids)
-  df [path]                 show space on the file system
-  help                      show this text
-  exit, quit                leave the shell
-
-Ctrl-C stops a transfer and returns to the prompt. An interrupted download
-is removed unless -c is used; an interrupted upload stays on the server as a
-partial file, which put -c continues. Ctrl-D leaves the shell.
-";
 
 impl Session {
     pub(super) fn cmd_ls(&mut self, args: &[String], out: &mut dyn Write) -> CmdResult<()> {

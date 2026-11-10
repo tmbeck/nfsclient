@@ -36,8 +36,24 @@ fn shell_help_documents_the_version_and_port_flags() {
     let out = nfsc(&["shell", "--help"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("--nfs-version"), "{text}");
-    assert!(text.contains("--nfs-port"), "global flag shown: {text}");
-    assert!(text.contains("--mount-port"), "global flag shown: {text}");
+    assert!(
+        text.contains("get [-r] [-c]"),
+        "shell commands listed: {text}"
+    );
+    assert!(
+        text.contains("nfsc --help"),
+        "breadcrumb to global options: {text}"
+    );
+    let top = String::from_utf8_lossy(&nfsc(&["--help"]).stdout).into_owned();
+    assert!(
+        top.contains("--nfs-port") && top.contains("--mount-port"),
+        "{top}"
+    );
+    assert!(
+        top.len() < 1500,
+        "top-level help stays short: {} bytes",
+        top.len()
+    );
 }
 
 #[test]

@@ -20,18 +20,19 @@ const MAX_GIDS: usize = 16;
 #[command(
     name = "nfsc",
     version,
-    about = "Userspace NFS client: browse and transfer files without mounting",
+    about = "Userspace NFS client (v2/v3/v4.x): browse and transfer files without mounting",
+    disable_help_subcommand = true,
     after_help = "\
-Examples:
-  nfsc shell nas:/srv/backups                       open an interactive shell
-  nfsc shell nfs://nas/srv/backups -c 'get -c vm.img ./vm.img'
-  nfsc exports nas                                  list exports (showmount -e)
-  nfsc rpcinfo nas                                  list portmapper services (rpcinfo -p)
+Global options (before or after the command):
+  --uid N, --gid N, --gids N,..  AUTH_SYS identity [current user]
+  --port-mode auto|priv|unpriv   source port [auto]; 'secure' exports need a port
+                                 <1024: run as root or setcap cap_net_bind_service
+  --proto tcp|udp                transport [tcp]; NFSv4 is TCP only
+  --timeout SECS                 per-reply timeout [10]
+  --nfs-port P, --mount-port P   skip portmap lookups
 
-Exit status: 0 success; 1 a command failed; 2 bad command line;
-130 interrupted with Ctrl-C.
-
-Run 'nfsc <command> --help' for the options of each command."
+Exit status: 0 ok, 1 command failed, 2 usage error, 130 Ctrl-C.
+More: nfsc <command> --help"
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -43,21 +44,28 @@ pub struct Cli {
 #[derive(Args, Debug, Clone)]
 pub struct Globals {
     /// AUTH_SYS uid (default: the current user)
-    #[arg(long, global = true, value_name = "UID")]
+    #[arg(long, global = true, hide = true, value_name = "UID")]
     pub uid: Option<u32>,
 
     /// AUTH_SYS gid (default: the current user's primary group)
-    #[arg(long, global = true, value_name = "GID")]
+    #[arg(long, global = true, hide = true, value_name = "GID")]
     pub gid: Option<u32>,
 
     /// AUTH_SYS supplementary gids, comma separated (default: the current user's groups)
-    #[arg(long, global = true, value_name = "GID,...", value_delimiter = ',')]
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        value_name = "GID,...",
+        value_delimiter = ','
+    )]
     pub gids: Option<Vec<u32>>,
 
     /// Source port selection: auto (reserved, falling back to ephemeral), priv, unpriv
     #[arg(
         long,
         global = true,
+        hide = true,
         value_enum,
         value_name = "MODE",
         default_value = "auto"
@@ -68,6 +76,7 @@ pub struct Globals {
     #[arg(
         long,
         global = true,
+        hide = true,
         value_enum,
         value_name = "PROTO",
         default_value = "tcp"
@@ -75,59 +84,48 @@ pub struct Globals {
     pub proto: ProtoArg,
 
     /// Seconds to wait for each reply (UDP: across all retransmits)
-    #[arg(long, global = true, value_name = "SECS", default_value = "10", value_parser = parse_timeout)]
+    #[arg(long, global = true, hide = true, value_name = "SECS", default_value = "10", value_parser = parse_timeout)]
     pub timeout: Duration,
 
     /// NFS server port; skips portmap for NFS (a port in an nfs:// target wins if equal)
-    #[arg(long, global = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, global = true, hide = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub nfs_port: Option<u16>,
 
     /// MOUNT server port; skips portmap for MOUNT (used by `exports` and `shell`)
-    #[arg(long, global = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, global = true, hide = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub mount_port: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Interactive shell on a path below an export, or run -c commands and exit
-    #[command(after_long_help = "\
-Interactive use: Tab completes command names, remote and local paths, and
-flags. Ctrl-C stops a running transfer (a partial download is removed unless
--c is given) and returns to the prompt; at the prompt it clears the line.
-Ctrl-D leaves the shell. Type 'help' at the prompt for the command list.
-
-Scripted use: -c, or commands piped on stdin, stop at the first failure.
-
-Exit status: 0 success, or 'exit' / 'quit'; 1 a command failed; 130 Ctrl-C.
-
-Examples:
-  nfsc shell nas:/srv/backups
-  nfsc shell nfs://nas/srv/backups -c 'get -c vm.img ./vm.img; ls -l'
-  nfsc shell nas:/srv/iso -v 4.1 -c 'ls'")]
+    /// Open a shell on host:/path, or run commands with -c and exit
+    #[command(after_help = crate::shell::CLI_HELP)]
     Shell(ShellArgs),
-    /// List the exports of a server (MOUNT EXPORT, like showmount -e)
+    /// List a server's exports (like showmount -e)
+    #[command(after_help = "Global options: nfsc --help")]
     Exports(HostArgs),
-    /// List the RPC services registered with the portmapper (rpcinfo -p)
+    /// List RPC services registered with portmap (like rpcinfo -p)
+    #[command(after_help = "Global options: nfsc --help")]
     Rpcinfo(HostArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct ShellArgs {
-    /// nfs://host[:port]/path or host:/path (the full server path, e.g. /srv/data/x)
+    /// host:/path or nfs://host[:port]/path (full server path)
     pub target: String,
 
-    /// Run these commands separated by ';' and exit. Stops at the first failure
-    /// (status 1), or at Ctrl-C (status 130). 'exit' or 'quit' ends early with status 0.
+    /// Run ';'-separated commands and exit; stops at the first failure
     #[arg(short = 'c', long = "command", value_name = "CMDS")]
     pub command: Option<String>,
 
-    /// NFS protocol version to use
+    /// 2|3|4|4.0|4.1|4.2|auto (4: highest v4 minor; auto: 4.2 down to 2)
     #[arg(
         short = 'v',
         long = "nfs-version",
         value_enum,
         value_name = "VERS",
-        default_value = "auto"
+        default_value = "auto",
+        hide_possible_values = true
     )]
     pub nfs_version: NfsVersionArg,
 }
@@ -157,7 +155,6 @@ pub enum NfsVersionArg {
     V2,
     #[value(name = "3")]
     V3,
-    /// Any NFSv4 minor version, highest first
     #[value(name = "4")]
     V4,
     #[value(name = "4.0")]

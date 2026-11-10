@@ -374,7 +374,15 @@ fn df_reports_space_in_human_units() {
 fn help_lists_the_commands_and_exit_ends_the_script() {
     let mut s = session(fixture());
     let help = ok(&mut s, "help");
-    assert!(help.contains("ls [-l] [path]") && help.contains("chown uid[:gid] path..."));
+    assert!(help.contains("ls [-l] [path]") && help.contains("chown uid[:gid] path.."));
+    assert!(help.contains("help <cmd>"), "{help}");
+    let get = ok(&mut s, "help get");
+    assert!(
+        get.starts_with("get [-r] [-c] remote [local]\n") && get.contains("-c  resume"),
+        "{get}"
+    );
+    assert_eq!(ok(&mut s, "help quit"), ok(&mut s, "help exit"));
+    assert!(run(&mut s, "help frob").failure.is_some());
     let r = run(&mut s, "pwd; exit; cd a");
     assert!(r.failure.is_none());
     assert_eq!(r.out, "/export\n", "commands after exit do not run");

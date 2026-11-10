@@ -10,6 +10,31 @@
 //!   or `quit` ends early with status 0. Unknown command names in `-c` are
 //!   rejected before connecting. Ctrl-C stops the run with status 130.
 
+/// The shell command summary, as a literal so it can be `concat!`ed into
+/// `nfsc shell --help` and printed by the in-shell `help`.
+macro_rules! shell_summary {
+    () => {
+        "  ls [-l] [path]               list (alias dir); * ? match in the last component
+  cd [path] | pwd | lcd [path] remote cwd (/ is the export root) | local cwd
+  stat path.. | cat path       attributes | file to stdout
+  get [-r] [-c] remote [local] download (-r tree, -c resume, local - is stdout)
+  put [-r] [-c] local [remote] upload (-r tree, -c resume)
+  mkdir rm rmdir mv ln [-s]    change the tree (rm: files only)
+  chmod mode path.. | chown uid[:gid] path.. | df [path]
+  help [cmd] | exit"
+    };
+}
+
+/// Text after the options in `nfsc shell --help`.
+pub const CLI_HELP: &str = concat!(
+    "Commands (interactive, or ';'-separated in -c):\n",
+    shell_summary!(),
+    "\n\nInteractive: Tab completes; Ctrl-C stops a transfer; Ctrl-D exits.\n\
+     Exit status: 0 ok, 1 command failed, 130 Ctrl-C.\n\
+     Example: nfsc shell nas:/srv -c 'cd vm; get -c disk.img'\n\
+     More: 'help <cmd>' in the shell; global options: nfsc --help"
+);
+
 mod complete;
 mod format;
 mod interrupt;

@@ -461,7 +461,9 @@ impl Session {
             "chmod" => self.cmd_chmod(args)?,
             "chown" => self.cmd_chown(args)?,
             "df" => self.cmd_df(args, out)?,
-            "help" => super::ops::write_help(out).map_err(|e| io_fail("help", e))?,
+            "help" => {
+                super::ops::write_help(args, out).map_err(|m| CmdFailure::new("help", None, m))?
+            }
             "exit" | "quit" => return Ok(Flow::Exit),
             other => {
                 return Err(CmdFailure::new(other, None, "unknown command (try help)"));
