@@ -14,11 +14,16 @@ pub mod code {
     pub const DELAY: u32 = 10008;
     pub const EXPIRED: u32 = 10011;
     pub const GRACE: u32 = 10013;
+    pub const RESOURCE: u32 = 10018;
+    pub const MOVED: u32 = 10019;
+    pub const NOFILEHANDLE: u32 = 10020;
     pub const MINOR_VERS_MISMATCH: u32 = 10021;
     pub const STALE_CLIENTID: u32 = 10022;
     pub const STALE_STATEID: u32 = 10023;
     pub const OLD_STATEID: u32 = 10024;
     pub const BAD_STATEID: u32 = 10025;
+    pub const BAD_SEQID: u32 = 10026;
+    pub const BADXDR: u32 = 10036;
     pub const ADMIN_REVOKED: u32 = 10047;
     pub const BADSESSION: u32 = 10052;
     pub const BADSLOT: u32 = 10053;
@@ -359,6 +364,20 @@ pub const ANON_STATEID: StateId = StateId {
     seqid: 0,
     other: [0; 12],
 };
+
+/// The READ-bypass stateid (all ones).
+pub const BYPASS_STATEID: StateId = StateId {
+    seqid: u32::MAX,
+    other: [0xff; 12],
+};
+
+impl StateId {
+    /// Whether this is one of the special stateids (anonymous or READ bypass),
+    /// which carry no client state.
+    pub fn is_special(&self) -> bool {
+        *self == ANON_STATEID || *self == BYPASS_STATEID
+    }
+}
 
 impl Pack for StateId {
     fn pack(&self, e: &mut Encoder) {

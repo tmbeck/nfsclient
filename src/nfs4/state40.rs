@@ -19,8 +19,9 @@ use super::types::{
     code,
 };
 
-/// Open-owner string sent with every OPEN. One owner per client ID.
-const OPEN_OWNER: &[u8] = b"nfsc-open-owner";
+/// Initial open-owner string sent with every OPEN. One owner per client ID,
+/// replaced with a suffixed variant after NFS4ERR_BAD_SEQID.
+pub(super) const OPEN_OWNER: &[u8] = b"nfsc-open-owner";
 const OPEN_CACHE_CAP: usize = 16;
 
 struct Entry {
@@ -116,7 +117,7 @@ pub(super) fn open_args(
         seqid: s.open_seqid,
         share_access,
         clientid: s.clientid,
-        owner: OPEN_OWNER.to_vec(),
+        owner: s.open_owner.clone(),
         how,
         claim,
     }
@@ -134,33 +135,32 @@ fn open_body(res: &[ResOp], i: usize) -> Result<(StateId, u32, Option<StateId>)>
 }
 
 impl Nfs4Backend {
-    /// SETCLIENTID then SETCLIENTID_CONFIRM (NFSv4.0).
+    /// SETCLIENTID then SETCLIENTID_CONFIRM (NFSv4.0). NFS4ERR_DELAY and
+    /// NFS4ERR_GRACE are retried with backoff.
     pub(super) fn establish_40(&mut self) -> Result<()> {
         let verifier = self.new_verifier();
         let id = self.owner_id.clone();
-        let res = self.send(
+        let res = self.send_setup(false, |_| {
             vec![Op::Setclientid {
                 verifier,
-                id,
+                id: id.clone(),
                 cb_program: CB_PROGRAM,
                 // Callbacks are never served; the server records an address it will fail to reach.
                 cb_addr: "0.0.0.0.0.0".into(),
                 cb_ident: 1,
-            }],
-            false,
-        )?;
+            }]
+        })?;
         let res = self.check(res)?;
         let (clientid, confirm) = match body(&res, 0)? {
             Res::Setclientid { clientid, verifier } => (*clientid, *verifier),
             _ => return Err(Error::Xdr("expected SETCLIENTID result".into())),
         };
-        let res = self.send(
+        let res = self.send_setup(false, |_| {
             vec![Op::SetclientidConfirm {
                 clientid,
                 verifier: confirm,
-            }],
-            false,
-        )?;
+            }]
+        })?;
         self.check(res)?;
         self.clientid = clientid;
         self.open_seqid = 0;
@@ -194,6 +194,14 @@ impl Nfs4Backend {
         }
     }
 
+    /// OPEN_CONFIRM if needed; if that fails, CLOSE the unconfirmed open
+    /// (best effort) so it is not left behind, and return the error.
+    fn confirm_or_close(&mut self, fh: &FileHandle, sid: StateId, rflags: u32) -> Result<StateId> {
+        self.maybe_confirm(fh, sid, rflags).inspect_err(|_| {
+            self.close_stateid(fh, sid);
+        })
+    }
+
     /// Finish an OPEN that created the file: confirm, release any delegation,
     /// and cache the stateid.
     pub(super) fn finish_open(
@@ -205,7 +213,7 @@ impl Nfs4Backend {
         access: u32,
     ) -> Result<()> {
         self.return_delegation(fh, deleg);
-        let sid = self.maybe_confirm(fh, sid, rflags)?;
+        let sid = self.confirm_or_close(fh, sid, rflags)?;
         self.cache_open(fh, sid, access);
         Ok(())
     }
@@ -258,7 +266,7 @@ impl Nfs4Backend {
                 ));
             }
             self.return_delegation(fh, deleg);
-            self.maybe_confirm(fh, sid, rflags)
+            self.confirm_or_close(fh, sid, rflags)
         }
     }
 

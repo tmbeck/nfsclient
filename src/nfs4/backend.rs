@@ -38,8 +38,9 @@ pub(super) const CHAN_REQUEST: u32 = MAX_IO + 8192;
 pub(super) const MAX_SLOTS: u32 = 16;
 /// Callback program number we advertise; no callbacks are ever served.
 pub(super) const CB_PROGRAM: u32 = 0x4000_0000;
-/// How long to keep retrying NFS4ERR_GRACE.
-const GRACE_WAIT: Duration = Duration::from_secs(30);
+/// Bounds on how long to keep retrying NFS4ERR_GRACE / NFS4ERR_DELAY; see [`grace_wait`].
+const GRACE_WAIT_MIN: Duration = Duration::from_secs(30);
+const GRACE_WAIT_MAX: Duration = Duration::from_secs(300);
 /// Lease used until the server reports lease_time.
 const DEFAULT_LEASE: Duration = Duration::from_secs(90);
 /// Cap on remembered (parent, name) pairs used to open files by name in NFSv4.0.
@@ -63,6 +64,8 @@ pub(super) struct Pending {
     xid: u32,
     /// Session slot the request was sequenced on (NFSv4.1+).
     slot: Option<usize>,
+    /// NFSv4.0: whether a successful reply renews the lease.
+    renews: bool,
 }
 
 pub(crate) struct Nfs4Backend {
@@ -75,6 +78,10 @@ pub(crate) struct Nfs4Backend {
     pub(super) session: Option<Session>,
     /// Next open-owner seqid (NFSv4.0 OPEN / OPEN_CONFIRM / CLOSE).
     pub(super) open_seqid: u32,
+    /// Open-owner string sent with every OPEN. Replaced after NFS4ERR_BAD_SEQID.
+    pub(super) open_owner: Vec<u8>,
+    /// csa_sequence for the next CREATE_SESSION on `clientid` (NFSv4.1+).
+    pub(super) create_seq: u32,
     pub(super) opens: super::state40::OpenCache,
     /// Last known (parent directory, name) for each handle, for NFSv4.0 CLAIM_NULL opens.
     pub(super) names: HashMap<FileHandle, (FileHandle, Vec<u8>)>,
@@ -127,25 +134,7 @@ pub(crate) fn connect(
 ) -> Result<Connected> {
     let addr = SocketAddr::new(host, opts.nfs_port.unwrap_or(DEFAULT_PORT));
     let rpc = RpcClient::connect(addr, PROGRAM, VERSION, &opts.rpc).map_err(map_connect_err)?;
-    let mut be = Nfs4Backend {
-        addr,
-        opts: opts.rpc.clone(),
-        rpc,
-        minor: 0,
-        root: FileHandle::default(),
-        clientid: 0,
-        session: None,
-        open_seqid: 0,
-        opens: super::state40::OpenCache::default(),
-        names: HashMap::new(),
-        lease: DEFAULT_LEASE,
-        last_activity: Instant::now(),
-        max_read: MAX_IO,
-        max_write: MAX_IO,
-        readdir_max: 32 * 1024,
-        owner_id: format!("nfsc {} {} {:x}", hostname(), std::process::id(), rand64()).into_bytes(),
-        disconnected: false,
-    };
+    let mut be = Nfs4Backend::new(addr, opts.rpc.clone(), rpc);
     let minors: Vec<u32> = match minor {
         Some(m) => vec![m],
         None => vec![2, 1, 0],
@@ -177,7 +166,79 @@ pub(crate) fn connect(
     })
 }
 
+/// How long to keep retrying NFS4ERR_GRACE (and NFS4ERR_DELAY during client
+/// setup). Linux sets the grace period to the lease time, so wait about two
+/// leases, within fixed bounds.
+pub(super) fn grace_wait(lease: Duration) -> Duration {
+    (lease * 2).clamp(GRACE_WAIT_MIN, GRACE_WAIT_MAX)
+}
+
+/// Exponential backoff for the `n`th (1-based) NFS4ERR_DELAY retry:
+/// 100 ms, doubling up to 1.6 s.
+pub(super) fn backoff(n: u32) -> Duration {
+    Duration::from_millis(50u64 << n.clamp(1, 5))
+}
+
+/// Whether an open-owner seqid-mutating operation (OPEN, OPEN_CONFIRM, CLOSE)
+/// that returned `status` advanced the owner's seqid. RFC 7530 §9.1.7: the
+/// seqid is not incremented for these errors.
+pub(super) fn seqid_advances(status: u32) -> bool {
+    !matches!(
+        status,
+        code::STALE_CLIENTID
+            | code::STALE_STATEID
+            | code::BAD_STATEID
+            | code::BAD_SEQID
+            | code::BADXDR
+            | code::RESOURCE
+            | code::NOFILEHANDLE
+            | code::MOVED
+    )
+}
+
+/// Whether an NFSv4.0 COMPOUND renews the client's lease when it succeeds:
+/// RENEW and SETCLIENTID_CONFIRM, or an operation carrying the clientid or a
+/// non-special stateid. Plain GETATTR / LOOKUP / READDIR do not.
+pub(super) fn renews_lease_40(ops: &[Op]) -> bool {
+    ops.iter().any(|op| match op {
+        Op::Renew(_) | Op::SetclientidConfirm { .. } | Op::Open(_) => true,
+        Op::OpenConfirm { stateid, .. }
+        | Op::Close { stateid, .. }
+        | Op::Read { stateid, .. }
+        | Op::Write { stateid, .. }
+        | Op::Setattr { stateid, .. }
+        | Op::DelegReturn(stateid) => !stateid.is_special(),
+        _ => false,
+    })
+}
+
 impl Nfs4Backend {
+    /// A backend on an open RPC connection, with no client state yet.
+    pub(super) fn new(addr: SocketAddr, opts: RpcOptions, rpc: RpcClient) -> Self {
+        Nfs4Backend {
+            addr,
+            opts,
+            rpc,
+            minor: 0,
+            root: FileHandle::default(),
+            clientid: 0,
+            session: None,
+            open_seqid: 0,
+            open_owner: super::state40::OPEN_OWNER.to_vec(),
+            create_seq: 0,
+            opens: super::state40::OpenCache::default(),
+            names: HashMap::new(),
+            lease: DEFAULT_LEASE,
+            last_activity: Instant::now(),
+            max_read: MAX_IO,
+            max_write: MAX_IO,
+            readdir_max: 32 * 1024,
+            owner_id: format!("nfsc {} {} {:x}", hostname(), std::process::id(), rand64())
+                .into_bytes(),
+            disconnected: false,
+        }
+    }
+
     pub(super) fn status_err(&self, st: u32) -> Error {
         Error::Nfs(crate::fs::Status::from_v4(st, self.minor))
     }
@@ -198,9 +259,13 @@ impl Nfs4Backend {
     /// Send one COMPOUND. When `sequenced` and the minor version is 4.1+, a
     /// SEQUENCE is prepended and its result stripped from the returned results.
     /// Bumps the session slot seqid after a successful SEQUENCE and the open
-    /// owner seqid for each OPEN / OPEN_CONFIRM / CLOSE that was executed.
+    /// owner seqid for each OPEN / OPEN_CONFIRM / CLOSE that was executed and
+    /// did not fail with a non-advancing error ([`seqid_advances`]). Records
+    /// lease renewal: a successful SEQUENCE (4.1+), or a successful compound
+    /// that renews the lease (4.0, [`renews_lease_40`]).
     pub(super) fn send(&mut self, ops: Vec<Op>, sequenced: bool) -> Result<CompoundRes> {
         let use_seq = sequenced && self.minor >= 1;
+        let renews = self.minor == 0 && renews_lease_40(&ops);
         let mut all = Vec::with_capacity(ops.len() + 1);
         let mut slot = None;
         if use_seq {
@@ -227,7 +292,9 @@ impl Nfs4Backend {
             ops: all,
         };
         let res: CompoundRes = self.rpc.call(PROC_COMPOUND, &args)?;
-        self.last_activity = Instant::now();
+        if renews && res.status == code::OK {
+            self.last_activity = Instant::now();
+        }
         let mut results = res.results;
         if let Some(free) = slot {
             let seq_ok = matches!(results.first(), Some(r) if r.status == code::OK);
@@ -236,10 +303,12 @@ impl Nfs4Backend {
             }
             if let Some(s) = self.session.as_mut().filter(|_| seq_ok) {
                 s.slot_seq[free] = next_seqid(s.slot_seq[free]);
+                self.last_activity = Instant::now();
             }
         }
         for r in &results {
-            if matches!(r.opcode, OP_OPEN | OP_CLOSE | OP_OPEN_CONFIRM) {
+            if matches!(r.opcode, OP_OPEN | OP_CLOSE | OP_OPEN_CONFIRM) && seqid_advances(r.status)
+            {
                 self.open_seqid = self.open_seqid.wrapping_add(1);
             }
         }
@@ -253,6 +322,7 @@ impl Nfs4Backend {
     /// the SEQUENCE is sent on a free session slot, which stays busy until
     /// [`Nfs4Backend::complete_compound`] reads the reply.
     pub(super) fn issue_compound(&mut self, ops: Vec<Op>) -> Result<Pending> {
+        let renews = self.minor == 0 && renews_lease_40(&ops);
         let mut all = Vec::with_capacity(ops.len() + 1);
         let mut slot = None;
         if self.minor >= 1 {
@@ -282,8 +352,7 @@ impl Nfs4Backend {
         if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
             s.busy[i] = true;
         }
-        self.last_activity = Instant::now();
-        Ok(Pending { xid, slot })
+        Ok(Pending { xid, slot, renews })
     }
 
     /// Read the reply to a pipelined COMPOUND, free its slot, advance the slot's
@@ -295,7 +364,9 @@ impl Nfs4Backend {
             s.busy[i] = false;
         }
         let res = reply?;
-        self.last_activity = Instant::now();
+        if p.renews && res.status == code::OK {
+            self.last_activity = Instant::now();
+        }
         let mut results = res.results;
         if let Some(i) = p.slot {
             let seq_ok = matches!(results.first(), Some(r) if r.status == code::OK);
@@ -304,6 +375,7 @@ impl Nfs4Backend {
             }
             if let Some(s) = self.session.as_mut().filter(|_| seq_ok) {
                 s.slot_seq[i] = next_seqid(s.slot_seq[i]);
+                self.last_activity = Instant::now();
             }
         }
         if res.status == code::OK {
@@ -327,8 +399,14 @@ impl Nfs4Backend {
 
     /// Run a sequenced compound with retry and recovery:
     /// - NFS4ERR_DELAY and NFS4ERR_GRACE: back off and retry (GRACE for a bounded time).
-    /// - Session / client / lease errors, or a broken connection: reconnect and
-    ///   re-establish the client and session, then retry once.
+    /// - NFS4ERR_BADSESSION / DEADSESSION: create a new session on the existing
+    ///   client ID (so the server keeps our opens), or fully re-establish if
+    ///   that fails; then retry once.
+    /// - Other session / client / lease errors, or a broken connection:
+    ///   reconnect and re-establish the client and session, then retry once.
+    /// - NFS4ERR_BAD_SEQID (4.0): switch to a fresh open-owner and retry once.
+    ///
+    /// Local conditions (no free session slot) fail without touching the connection.
     ///
     /// `build` is called on every attempt so it can read the current clientid
     /// and seqids.
@@ -341,6 +419,24 @@ impl Nfs4Backend {
         let mut delays = 0u32;
         let mut recovered = false;
         loop {
+            if self.minor >= 1 {
+                match &self.session {
+                    None if !recovered => {
+                        recovered = true;
+                        self.recover()?;
+                        continue;
+                    }
+                    None => {
+                        return Err(Error::Protocol(
+                            "NFSv4.1 operation without a session".into(),
+                        ));
+                    }
+                    Some(s) if s.busy.iter().all(|b| *b) => {
+                        return Err(Error::Protocol("no free session slot".into()));
+                    }
+                    Some(_) => {}
+                }
+            }
             let ops = build(&*self);
             let res = match self.send(ops, true) {
                 Ok(r) => r,
@@ -360,17 +456,23 @@ impl Nfs4Backend {
                     if delays > 40 {
                         return Err(self.status_err(res.status));
                     }
-                    std::thread::sleep(Duration::from_millis(50u64 << delays.min(5)));
+                    std::thread::sleep(backoff(delays));
                 }
                 code::GRACE => {
-                    if started.elapsed() > GRACE_WAIT {
+                    if started.elapsed() > grace_wait(self.lease) {
                         return Err(self.status_err(res.status));
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
-                code::BADSESSION
-                | code::DEADSESSION
-                | code::STALE_CLIENTID
+                code::BAD_SEQID if self.minor == 0 && !recovered => {
+                    recovered = true;
+                    self.new_open_owner();
+                }
+                code::BADSESSION | code::DEADSESSION if !recovered => {
+                    recovered = true;
+                    self.recover_session()?;
+                }
+                code::STALE_CLIENTID
                 | code::EXPIRED
                 | code::BADSLOT
                 | code::SEQ_MISORDERED
@@ -382,6 +484,27 @@ impl Nfs4Backend {
                 }
                 other => return Err(self.status_err(other)),
             }
+        }
+    }
+
+    /// [`Nfs4Backend::send`] for client / session setup, which cannot go through
+    /// [`Nfs4Backend::exec`]: NFS4ERR_DELAY and NFS4ERR_GRACE are retried with
+    /// backoff for up to [`grace_wait`]; any other status is returned as is.
+    pub(super) fn send_setup<F>(&mut self, sequenced: bool, build: F) -> Result<CompoundRes>
+    where
+        F: Fn(&Nfs4Backend) -> Vec<Op>,
+    {
+        let started = Instant::now();
+        let mut tries = 0u32;
+        loop {
+            let res = self.send(build(&*self), sequenced)?;
+            if !matches!(res.status, code::DELAY | code::GRACE)
+                || started.elapsed() > grace_wait(self.lease)
+            {
+                return Ok(res);
+            }
+            tries += 1;
+            std::thread::sleep(backoff(tries));
         }
     }
 
@@ -398,6 +521,28 @@ impl Nfs4Backend {
         self.opens.clear();
         self.open_seqid = 0;
         self.establish()
+    }
+
+    /// The session is gone but the client ID may not be: try CREATE_SESSION on
+    /// the existing client ID first, so the server keeps our opens; fall back
+    /// to a full [`Nfs4Backend::recover`].
+    fn recover_session(&mut self) -> Result<()> {
+        self.session = None;
+        if self.minor >= 1 && self.clientid != 0 && self.create_session(self.clientid).is_ok() {
+            return Ok(());
+        }
+        self.recover()
+    }
+
+    /// Abandon the open-owner after NFS4ERR_BAD_SEQID: its seqid is unknown,
+    /// so its opens can no longer be closed and are forgotten. The next OPEN
+    /// uses a new owner, whose first seqid the server accepts as given.
+    pub(super) fn new_open_owner(&mut self) {
+        self.opens.clear();
+        let mut owner = super::state40::OPEN_OWNER.to_vec();
+        owner.extend_from_slice(format!(" {:x}", rand64()).as_bytes());
+        self.open_owner = owner;
+        self.open_seqid = 0;
     }
 
     /// Establish a client ID (and a session for 4.1+) on the current connection.
@@ -1179,11 +1324,383 @@ pub(super) fn back_channel_request() -> ChannelAttrs {
 
 #[cfg(test)]
 mod tests {
-    use super::next_seqid;
+    use super::*;
+    use crate::nfs4::ops::{OP_CREATE_SESSION, OP_EXCHANGE_ID, OP_PUTFH, OP_PUTROOTFH};
+    use crate::rpc::PortMode;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    const OP_SEQUENCE: u32 = 53;
+    const OP_RECLAIM_COMPLETE: u32 = 58;
+    const OP_SETCLIENTID: u32 = 35;
+    const OP_SETCLIENTID_CONFIRM: u32 = 36;
+
+    fn w(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|x| x.to_be_bytes()).collect()
+    }
+
+    /// COMPOUND4res body: status, empty tag, then (opcode, status, result body) per op.
+    fn compound(status: u32, ops: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut v = w(&[status, 0, ops.len() as u32]);
+        for (op, st, body) in ops {
+            v.extend(w(&[*op, *st]));
+            v.extend_from_slice(body);
+        }
+        v
+    }
+
+    fn read_record(s: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).ok()?;
+            let n = u32::from_be_bytes(hdr);
+            let mut frag = vec![0u8; (n & 0x7fff_ffff) as usize];
+            s.read_exact(&mut frag).ok()?;
+            out.extend_from_slice(&frag);
+            if n & 0x8000_0000 != 0 {
+                return Some(out);
+            }
+        }
+    }
+
+    /// Fake NFSv4 server: answers each call with the next scripted COMPOUND
+    /// reply body, then closes the connection. Returns the address and the
+    /// number of calls received so far.
+    fn fake_server(replies: Vec<Vec<u8>>) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = calls.clone();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            for body in replies {
+                let Some(call) = read_record(&mut s) else {
+                    return;
+                };
+                *seen.lock().unwrap() += 1;
+                let mut msg = call[0..4].to_vec(); // xid
+                msg.extend(w(&[1, 0, 0, 0, 0])); // REPLY, ACCEPTED, AUTH_NONE verf, SUCCESS
+                msg.extend(body);
+                let mut rec = (0x8000_0000u32 | msg.len() as u32).to_be_bytes().to_vec();
+                rec.extend(msg);
+                if s.write_all(&rec).is_err() {
+                    return;
+                }
+            }
+            // Count (but do not answer) any further call.
+            if read_record(&mut s).is_some() {
+                *seen.lock().unwrap() += 1;
+            }
+        });
+        (addr, calls)
+    }
+
+    fn backend(addr: SocketAddr, minor: u32) -> Nfs4Backend {
+        let opts = RpcOptions {
+            port_mode: PortMode::Unprivileged,
+            timeout: Duration::from_secs(5),
+            ..RpcOptions::default()
+        };
+        let rpc = RpcClient::connect(addr, PROGRAM, VERSION, &opts).unwrap();
+        let mut be = Nfs4Backend::new(addr, opts, rpc);
+        be.minor = minor;
+        // No teardown traffic on drop.
+        be.disconnected = true;
+        be
+    }
+
+    fn sid(n: u8) -> StateId {
+        StateId {
+            seqid: 1,
+            other: [n; 12],
+        }
+    }
+
+    fn stateid_bytes(s: StateId) -> Vec<u8> {
+        let mut v = w(&[s.seqid]);
+        v.extend_from_slice(&s.other);
+        v
+    }
+
+    fn chan_bytes() -> Vec<u8> {
+        w(&[0, 65536, 65536, 0, 8, 4, 0])
+    }
+
+    fn create_session_ok(id: [u8; 16], seq: u32) -> Vec<u8> {
+        let mut body = id.to_vec();
+        body.extend(w(&[seq, 0]));
+        body.extend(chan_bytes());
+        body.extend(chan_bytes());
+        compound(code::OK, &[(OP_CREATE_SESSION, code::OK, body)])
+    }
+
+    fn sequence_ok(id: [u8; 16]) -> (u32, u32, Vec<u8>) {
+        let mut body = id.to_vec();
+        body.extend(w(&[1, 0, 3, 3, 0]));
+        (OP_SEQUENCE, code::OK, body)
+    }
 
     #[test]
     fn seqids_advance_and_skip_zero() {
         assert_eq!(next_seqid(1), 2);
         assert_eq!(next_seqid(u32::MAX), 1);
+    }
+
+    #[test]
+    fn seqid_not_advanced_for_rfc7530_errors() {
+        for c in [
+            code::STALE_CLIENTID,
+            code::STALE_STATEID,
+            code::BAD_STATEID,
+            code::BAD_SEQID,
+            code::BADXDR,
+            code::RESOURCE,
+            code::NOFILEHANDLE,
+            code::MOVED,
+        ] {
+            assert!(!seqid_advances(c), "{c}");
+        }
+        for c in [code::OK, code::OLD_STATEID, code::EXPIRED, 2, 13] {
+            assert!(seqid_advances(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn grace_wait_follows_lease() {
+        assert_eq!(
+            grace_wait(Duration::from_secs(90)),
+            Duration::from_secs(180)
+        );
+        assert_eq!(grace_wait(Duration::from_secs(5)), GRACE_WAIT_MIN);
+        assert_eq!(grace_wait(Duration::from_secs(3600)), GRACE_WAIT_MAX);
+    }
+
+    #[test]
+    fn only_stateful_ops_renew_a_40_lease() {
+        assert!(!renews_lease_40(&[Op::Putrootfh, Op::Getattr(vec![1])]));
+        assert!(!renews_lease_40(&[
+            Op::Putfh(vec![1]),
+            Op::Lookup(b"a".to_vec())
+        ]));
+        let read = |stateid| Op::Read {
+            stateid,
+            offset: 0,
+            count: 1,
+        };
+        assert!(!renews_lease_40(&[read(ANON_STATEID)]));
+        assert!(!renews_lease_40(&[read(
+            super::super::types::BYPASS_STATEID
+        )]));
+        assert!(renews_lease_40(&[read(sid(7))]));
+        assert!(renews_lease_40(&[Op::Renew(1)]));
+    }
+
+    #[test]
+    fn send_bumps_open_seqid_only_when_server_did() {
+        let close = |st: u32| {
+            let body = if st == code::OK {
+                stateid_bytes(sid(2))
+            } else {
+                Vec::new()
+            };
+            compound(st, &[(OP_CLOSE, st, body)])
+        };
+        let (addr, _) = fake_server(vec![
+            close(code::BAD_SEQID),
+            close(code::STALE_STATEID),
+            close(code::OLD_STATEID),
+            close(code::OK),
+        ]);
+        let mut be = backend(addr, 0);
+        be.open_seqid = 5;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let op = Op::Close {
+                seqid: be.open_seqid,
+                stateid: sid(1),
+            };
+            be.send(vec![op], false).unwrap();
+            seen.push(be.open_seqid);
+        }
+        assert_eq!(seen, [5, 5, 6, 7]);
+    }
+
+    #[test]
+    fn bad_seqid_switches_to_a_new_open_owner_and_retries() {
+        let (addr, calls) = fake_server(vec![
+            compound(
+                code::BAD_SEQID,
+                &[
+                    (OP_PUTFH, code::OK, Vec::new()),
+                    (OP_CLOSE, code::BAD_SEQID, Vec::new()),
+                ],
+            ),
+            compound(
+                code::OK,
+                &[
+                    (OP_PUTFH, code::OK, Vec::new()),
+                    (OP_CLOSE, code::OK, stateid_bytes(sid(3))),
+                ],
+            ),
+        ]);
+        let mut be = backend(addr, 0);
+        be.clientid = 9;
+        be.open_seqid = 7;
+        be.opens
+            .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
+        let res = be.exec(|s| {
+            vec![
+                Op::Putfh(vec![1]),
+                Op::Close {
+                    seqid: s.open_seqid,
+                    stateid: sid(1),
+                },
+            ]
+        });
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_ne!(be.open_owner, super::super::state40::OPEN_OWNER);
+        assert_eq!(be.open_seqid, 1);
+        assert!(be.opens.get(&FileHandle(vec![1]), false).is_none());
+    }
+
+    #[test]
+    fn establish_40_retries_delay() {
+        let mut sc = w(&[0, 0x42]);
+        sc.extend_from_slice(&[7; 8]);
+        let (addr, calls) = fake_server(vec![
+            compound(code::DELAY, &[(OP_SETCLIENTID, code::DELAY, Vec::new())]),
+            compound(code::OK, &[(OP_SETCLIENTID, code::OK, sc)]),
+            compound(
+                code::GRACE,
+                &[(OP_SETCLIENTID_CONFIRM, code::GRACE, Vec::new())],
+            ),
+            compound(code::OK, &[(OP_SETCLIENTID_CONFIRM, code::OK, Vec::new())]),
+        ]);
+        let mut be = backend(addr, 0);
+        be.establish_40().unwrap();
+        assert_eq!(be.clientid, 0x42);
+        assert_eq!(*calls.lock().unwrap(), 4);
+    }
+
+    #[test]
+    fn establish_41_retries_delay() {
+        // clientid, sequence 5, flags, SP4_NONE, minor id, empty major id / scope / impl list.
+        let xid = w(&[0, 0x77, 5, 0, 0, 0, 0, 0, 0, 0]);
+        let sess = [0xab; 16];
+        let (addr, calls) = fake_server(vec![
+            compound(code::DELAY, &[(OP_EXCHANGE_ID, code::DELAY, Vec::new())]),
+            compound(code::OK, &[(OP_EXCHANGE_ID, code::OK, xid)]),
+            compound(code::DELAY, &[(OP_CREATE_SESSION, code::DELAY, Vec::new())]),
+            create_session_ok(sess, 5),
+            compound(
+                code::OK,
+                &[
+                    sequence_ok(sess),
+                    (OP_RECLAIM_COMPLETE, code::OK, Vec::new()),
+                ],
+            ),
+        ]);
+        let mut be = backend(addr, 1);
+        be.establish_41().unwrap();
+        assert_eq!(be.clientid, 0x77);
+        assert_eq!(be.create_seq, 6);
+        let s = be.session.as_ref().unwrap();
+        assert_eq!(s.id, sess);
+        assert_eq!(s.slot_seq, vec![2, 1, 1, 1]);
+        assert_eq!(*calls.lock().unwrap(), 5);
+    }
+
+    #[test]
+    fn bad_session_recreates_session_on_same_clientid() {
+        let old = [1; 16];
+        let new = [2; 16];
+        let (addr, calls) = fake_server(vec![
+            compound(
+                code::BADSESSION,
+                &[(OP_SEQUENCE, code::BADSESSION, Vec::new())],
+            ),
+            create_session_ok(new, 3),
+            compound(
+                code::OK,
+                &[sequence_ok(new), (OP_PUTROOTFH, code::OK, Vec::new())],
+            ),
+        ]);
+        let mut be = backend(addr, 1);
+        be.clientid = 0x55;
+        be.create_seq = 3;
+        be.session = Some(Session {
+            id: old,
+            slot_seq: vec![9],
+            busy: vec![false],
+            max_req: 4096,
+            max_resp: 4096,
+        });
+        be.opens
+            .insert(FileHandle(vec![1]), sid(1), OPEN4_SHARE_ACCESS_BOTH);
+        be.exec(|_| vec![Op::Putrootfh]).unwrap();
+        assert_eq!(*calls.lock().unwrap(), 3);
+        assert_eq!(be.clientid, 0x55);
+        assert_eq!(be.create_seq, 4);
+        assert_eq!(be.session.as_ref().unwrap().id, new);
+        // The open survived: no full EXCHANGE_ID recovery happened.
+        assert!(be.opens.get(&FileHandle(vec![1]), true).is_some());
+    }
+
+    #[test]
+    fn failed_open_confirm_closes_the_open() {
+        let (addr, calls) = fake_server(vec![
+            compound(
+                code::BAD_STATEID,
+                &[
+                    (OP_PUTFH, code::OK, Vec::new()),
+                    (OP_OPEN_CONFIRM, code::BAD_STATEID, Vec::new()),
+                ],
+            ),
+            compound(
+                code::OK,
+                &[
+                    (OP_PUTFH, code::OK, Vec::new()),
+                    (OP_CLOSE, code::OK, stateid_bytes(sid(1))),
+                ],
+            ),
+        ]);
+        let mut be = backend(addr, 0);
+        be.clientid = 9;
+        let fh = FileHandle(vec![4]);
+        let r = be.finish_open(
+            &fh,
+            sid(1),
+            super::super::types::OPEN4_RESULT_CONFIRM,
+            None,
+            OPEN4_SHARE_ACCESS_BOTH,
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "CLOSE sent after failed OPEN_CONFIRM"
+        );
+        assert!(be.opens.get(&fh, false).is_none());
+    }
+
+    #[test]
+    fn no_free_slot_fails_without_reconnecting() {
+        let (addr, calls) = fake_server(Vec::new());
+        let mut be = backend(addr, 1);
+        be.session = Some(Session {
+            id: [1; 16],
+            slot_seq: vec![1],
+            busy: vec![true],
+            max_req: 4096,
+            max_resp: 4096,
+        });
+        match be.exec(|_| vec![Op::Putrootfh]) {
+            Err(Error::Protocol(m)) => assert!(m.contains("slot"), "{m}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 }
