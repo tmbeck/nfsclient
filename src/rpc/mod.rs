@@ -91,9 +91,11 @@ pub struct RpcOptions {
     /// How the NFS backends retry calls that fail with a retryable error
     /// (timeouts, dropped or refused connections, NFS3ERR_JUKEBOX /
     /// NFS4ERR_DELAY, NFS4ERR_GRACE). Plain [`RpcClient::call`] never
-    /// retries; see [`RpcClient::call_retrying`]. Connection setup (portmap,
-    /// MOUNT, the first connect) is not retried either, so a server that is
-    /// down at connect time is reported at once.
+    /// retries; see [`RpcClient::call_retrying`]. [`crate::fs::connect`]
+    /// retries the whole connection setup (portmap, MOUNT, the first
+    /// connect, NFSv4 client ID setup) under the same policy, so a server
+    /// that is down at connect time is waited for; the per-version
+    /// `connect` functions and [`RpcClient::connect`] do not.
     pub retry: RetryPolicy,
 }
 

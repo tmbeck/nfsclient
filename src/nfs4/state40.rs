@@ -100,10 +100,6 @@ impl OpenCache {
     pub fn drain(&mut self) -> Vec<(FileHandle, StateId)> {
         self.entries.drain().map(|(k, e)| (k, e.stateid)).collect()
     }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
 }
 
 /// Build OPEN arguments for the current open owner.
@@ -138,7 +134,43 @@ impl Nfs4Backend {
     /// SETCLIENTID then SETCLIENTID_CONFIRM (NFSv4.0). NFS4ERR_DELAY and
     /// NFS4ERR_GRACE are retried with backoff.
     pub(super) fn establish_40(&mut self) -> Result<()> {
-        let verifier = self.new_verifier();
+        let old = self.clientid;
+        let verifier = self.verifier;
+        let (clientid, confirm) = self.setclientid(verifier)?;
+        let res = self.send_setup(false, |_| {
+            vec![Op::SetclientidConfirm {
+                clientid,
+                verifier: confirm,
+            }]
+        })?;
+        self.check(res)?;
+        self.clientid = clientid;
+        if clientid != old {
+            self.open_seqid = 0;
+        }
+        Ok(())
+    }
+
+    /// Release all state of this client at once (best effort, at disconnect):
+    /// SETCLIENTID / SETCLIENTID_CONFIRM under a new verifier, which the
+    /// server treats as a client reboot (RFC 7530 §16.34.4), dropping every
+    /// open of the old client ID, including those of abandoned open-owners.
+    pub(super) fn release_client_40(&mut self) -> Result<()> {
+        let (clientid, confirm) = self.setclientid(self.new_verifier())?;
+        let res = self.send(
+            vec![Op::SetclientidConfirm {
+                clientid,
+                verifier: confirm,
+            }],
+            false,
+        )?;
+        self.check(res)?;
+        self.clientid = clientid;
+        Ok(())
+    }
+
+    /// SETCLIENTID with `verifier`: the new client ID and its confirm verifier.
+    fn setclientid(&mut self, verifier: [u8; 8]) -> Result<(u64, [u8; 8])> {
         let id = self.owner_id.clone();
         let res = self.send_setup(false, |_| {
             vec![Op::Setclientid {
@@ -151,20 +183,10 @@ impl Nfs4Backend {
             }]
         })?;
         let res = self.check(res)?;
-        let (clientid, confirm) = match body(&res, 0)? {
-            Res::Setclientid { clientid, verifier } => (*clientid, *verifier),
-            _ => return Err(Error::Xdr("expected SETCLIENTID result".into())),
-        };
-        let res = self.send_setup(false, |_| {
-            vec![Op::SetclientidConfirm {
-                clientid,
-                verifier: confirm,
-            }]
-        })?;
-        self.check(res)?;
-        self.clientid = clientid;
-        self.open_seqid = 0;
-        Ok(())
+        match body(&res, 0)? {
+            Res::Setclientid { clientid, verifier } => Ok((*clientid, *verifier)),
+            _ => Err(Error::Xdr("expected SETCLIENTID result".into())),
+        }
     }
 
     /// OPEN_CONFIRM when the server asks for it (NFSv4.0 only).
