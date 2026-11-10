@@ -11,18 +11,28 @@
 //! therefore never leaves a truncated file under the final name, nor damages
 //! a good file that was already there.
 //!
+//! Uploads are atomic the same way on the server: data goes to the remote
+//! `NAME.nfsc-part`, which is renamed over `NAME` (NFS RENAME replaces the
+//! target atomically) once complete. A failed put never truncates or replaces
+//! a good remote file.
+//!
 //! Resume (`-c`): `get -c` continues `NAME.nfsc-part` (or, for files from
 //! older versions, a partial `NAME` in place) from its current size, and
-//! `put -c` continues a remote file from its current size. Before `get -c`
-//! appends, the last [`TAIL_CHECK`] bytes of the local file are compared with
-//! the same range on the server; a mismatch (the remote file was replaced, or
-//! the local file is something else) refuses the resume.
+//! `put -c` does the same with the remote `NAME.nfsc-part` (or a partial
+//! remote `NAME`). Before either appends, the last [`TAIL_CHECK`] bytes
+//! before the resume point are compared between the local and the remote
+//! file; a mismatch (one side was replaced or is something else) refuses the
+//! resume.
 //!
-//! Verify (`get -V`): the bytes are hashed (SHA-256) as they are written,
-//! after hashing the local prefix that a resume keeps. Once the file is
-//! complete, the remote file is read a second time and hashed; the `.nfsc-part`
-//! is renamed into place only when both digests agree. This costs a second
-//! full read, so it is off by default.
+//! Verify (`-V`): the bytes are hashed (SHA-256) as they are transferred,
+//! after hashing the prefix that a resume keeps. Once the file is complete,
+//! the remote file is read (again) and hashed; the `.nfsc-part` is renamed
+//! into place only when both digests agree. This costs a full extra read of
+//! the remote file, so it is off by default.
+//!
+//! Modes: `get` applies the server's mode without setuid/setgid/sticky and,
+//! like `cp`, minus the process umask; `get -p` keeps the server's bits.
+//! `put` sends the local mode bits as they are (like `scp`).
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
@@ -66,11 +76,61 @@ const O_NOFOLLOW: i32 = 0x0100;
 /// Bytes before the resume offset that `get -c` compares with the server.
 const TAIL_CHECK: u64 = 1 << 20;
 
+/// How far back `get -c` keeps comparing while both sides are all zeros.
+const ZERO_SCAN_MAX: u64 = 64 << 20;
+
 /// Read size when hashing a local file.
 const LOCAL_CHUNK: usize = 1 << 20;
 
-const GET_USAGE: &str = "usage: get [-rcknV] remote... [local]";
-const PUT_USAGE: &str = "usage: put [-rckn] local... [remote]";
+const GET_USAGE: &str = "usage: get [-rcknpV] remote... [local]";
+const PUT_USAGE: &str = "usage: put [-rcknV] local... [remote]";
+
+/// The process umask, read once. On Linux it comes from `/proc/self/status`;
+/// elsewhere (or without /proc) from umask(2), which has to set a mask to read
+/// one: the stricter 077 is in place for that instant, then the old one is back.
+pub(super) fn process_umask() -> u32 {
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| proc_umask().unwrap_or_else(syscall_umask) & 0o777)
+}
+
+fn proc_umask() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let value = status.lines().find_map(|l| l.strip_prefix("Umask:"))?;
+    u32::from_str_radix(value.trim(), 8).ok()
+}
+
+fn syscall_umask() -> u32 {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    type ModeT = u16;
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
+    type ModeT = u32;
+    unsafe extern "C" {
+        fn umask(mask: ModeT) -> ModeT;
+    }
+    // SAFETY: umask(2) takes a plain integer, cannot fail and touches no
+    // memory; the previous mask is restored right away.
+    let old = unsafe { umask(0o077) };
+    // SAFETY: as above.
+    unsafe { umask(old) };
+    #[allow(clippy::useless_conversion)] // mode_t is u16 on some platforms
+    u32::from(old)
+}
+
+/// The local mode for a downloaded file or directory whose server mode is
+/// `mode`: never setuid/setgid/sticky, and without the bits in `umask`.
+fn local_mode(mode: u32, umask: u32) -> u32 {
+    mode & 0o777 & !umask
+}
 
 fn local_err(e: std::io::Error) -> Error {
     Error::Invalid(io_text(&e))
@@ -243,10 +303,10 @@ fn ensure_writable(dir: &Path) {
     }
 }
 
-/// Sets a downloaded directory's mode (without setuid/setgid/sticky) and
-/// mtime from the server, after its contents are written (writing entries
-/// would change the mtime again). Best effort; a failure is noted on `err`.
-fn restore_dir(dir: &Path, attr: &Attr, err: &mut dyn Write) {
+/// Sets a downloaded directory's mode (see [`local_mode`]) and mtime from the
+/// server, after its contents are written (writing entries would change the
+/// mtime again). Best effort; a failure is noted on `err`.
+fn restore_dir(dir: &Path, attr: &Attr, umask: u32, err: &mut dyn Write) {
     let note = |err: &mut dyn Write, e: &std::io::Error| {
         let _ = writeln!(
             err,
@@ -268,7 +328,8 @@ fn restore_dir(dir: &Path, attr: &Attr, err: &mut dyn Write) {
     {
         note(err, &e);
     }
-    if let Err(e) = handle.set_permissions(fs::Permissions::from_mode(attr.mode & 0o777)) {
+    if let Err(e) = handle.set_permissions(fs::Permissions::from_mode(local_mode(attr.mode, umask)))
+    {
         note(err, &e);
     }
 }
@@ -284,6 +345,8 @@ struct GetOpts {
     keep_going: bool,
     /// `-V`: hash while writing, then compare with a second read of the server.
     verify: bool,
+    /// `-p`: apply the server's mode bits without the local umask.
+    preserve: bool,
 }
 
 /// Why a download did not complete.
@@ -313,6 +376,8 @@ struct PutOpts {
     no_clobber: bool,
     /// `-k`: report errors and continue; fail at the end.
     keep_going: bool,
+    /// `-V`: hash while sending, then compare with a read of the remote file.
+    verify: bool,
 }
 
 /// What one `get` was asked to do, shared by its sources.
@@ -342,6 +407,7 @@ fn long_options(args: &[String]) -> Vec<String> {
                 "--no-clobber" => "-n".to_string(),
                 "--continue" => "-c".to_string(),
                 "--recursive" => "-r".to_string(),
+                "--preserve" => "-p".to_string(),
                 _ => a.clone(),
             }
         })
@@ -357,12 +423,13 @@ impl Session {
     ) -> CmdResult<()> {
         const CMD: &str = "get";
         let args = long_options(args);
-        let flags = parse_args(&args, "rcnkV").map_err(|m| usage(CMD, m))?;
+        let flags = parse_args(&args, "rcnkpV").map_err(|m| usage(CMD, m))?;
         let opts = GetOpts {
             resume: flags.has('c'),
             no_clobber: flags.has('n'),
             keep_going: flags.has('k'),
             verify: flags.has('V'),
+            preserve: flags.has('p'),
         };
         let (remotes, local) = match flags.positional.as_slice() {
             [] => return Err(usage(CMD, GET_USAGE)),
@@ -514,6 +581,7 @@ impl Session {
         let tree = TreeProgress::new(totals);
         let mut lines = LineWriter::new(err, tree.multi());
         self.tree = Some(tree);
+        self.tree_failed_at = None;
         let result = self.get_tree(
             &node.fh,
             &node.attr,
@@ -524,10 +592,12 @@ impl Session {
             failures,
         );
         drop(lines);
+        // The new top directory's own entry, in its parent.
+        sync_parent(&dest);
         self.scan_cache.clear();
         let tree = self.tree.take();
         let summary = tree.map(|t| t.finish("got"));
-        result.ctx(CMD, src)?;
+        self.tree_result(CMD, src, result)?;
         if let Some(line) = summary {
             writeln!(err, "{line}").map_err(|e| io_fail(CMD, e))?;
         }
@@ -537,12 +607,13 @@ impl Session {
     pub(super) fn cmd_put(&mut self, args: &[String], err: &mut dyn Write) -> CmdResult<()> {
         const CMD: &str = "put";
         let args = long_options(args);
-        let flags = parse_args(&args, "rcnk").map_err(|m| usage(CMD, m))?;
+        let flags = parse_args(&args, "rcnkV").map_err(|m| usage(CMD, m))?;
         let opts = PutOpts {
             recursive: flags.has('r'),
             resume: flags.has('c'),
             no_clobber: flags.has('n'),
             keep_going: flags.has('k'),
+            verify: flags.has('V'),
         };
         let (locals, remote) = match flags.positional.as_slice() {
             [] => return Err(usage(CMD, PUT_USAGE)),
@@ -651,11 +722,12 @@ impl Session {
             let tree = TreeProgress::new(totals);
             let mut lines = LineWriter::new(err, tree.multi());
             self.tree = Some(tree);
+            self.tree_failed_at = None;
             let result = self.put_tree(&path, &dir, &name, opts, &mut lines, failures, 0);
             drop(lines);
             let tree = self.tree.take();
             let summary = tree.map(|t| t.finish("put"));
-            result.ctx(CMD, local)?;
+            self.tree_result(CMD, local, result)?;
             if let Some(line) = summary {
                 writeln!(err, "{line}").map_err(|e| io_fail(CMD, e))?;
             }
@@ -663,6 +735,21 @@ impl Session {
         } else {
             self.put_file(&path, &meta, &dir, &name, opts, err)
                 .ctx(CMD, local)
+        }
+    }
+
+    /// The failure of a recursive transfer of `src`, naming the entry that
+    /// stopped it: `nfsc: get: tree: /dl/tree/x.bin: gave up on READ ...`.
+    fn tree_result(&mut self, cmd: &str, src: &str, result: Result<()>) -> CmdResult<()> {
+        let at = self.tree_failed_at.take();
+        match (result, at) {
+            (Ok(()), _) => Ok(()),
+            (Err(e), Some(at)) if !interrupt::is_interrupt(&e) => Err(CmdFailure::new(
+                cmd,
+                Some(src),
+                format!("{}: {e}", display_path(&at)),
+            )),
+            (Err(e), _) => Err(CmdFailure::from_error(cmd, src, e)),
         }
     }
 
@@ -796,11 +883,13 @@ impl Session {
     }
 
     /// Downloads one file to `path` through `path.nfsc-part` (see the module
-    /// docs), restoring the remote mode and modification time. Only the size
-    /// the server reported is written; more data is not stored. `nofollow` is
-    /// set for files inside a downloaded tree, whose names come from the
-    /// server: a local symbolic link at `path` is then refused. For a single
-    /// file, a symbolic link the user points at is followed, as before.
+    /// docs), restoring the remote mode (see [`local_mode`]) and modification
+    /// time. Only the size the server reported is written; more data is not
+    /// stored. `in_tree` is set for files inside a downloaded tree, whose
+    /// names come from the server: a local symbolic link at `path` is then
+    /// refused, and the directory is synced once by the tree walk instead of
+    /// after every file. For a single file, a symbolic link the user points
+    /// at is followed, as before.
     #[allow(clippy::too_many_arguments)]
     fn fetch_to_path(
         &mut self,
@@ -809,9 +898,10 @@ impl Session {
         attr: &Attr,
         path: &Path,
         opts: GetOpts,
-        nofollow: bool,
+        in_tree: bool,
         err: &mut dyn Write,
     ) -> Result<()> {
+        let nofollow = in_tree;
         let existing = fs::symlink_metadata(path).ok();
         if opts.no_clobber && existing.is_some() {
             return writeln!(
@@ -855,7 +945,10 @@ impl Session {
             )));
         }
         if opts.resume && start > 0 {
-            self.check_tail(fh, &mut file, target, start)?;
+            if in_place {
+                Self::check_in_place_age(&file, target, attr)?;
+            }
+            self.check_tail(fh, &mut file, target, start, opts.verify)?;
         }
         let started = Instant::now();
         let received = self.receive_verified(label, fh, &mut file, target, start, size, opts);
@@ -891,9 +984,11 @@ impl Session {
         };
         // Best effort: a failed chmod or utime does not undo a successful download.
         // Setuid, setgid and sticky bits from the server are dropped: a root
-        // download must not create a set-id local file. The chmod goes through the
-        // descriptor, so it cannot land on a symlink target.
-        let _ = file.set_permissions(fs::Permissions::from_mode(attr.mode & 0o777));
+        // download must not create a set-id local file. The umask applies
+        // unless -p. The chmod goes through the descriptor, so it cannot land
+        // on a symlink target.
+        let umask = if opts.preserve { 0 } else { self.umask };
+        let _ = file.set_permissions(fs::Permissions::from_mode(local_mode(attr.mode, umask)));
         if let Some(t) = system_time(attr.mtime)
             && let Err(e) = file.set_modified(t)
         {
@@ -916,7 +1011,9 @@ impl Session {
                     &e,
                 ));
             }
-            sync_parent(&dest);
+            if !in_tree {
+                sync_parent(&dest);
+            }
         }
         let verified = verified
             .map(|hex| format!(", verified {} {hex}", Algo::Sha256.name()))
@@ -934,32 +1031,126 @@ impl Session {
     /// Refuses a resume when the last bytes before `start` in the local file
     /// differ from the same range on the server: the remote file was replaced
     /// or the local file is another one, and appending would corrupt it.
+    ///
+    /// Zeros on both sides prove little (VM images and padded archives are
+    /// full of them), so while the compared window is all zeros the check
+    /// moves further back, up to [`ZERO_SCAN_MAX`] bytes. When that finds no
+    /// data, the resume is refused unless `verify` (-V) will compare the
+    /// whole file afterwards anyway.
     fn check_tail(
         &mut self,
         fh: &FileHandle,
         file: &mut File,
         target: &Path,
         start: u64,
+        verify: bool,
     ) -> Result<()> {
-        let n = start.min(TAIL_CHECK);
-        let from = start - n;
-        let mut local = vec![0u8; n as usize];
-        file.seek(SeekFrom::Start(from))
-            .and_then(|_| file.read_exact(&mut local))
-            .map_err(|e| local_io("read", target, &e))?;
-        let mut remote = Vec::with_capacity(local.len());
-        self.download(fh, from, Some(n), &mut |chunk: &[u8]| -> Result<()> {
-            remote.extend_from_slice(chunk);
-            Ok(())
-        })?;
-        if remote != local {
+        let mut end = start;
+        let mut compared = 0u64;
+        while end > 0 {
+            let n = end.min(TAIL_CHECK);
+            let from = end - n;
+            let mut local = vec![0u8; n as usize];
+            file.seek(SeekFrom::Start(from))
+                .and_then(|_| file.read_exact(&mut local))
+                .map_err(|e| local_io("read", target, &e))?;
+            let mut remote = Vec::with_capacity(local.len());
+            self.download(fh, from, Some(n), &mut |chunk: &[u8]| -> Result<()> {
+                remote.extend_from_slice(chunk);
+                Ok(())
+            })?;
+            if remote != local {
+                return Err(Error::Invalid(format!(
+                    "{} does not match the remote file in the {n} bytes before offset {end}; \
+                     not resuming (the remote file may have changed; get without -c downloads it again)",
+                    display_path(target)
+                )));
+            }
+            if local.iter().any(|&b| b != 0) {
+                return Ok(());
+            }
+            compared += n;
+            end = from;
+            if compared >= ZERO_SCAN_MAX && end > 0 && !verify {
+                return Err(Error::Invalid(format!(
+                    "the {compared} bytes of {} before offset {start} are all zeros, as on the \
+                     server, which does not show that it is the same file; not resuming \
+                     (get -cV resumes and then checks the whole file; get without -c downloads it again)",
+                    display_path(target)
+                )));
+            }
+            if compared >= ZERO_SCAN_MAX {
+                break;
+            }
+        }
+        // Everything before `start` compared equal, or -V checks it all later.
+        Ok(())
+    }
+
+    /// Refuses to continue a final-named local file (not a `.nfsc-part`)
+    /// whose mtime is older than the remote file's: it was written before
+    /// the remote file last changed, so it is an earlier version (a finished
+    /// get sets the remote mtime), not the start of this one.
+    fn check_in_place_age(file: &File, target: &Path, attr: &Attr) -> Result<()> {
+        let local = file.metadata().and_then(|m| m.modified()).ok();
+        let remote = system_time(attr.mtime);
+        if let (Some(local), Some(remote)) = (local, remote)
+            && local < remote
+        {
             return Err(Error::Invalid(format!(
-                "{} does not match the remote file in the {n} bytes before offset {start}; \
-                 not resuming (the remote file may have changed; get without -c downloads it again)",
+                "{} is older than the remote file, so it is an earlier version rather than a \
+                 partial download; not resuming (get without -c downloads it again)",
                 display_path(target)
             )));
         }
         Ok(())
+    }
+
+    /// Compares the first `len` bytes of the local `file` (at `path`) with
+    /// the remote `fh`, reading the remote range once. Returns the first
+    /// offset where they differ. Used by `put -c`: a failed pipelined upload
+    /// can leave a gap (zeros) well before the end of the remote file, which
+    /// a tail check would not see.
+    fn prefix_mismatch(
+        &mut self,
+        label: &str,
+        fh: &FileHandle,
+        file: &mut File,
+        path: &Path,
+        len: u64,
+    ) -> Result<Option<u64>> {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| local_io("read", path, &e))?;
+        let mut meter = Meter::new(self.progress, &format!("{label} (check)"), len, 0, None);
+        let mut pos = 0u64;
+        let mut differs = None;
+        let mut local = Vec::new();
+        let result = self.download(fh, 0, Some(len), &mut |chunk: &[u8]| -> Result<()> {
+            local.resize(chunk.len(), 0);
+            file.read_exact(&mut local)
+                .map_err(|e| local_io("read", path, &e))?;
+            // Slice equality first: it is a memcmp, the search is not.
+            if local.as_slice() != chunk
+                && let Some(i) = local.iter().zip(chunk).position(|(a, b)| a != b)
+            {
+                differs = Some(pos + i as u64);
+                // Stop reading; the answer is known.
+                return Err(Error::Invalid("differs".into()));
+            }
+            pos += chunk.len() as u64;
+            meter.tick(pos);
+            Ok(())
+        });
+        meter.finish(result.is_ok());
+        if differs.is_some() {
+            return Ok(differs);
+        }
+        let n = result?;
+        if n < len {
+            // The remote file is shorter than it claimed: treat the rest as different.
+            return Ok(Some(n));
+        }
+        Ok(None)
     }
 
     /// [`Self::receive`], hashing the data when `opts.verify` is set and then
@@ -1180,7 +1371,8 @@ impl Session {
         let result = self.get_tree_entries(fh, dir, opts, err, ancestors, failures);
         ancestors.pop();
         result?;
-        restore_dir(dir, attr, err);
+        let umask = if opts.preserve { 0 } else { self.umask };
+        restore_dir(dir, attr, umask, err);
         Ok(())
     }
 
@@ -1210,13 +1402,23 @@ impl Session {
             let result =
                 self.get_tree_entry(fh, entry, &label, &child, opts, err, ancestors, failures);
             if let Err(e) = result {
-                if !opts.keep_going || interrupt::is_interrupt(&e) {
+                if interrupt::is_interrupt(&e) {
+                    return Err(e);
+                }
+                if !opts.keep_going {
+                    // The innermost directory sees the error first.
+                    self.tree_failed_at.get_or_insert(child);
                     return Err(e);
                 }
                 let what = format!("{}: {}", display_path(&child), display_str(&e.to_string()));
                 writeln!(err, "nfsc: get: {what}").map_err(local_err)?;
                 failures.push(what);
             }
+        }
+        // Files were renamed into place without a directory sync each; one
+        // sync here makes all of those renames durable.
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
         }
         Ok(())
     }
@@ -1266,9 +1468,22 @@ impl Session {
         }
     }
 
-    /// Uploads one local file as `name` in `dir`, replacing any existing file
-    /// unless `resume` is set, in which case the remote file is continued from
-    /// its current size. With `no_clobber` an existing remote name is skipped.
+    /// LOOKUP that maps "no such name" to `None`.
+    fn lookup_opt(&mut self, dir: &FileHandle, name: &[u8]) -> Result<Option<(FileHandle, Attr)>> {
+        match self.fs.lookup(dir, name) {
+            Ok(found) => Ok(Some(found)),
+            Err(Error::Nfs(Status::NoEnt)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Uploads one local file as `name` in `dir` through the remote
+    /// `NAME.nfsc-part`, which is renamed over `name` once complete (see the
+    /// module docs). With `resume`, the remote part (or, when there is none,
+    /// a partial remote `name` in place) is continued from its current size
+    /// after a tail check. With `no_clobber` an existing remote name is
+    /// skipped. The remote file gets the local mode bits; the remote mtime is
+    /// the time of the upload.
     fn put_file(
         &mut self,
         local: &Path,
@@ -1278,16 +1493,11 @@ impl Session {
         opts: PutOpts,
         err: &mut dyn Write,
     ) -> Result<()> {
-        let resume = opts.resume;
         let mut file = File::open(local).map_err(local_err)?;
         let size = meta.len();
         let mode = meta.permissions().mode() & 0o7777;
         let label = display_name(name);
-        let existing = match self.fs.lookup(dir, name) {
-            Ok(found) => Some(found),
-            Err(Error::Nfs(Status::NoEnt)) => None,
-            Err(e) => return Err(e),
-        };
+        let existing = self.lookup_opt(dir, name)?;
         if opts.no_clobber && existing.is_some() {
             return writeln!(
                 err,
@@ -1295,84 +1505,222 @@ impl Session {
             )
             .map_err(local_err);
         }
-        let (fh, start, attrs) = match existing {
-            Some((fh, attr)) => {
-                if attr.ftype == FileType::Directory {
-                    return Err(Error::Nfs(Status::IsDir));
-                }
-                if resume {
-                    if attr.size > size {
-                        return Err(Error::Invalid(format!(
-                            "remote file is larger than the local file ({} > {size} bytes), not resuming",
-                            attr.size
-                        )));
-                    }
-                    let attrs = SetAttr {
-                        mode: Some(mode),
-                        ..SetAttr::default()
-                    };
-                    (fh, attr.size, attrs)
-                } else {
-                    let attrs = SetAttr {
-                        mode: Some(mode),
-                        size: Some(0),
-                        ..SetAttr::default()
-                    };
-                    (fh, 0, attrs)
+        if let Some((_, attr)) = &existing {
+            match attr.ftype {
+                FileType::Regular => {}
+                FileType::Directory => return Err(Error::Nfs(Status::IsDir)),
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "{label} exists on the server and is not a regular file"
+                    )));
                 }
             }
-            None => {
-                let (fh, _) =
-                    self.fs
-                        .create(dir, name, CreateMode::Unchecked, &SetAttr::default())?;
-                let attrs = SetAttr {
-                    mode: Some(mode),
-                    ..SetAttr::default()
+        }
+        let mut part_name = name.to_vec();
+        part_name.extend_from_slice(PART_SUFFIX.as_bytes());
+        let part_label = display_name(&part_name);
+        let part = self.lookup_opt(dir, &part_name)?;
+        if part
+            .as_ref()
+            .is_some_and(|(_, a)| a.ftype != FileType::Regular)
+        {
+            return Err(Error::Invalid(format!(
+                "{part_label} exists on the server and is not a regular file"
+            )));
+        }
+        // The owner can write while data goes up, whatever the final mode is.
+        let writable = SetAttr {
+            mode: Some((mode & 0o777) | 0o600),
+            ..SetAttr::default()
+        };
+        let (fh, in_place, start) = match (opts.resume, part, existing) {
+            (true, Some((fh, attr)), _) => (fh, false, attr.size),
+            // A partial file from an older nfsc (or another tool).
+            (true, None, Some((fh, attr))) => (fh, true, attr.size),
+            (_, Some((fh, _)), _) => {
+                let truncate = SetAttr {
+                    size: Some(0),
+                    ..writable.clone()
                 };
-                (fh, 0, attrs)
+                self.fs.setattr(&fh, &truncate)?;
+                (fh, false, 0)
+            }
+            (_, None, _) => {
+                let (fh, _) = self
+                    .fs
+                    .create(dir, &part_name, CreateMode::Unchecked, &writable)?;
+                (fh, false, 0)
             }
         };
-        self.fs.setattr(&fh, &attrs)?;
+        let target = if in_place { &label } else { &part_label };
+        if start > size {
+            return Err(Error::Invalid(format!(
+                "remote file {target} is larger than the local file ({start} > {size} bytes), not resuming"
+            )));
+        }
+        if start > 0
+            && let Some(at) = self.prefix_mismatch(&label, &fh, &mut file, local, start)?
+        {
+            return Err(Error::Invalid(format!(
+                "remote file {target} differs from {} at offset {at} (of the {start} bytes \
+                 already on the server); not resuming (a failed upload can leave a gap, or one \
+                 of the files changed; put without -c uploads it again)",
+                display_path(local)
+            )));
+        }
 
         let started = Instant::now();
-        let mut tree = self.tree.take();
-        let mut meter = Meter::new(self.progress, &label, size, start, tree.as_mut());
         let mut sent = start;
-        if start >= size {
-            meter.finish(true);
-        } else {
-            file.seek(SeekFrom::Start(start)).map_err(local_err)?;
-            let flag = Arc::clone(&self.interrupt);
-            let result = self
-                .fs
-                .write_stream(&fh, start, &mut |buf: &mut [u8]| -> Result<usize> {
-                    interrupt::check(&flag)?;
-                    let n = file.read(buf).map_err(local_err)?;
-                    sent += n as u64;
-                    meter.tick(sent);
-                    Ok(n)
-                });
-            meter.finish(result.is_ok());
-            if let Err(e) = result {
-                self.tree = tree;
-                if interrupt::is_interrupt(&e) {
-                    let _ = writeln!(
-                        err,
-                        "nfsc: put: remote file {label} is partial ({sent} of {size} bytes); put -c continues it"
-                    );
+        let outcome = self.send_verified(
+            &label,
+            &fh,
+            &mut file,
+            local,
+            start,
+            size,
+            opts.verify,
+            &mut sent,
+        );
+        let verified = match outcome {
+            Ok(v) => v,
+            Err(Failed::Mismatch(e)) => {
+                // Never keep data that differs from the local file for a
+                // later -c. A partial file under the final name is left alone.
+                if !in_place && self.fs.remove(dir, &part_name).is_ok() {
+                    let _ = writeln!(err, "nfsc: put: removed {part_label} from the server");
                 }
                 return Err(e);
             }
+            Err(Failed::Transfer(e)) => {
+                if opts.resume {
+                    let _ = writeln!(
+                        err,
+                        "nfsc: put: partial remote file {target} kept (up to {sent} of {size} \
+                         bytes sent); put -c checks it and continues"
+                    );
+                } else if matches!(e, Error::GaveUp { .. }) {
+                    // The server is not answering; removing would only wait again.
+                    let _ = writeln!(
+                        err,
+                        "nfsc: put: partial remote file {part_label} left on the server \
+                         (up to {sent} of {size} bytes sent); put -c checks it and continues"
+                    );
+                } else if self.fs.remove(dir, &part_name).is_ok() {
+                    let _ = writeln!(err, "nfsc: put: removed partial remote file {part_label}");
+                }
+                return Err(e);
+            }
+        };
+        // Best effort, as for get: the data is complete either way.
+        let final_mode = SetAttr {
+            mode: Some(mode),
+            ..SetAttr::default()
+        };
+        if let Err(e) = self.fs.setattr(&fh, &final_mode) {
+            let _ = writeln!(err, "nfsc: put: cannot set the mode of {target}: {e}");
         }
-        self.tree = tree;
+        if !in_place && let Err(e) = self.fs.rename(dir, &part_name, dir, name) {
+            if !opts.resume {
+                let _ = self.fs.remove(dir, &part_name);
+            }
+            return Err(Error::Invalid(format!(
+                "cannot rename {part_label} to {label} on the server: {e}"
+            )));
+        }
+        let verified = verified
+            .map(|hex| format!(", verified {} {hex}", Algo::Sha256.name()))
+            .unwrap_or_default();
         writeln!(
             err,
-            "putting file {} as {label} ({}{})",
+            "putting file {} as {label} ({}{}{verified})",
             display_path(local),
             rate(sent - start, started.elapsed()),
             resumed_note(start, size)
         )
         .map_err(local_err)
+    }
+
+    /// [`Self::send`], hashing the data when `verify` is set (after the local
+    /// prefix a resume keeps) and then comparing it with a read of the remote
+    /// file. Returns the hex digest after a successful check.
+    #[allow(clippy::too_many_arguments)]
+    fn send_verified(
+        &mut self,
+        label: &str,
+        fh: &FileHandle,
+        file: &mut File,
+        local: &Path,
+        start: u64,
+        size: u64,
+        verify: bool,
+        sent: &mut u64,
+    ) -> std::result::Result<Option<String>, Failed> {
+        let mut hasher = verify.then(|| Algo::Sha256.hasher());
+        if let Some(h) = hasher.as_mut()
+            && start > 0
+        {
+            hash_local(file, local, start, h, &self.interrupt).map_err(Failed::Transfer)?;
+        }
+        self.send(label, fh, file, start, size, hasher.as_mut(), sent)
+            .map_err(Failed::Transfer)?;
+        let Some(hasher) = hasher else {
+            return Ok(None);
+        };
+        let ours = hasher.hex();
+        let remote = self
+            .remote_digest(&format!("{label} (verify)"), fh, size, None, Algo::Sha256)
+            .map_err(Failed::Transfer)?;
+        if remote != ours {
+            return Err(Failed::Mismatch(Error::Invalid(format!(
+                "verification failed: the remote file (sha256 {remote}) differs from \
+                 the uploaded data (sha256 {ours})"
+            ))));
+        }
+        Ok(Some(ours))
+    }
+
+    /// Writes `file` from `start` to the remote `fh` until the local file
+    /// ends, with a progress meter sized for `size`. `sent` ends at the
+    /// offset reached, also on failure.
+    #[allow(clippy::too_many_arguments)]
+    fn send(
+        &mut self,
+        label: &str,
+        fh: &FileHandle,
+        file: &mut File,
+        start: u64,
+        size: u64,
+        mut hasher: Option<&mut Hasher>,
+        sent: &mut u64,
+    ) -> Result<()> {
+        *sent = start;
+        let mut tree = self.tree.take();
+        let mut meter = Meter::new(self.progress, label, size, start, tree.as_mut());
+        let result = if start >= size {
+            Ok(())
+        } else if let Err(e) = file.seek(SeekFrom::Start(start)) {
+            Err(local_err(e))
+        } else {
+            let flag = Arc::clone(&self.interrupt);
+            let mut done = start;
+            let result = self
+                .fs
+                .write_stream(fh, start, &mut |buf: &mut [u8]| -> Result<usize> {
+                    interrupt::check(&flag)?;
+                    let n = file.read(buf).map_err(local_err)?;
+                    if let Some(h) = hasher.as_deref_mut() {
+                        h.update(&buf[..n]);
+                    }
+                    done += n as u64;
+                    meter.tick(done);
+                    Ok(n)
+                });
+            *sent = done;
+            result.map(|_| ())
+        };
+        meter.finish(result.is_ok());
+        self.tree = tree;
+        result
     }
 
     /// Uploads a local directory tree. Symlinks and special files are skipped,
@@ -1445,7 +1793,11 @@ impl Session {
                 .map_err(local_err),
             };
             if let Err(e) = result {
-                if !opts.keep_going || interrupt::is_interrupt(&e) {
+                if interrupt::is_interrupt(&e) {
+                    return Err(e);
+                }
+                if !opts.keep_going {
+                    self.tree_failed_at.get_or_insert(path);
                     return Err(e);
                 }
                 let what = format!("{}: {}", display_path(&path), display_str(&e.to_string()));

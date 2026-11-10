@@ -18,9 +18,10 @@ macro_rules! shell_summary {
         "  ls [-l] [path]               list (alias dir); * ? match in the last component
   cd [path] | pwd | lcd [path] remote cwd (/ is the export root) | local cwd
   stat path.. | cat path       attributes | file to stdout
-  get [-rcknV] remote.. [loc]  download (-r tree, -c resume, -k keep going,
-                               -n no clobber, -V verify; local - is stdout)
-  put [-rckn] local.. [remote] upload (flags as get; local globs expand)
+  get [-rcknpV] remote.. [loc] download (-r tree, -c resume, -k keep going,
+                               -n no clobber, -p keep mode, -V verify;
+                               local - is stdout)
+  put [-rcknV] local.. [rmt]   upload (flags as get, no -p; local globs expand)
   sum [-a alg] path..          sha256 (or sha512) checksums, like sha256sum
   mkdir rm rmdir mv ln [-s]    change the tree (rm -r: a whole tree)
   chmod mode path.. | chown uid[:gid] path.. | df [path] | du [-sh] [path..]
@@ -64,6 +65,8 @@ use crate::cli::{self, CmdError, Globals, ShellArgs};
 use crate::target;
 use complete::ShellHelper;
 use session::{Flow, Session, check_command};
+
+pub(crate) use progress::status_line;
 
 /// Exit status after Ctrl-C (128 + SIGINT), as shells report it.
 const EXIT_INTERRUPTED: u8 = 130;

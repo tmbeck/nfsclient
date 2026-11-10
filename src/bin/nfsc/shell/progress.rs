@@ -16,8 +16,15 @@
 //! Bars are only drawn when stderr is a terminal (`Session::progress`).
 //! Text written to stderr during a recursive transfer goes through
 //! [`LineWriter`], which pauses the bars for each whole line.
+//!
+//! Messages that do not come through the session's writers (retry notices
+//! from the RPC layer) use [`status_line`]: while bars are drawn, it prints
+//! the line above them through the active [`MultiProgress`]; otherwise it is
+//! a plain line on stderr, as in a cron log.
 
 use std::io::{self, Write};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -53,6 +60,51 @@ pub(super) fn style() -> ProgressStyle {
         .progress_chars(chars)
 }
 
+/// The progress displays currently drawing, innermost last.
+static ACTIVE: Mutex<Vec<(u64, MultiProgress)>> = Mutex::new(Vec::new());
+
+/// Keeps a [`MultiProgress`] in the [`ACTIVE`] registry while alive.
+pub(super) struct Registered(u64);
+
+impl Registered {
+    fn new(multi: &MultiProgress) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut active) = ACTIVE.lock() {
+            active.push((id, multi.clone()));
+        }
+        Registered(id)
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE.lock() {
+            active.retain(|(id, _)| *id != self.0);
+        }
+    }
+}
+
+/// The innermost progress display that is drawn, if any.
+fn active_display() -> Option<MultiProgress> {
+    let active = ACTIVE.lock().ok()?;
+    active
+        .iter()
+        .rev()
+        .map(|(_, m)| m)
+        .find(|m| !m.is_hidden())
+        .cloned()
+}
+
+/// Prints `line` on stderr without tearing through progress bars: with a bar
+/// on screen it is printed above the bars, otherwise as a plain line.
+pub(crate) fn status_line(line: &str) {
+    match active_display() {
+        Some(multi) => multi.suspend(|| eprintln!("{line}")),
+        None => eprintln!("{line}"),
+    }
+}
+
 fn new_bar(len: u64, start: u64, label: &str) -> ProgressBar {
     let bar = ProgressBar::hidden();
     bar.set_style(style());
@@ -68,6 +120,7 @@ fn new_bar(len: u64, start: u64, label: &str) -> ProgressBar {
 /// one `get -r` / `put -r`; each file's [`Meter`] borrows it.
 pub(super) struct TreeProgress {
     multi: MultiProgress,
+    _registered: Registered,
     /// The totals bar, present when a pre-scan sized the tree.
     total: Option<ProgressBar>,
     /// Files found by the pre-scan.
@@ -96,6 +149,7 @@ impl TreeProgress {
             bar
         });
         TreeProgress {
+            _registered: Registered::new(&multi),
             multi,
             total,
             files: totals.map_or(0, |t| t.0),
@@ -148,6 +202,8 @@ impl TreeProgress {
 /// The progress display for one file transfer.
 pub(super) struct Meter<'t> {
     bar: Option<ProgressBar>,
+    /// A bar of its own (outside a tree), registered for [`status_line`].
+    own: Option<(MultiProgress, Registered)>,
     /// Size of the whole file and the offset the transfer started from.
     total: u64,
     start: u64,
@@ -164,6 +220,7 @@ impl<'t> Meter<'t> {
         start: u64,
         tree: Option<&'t mut TreeProgress>,
     ) -> Self {
+        let mut own = None;
         let bar = (progress && total >= PROGRESS_MIN).then(|| {
             let bar = new_bar(total, start, label);
             match tree
@@ -173,7 +230,10 @@ impl<'t> Meter<'t> {
                 // Above the totals bar.
                 Some((t, totals)) => t.multi.insert_before(totals, bar),
                 None => {
-                    bar.set_draw_target(ProgressDrawTarget::stderr());
+                    let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+                    let bar = multi.add(bar);
+                    let registered = Registered::new(&multi);
+                    own = Some((multi, registered));
                     bar
                 }
             }
@@ -183,6 +243,7 @@ impl<'t> Meter<'t> {
         }
         Meter {
             bar,
+            own,
             total,
             start,
             done: start,
@@ -208,6 +269,9 @@ impl<'t> Meter<'t> {
             bar.finish_and_clear();
             if let Some(t) = self.tree.as_deref() {
                 t.multi.remove(bar);
+            }
+            if let Some((multi, _)) = &self.own {
+                multi.remove(bar);
             }
         }
         if let Some(t) = self.tree {
@@ -299,6 +363,16 @@ mod tests {
         let mut tree = TreeProgress::new(None);
         tree.files_done = 2;
         assert!(tree.finish("put").starts_with("put 2 files (0 B) in "));
+    }
+
+    #[test]
+    fn hidden_displays_are_not_used_for_status_lines() {
+        let tree = TreeProgress::new(None);
+        assert!(!ACTIVE.lock().unwrap().is_empty());
+        assert!(active_display().is_none(), "hidden displays are skipped");
+        drop(tree);
+        // With nothing drawn, status_line is a plain eprintln.
+        status_line("nfsc: test status line");
     }
 
     #[test]
