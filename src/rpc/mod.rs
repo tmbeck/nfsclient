@@ -281,8 +281,8 @@ pub fn fell_back_to_unprivileged() -> bool {
 
 /// Hint appended to permission errors when [`fell_back_to_unprivileged`] is true.
 pub const PRIVILEGED_PORT_HINT: &str = "the server may require a reserved source port \
-(exports marked 'secure'); run as root, grant CAP_NET_BIND_SERVICE \
-(setcap cap_net_bind_service=+ep), or use --port-mode priv";
+(exports marked 'secure'); run as root, or grant the program CAP_NET_BIND_SERVICE \
+(sudo setcap cap_net_bind_service=+ep <program>)";
 
 pub mod auth;
 pub mod message;

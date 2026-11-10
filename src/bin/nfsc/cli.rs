@@ -25,11 +25,13 @@ const MAX_GIDS: usize = 16;
     after_help = "\
 Global options (before or after the command):
   --uid N, --gid N, --gids N,..  AUTH_SYS identity [current user]
-  --port-mode auto|priv|unpriv   source port [auto]; 'secure' exports need a port
-                                 <1024: run as root or setcap cap_net_bind_service
+  --port-mode auto|priv|unpriv   source port [auto]; see 'Permission denied' below
   --proto tcp|udp                transport [tcp]; NFSv4 is TCP only
   --timeout SECS                 per-reply timeout [10]
   --nfs-port P, --mount-port P   skip portmap lookups
+
+Permission denied on 'secure' exports: the server wants a source port <1024.
+  sudo setcap cap_net_bind_service=+ep \"$(command -v nfsc)\"   (once per install)
 
 Exit status: 0 ok, 1 command failed, 2 usage error, 130 Ctrl-C.
 More: nfsc <command> --help"

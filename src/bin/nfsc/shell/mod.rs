@@ -30,6 +30,7 @@ pub const CLI_HELP: &str = concat!(
     "Commands (interactive, or ';'-separated in -c):\n",
     shell_summary!(),
     "\n\nInteractive: Tab completes; Ctrl-C stops a transfer; Ctrl-D exits.\n\
+     Permission denied? sudo setcap cap_net_bind_service=+ep \"$(command -v nfsc)\"\n\
      Exit status: 0 ok, 1 command failed, 130 Ctrl-C.\n\
      Example: nfsc shell nas:/srv -c 'cd vm; get -c disk.img'\n\
      More: 'help <cmd>' in the shell; global options: nfsc --help"

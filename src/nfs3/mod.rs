@@ -42,8 +42,7 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
             let hint = if client.is_privileged() {
                 "the export does not list this client address, or the path is not exported"
             } else {
-                "this client used an unprivileged source port; exports marked 'secure' require \
-                 a reserved port (run as root / with CAP_NET_BIND_SERVICE, or use --port-mode priv)"
+                crate::rpc::PRIVILEGED_PORT_HINT
             };
             return Err(Error::Invalid(format!(
                 "MOUNT of {} was refused (permission denied): {hint}",
