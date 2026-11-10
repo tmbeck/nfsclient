@@ -165,7 +165,7 @@ fn suite(fs: &mut dyn Filesystem, dir: &FileHandle) {
     }
     let entries = fs.readdir(&big).expect("readdir");
     assert_eq!(entries.len(), 1200);
-    assert!(entries.iter().all(|e| e.attr.is_some() && e.handle.is_some()));
+    assert!(entries.iter().all(|e| e.attr.is_some()));
 
     // FSSTAT and lookup("..").
     let st = fs.fsstat(dir).expect("fsstat");

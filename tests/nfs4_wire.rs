@@ -214,3 +214,20 @@ fn unset_setattr_is_empty() {
     assert!(f.is_empty());
     assert!(f.vals.is_empty());
 }
+
+/// Nothing listening on the NFS port: negotiation must see "version not offered"
+/// so the caller can fall back to another protocol version.
+#[test]
+fn connection_refused_is_version_unsupported() {
+    use nfsc::fs::{ConnectOptions, VersionPref};
+    use nfsc::rpc::RpcOptions;
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let opts = ConnectOptions {
+        rpc: RpcOptions::default(),
+        nfs_port: Some(port),
+        mount_port: None,
+        version: VersionPref::AnyV4,
+    };
+    let err = nfsc::nfs4::connect("127.0.0.1".parse().unwrap(), b"/", None, &opts).err().unwrap();
+    assert!(err.is_version_unsupported(), "got {err}");
+}

@@ -542,7 +542,7 @@ impl Filesystem for Nfs4Backend {
                     continue;
                 }
                 let handle = e.attrs.filehandle.clone().map(FileHandle);
-                let attr = if e.attrs.rdattr_error.is_none() { Some(to_fs_attr(&e.attrs)) } else { None };
+                let attr = if e.attrs.rdattr_error.unwrap_or(0) == 0 { Some(to_fs_attr(&e.attrs)) } else { None };
                 let fileid = e.attrs.fileid.unwrap_or(0);
                 if let Some(h) = &handle {
                     self.remember(h, dir, &e.name);

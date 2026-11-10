@@ -54,7 +54,11 @@ impl OpenCache {
         self.tick += 1;
         let mut to_close = Vec::new();
         if let Some(old) = self.entries.remove(&fh) {
-            to_close.push((fh.clone(), old.stateid));
+            // Re-opening the same file by the same owner returns the same open-state;
+            // closing the "old" stateid would close the new one as well.
+            if old.stateid.other != stateid.other {
+                to_close.push((fh.clone(), old.stateid));
+            }
         }
         if self.entries.len() >= OPEN_CACHE_CAP {
             let victim = self.entries.iter().min_by_key(|(_, e)| e.last).map(|(k, _)| k.clone());
