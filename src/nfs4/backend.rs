@@ -872,7 +872,14 @@ impl ReadIo for V4Reads<'_, '_> {
     }
 
     fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
-        self.be.read(self.fh, offset, count)
+        let policy = self.be.opts.retry.clone();
+        let r = pipeline::read_with_progress(&policy, offset, count, || {
+            self.be.read(self.fh, offset, count)
+        });
+        // Recovery (after a server restart) may have replaced the open state;
+        // later pipelined READs must not use a stale stateid.
+        self.stateid = self.be.stateid_for_io(self.fh, false);
+        r
     }
 }
 
@@ -902,6 +909,35 @@ impl WriteIo for V4Writes<'_, '_> {
     fn complete(&mut self, p: Pending) -> Result<WriteAck> {
         let res = self.be.complete_compound(p)?;
         match body(&res, 1)? {
+            Res::Write {
+                count,
+                committed,
+                verf,
+            } => Ok(WriteAck {
+                count: *count,
+                durable: *committed == FILE_SYNC4,
+                verf: *verf,
+            }),
+            _ => Err(xdr_err("WRITE")),
+        }
+    }
+
+    fn write_sync(&mut self, offset: u64, data: &[u8]) -> Result<WriteAck> {
+        let fh = self.fh;
+        let res = self.be.exec_stateid(fh, true, |sid| {
+            vec![
+                Op::Putfh(fh.0.clone()),
+                Op::Write {
+                    stateid: sid,
+                    offset,
+                    data: data.to_vec(),
+                    stable: UNSTABLE4,
+                },
+            ]
+        });
+        // As for reads: pick up open state re-established by recovery.
+        self.stateid = self.be.stateid_for_io(fh, true);
+        match body(&res?, 1)? {
             Res::Write {
                 count,
                 committed,

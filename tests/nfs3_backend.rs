@@ -7,8 +7,8 @@
 //! an unprivileged process may bind those ports; where namespaces are not
 //! available they print a note and pass.
 //!
-//! Tests for behavior that the RPC retry/backoff policy will add are
-//! `#[ignore = "needs retry policy (wave 2)"]`.
+//! Connections use a short retry budget ([`fast_retry`]) so fault tests that
+//! exhaust it finish quickly.
 
 #[path = "nfs3_backend/server.rs"]
 mod server;
@@ -22,7 +22,7 @@ use nfsc::fs::{
     ConnectOptions, Connected, CreateMode, FileHandle, FileType, Filesystem, NfsVersion, SetAttr,
     Status, VersionPref, connect,
 };
-use nfsc::rpc::{Auth, PortMode, Proto, RpcOptions};
+use nfsc::rpc::{Auth, PortMode, Proto, RetryPolicy, RpcOptions};
 
 use server::{
     COMMIT, Config, FSINFO, FakeNfs3, Fault, Fsinfo, GETATTR, MOUNT_PROG, NFS_PROG,
@@ -40,6 +40,17 @@ fn rpc(proto: Proto) -> RpcOptions {
         port_mode: PortMode::Unprivileged,
         timeout: Duration::from_secs(5),
         auth: Auth::None,
+        retry: fast_retry(),
+    }
+}
+
+/// Retries with a short budget and backoff, so fault tests run fast.
+fn fast_retry() -> RetryPolicy {
+    RetryPolicy {
+        budget: Duration::from_secs(8),
+        initial_backoff: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(500),
+        ..RetryPolicy::default()
     }
 }
 
@@ -55,6 +66,16 @@ fn opts(srv: &FakeNfs3, proto: Proto) -> ConnectOptions {
 
 fn mount(srv: &FakeNfs3, proto: Proto) -> Box<dyn Filesystem> {
     connect(LOCALHOST, b"/export", &opts(srv, proto))
+        .unwrap_or_else(|e| panic!("connect: {e}"))
+        .fs
+}
+
+/// [`mount`] with a retry budget of half a second, for faults that never
+/// clear (the client retries, then gives up).
+fn mount_short_budget(srv: &FakeNfs3) -> Box<dyn Filesystem> {
+    let mut o = opts(srv, Proto::Tcp);
+    o.rpc.retry.budget = Duration::from_millis(500);
+    connect(LOCALHOST, b"/export", &o)
         .unwrap_or_else(|e| panic!("connect: {e}"))
         .fs
 }
@@ -392,17 +413,15 @@ fn read_count_beyond_data_is_rejected() {
     );
 }
 
-/// read_stream to EOF (`len: None`, as `cat` and `get x -` use it) stops at
-/// a READ reply with no data and eof = false and returns Ok with however much
-/// it had: the caller gets a silently truncated file.
+/// read_stream to EOF (`len: None`, as `cat` and `get x -` use it) must not
+/// stop at a READ reply with no data and eof = false and return Ok with
+/// however much it had: that would be a silently truncated file.
 #[test]
-#[ignore = "BUG: read_stream(len=None) returns Ok(short) on an empty non-EOF READ reply \
-            (src/rpc/pipeline.rs:176-186, src/fs.rs:406-416)"]
 fn read_reply_with_no_data_and_no_eof_is_an_error_to_eof() {
     let size = MIB;
     let srv = start();
     let fh = srv.add_pattern_file("f", size, 6);
-    let mut fs = mount(&srv, Proto::Tcp);
+    let mut fs = mount_short_budget(&srv);
     let bad = 3 * 65536;
     srv.script(vec![
         Rule::nfs(READ, Fault::ShortRead(0)).when(move |c| c.offset == bad),
@@ -415,7 +434,7 @@ fn read_reply_with_no_data_and_no_eof_is_an_error_to_eof() {
 fn read_reply_with_no_data_and_no_eof_is_an_error_with_length() {
     let srv = start();
     let fh = srv.add_pattern_file("f", MIB, 6);
-    let mut fs = mount(&srv, Proto::Tcp);
+    let mut fs = mount_short_budget(&srv);
     let bad = 3 * 65536;
     srv.script(vec![
         Rule::nfs(READ, Fault::ShortRead(0)).when(move |c| c.offset == bad),
@@ -817,6 +836,7 @@ fn silent_server_times_out() {
     let srv = start();
     let mut o = opts(&srv, Proto::Tcp);
     o.rpc.timeout = Duration::from_millis(500);
+    o.rpc.retry = RetryPolicy::none();
     let mut fs = connect(LOCALHOST, b"/export", &o).unwrap().fs;
     srv.script(vec![Rule::nfs(GETATTR, Fault::Silent)]);
     let t = Instant::now();
@@ -827,10 +847,9 @@ fn silent_server_times_out() {
     assert!(t.elapsed() < Duration::from_secs(4));
 }
 
-// ------------------------------------------------- retry policy (wave 2)
+// --------------------------------------------------------- retry policy
 
 #[test]
-#[ignore = "needs retry policy (wave 2)"]
 fn jukebox_twice_then_ok_read_completes() {
     let size = 2 * MIB;
     let srv = start();
@@ -849,7 +868,6 @@ fn jukebox_twice_then_ok_read_completes() {
 }
 
 #[test]
-#[ignore = "needs retry policy (wave 2)"]
 fn jukebox_twice_then_ok_getattr() {
     let srv = start();
     let mut fs = mount(&srv, Proto::Tcp);
@@ -860,7 +878,6 @@ fn jukebox_twice_then_ok_getattr() {
 }
 
 #[test]
-#[ignore = "needs retry policy (wave 2)"]
 fn jukebox_during_write_stream_completes() {
     let srv = start();
     let mut fs = mount(&srv, Proto::Tcp);
@@ -879,7 +896,6 @@ fn jukebox_during_write_stream_completes() {
 }
 
 #[test]
-#[ignore = "needs retry policy (wave 2)"]
 fn server_restart_mid_transfer_completes() {
     let size = 4 * MIB;
     let srv = start();

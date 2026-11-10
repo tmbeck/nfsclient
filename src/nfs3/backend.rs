@@ -345,7 +345,10 @@ impl ReadIo for V3Reads<'_, '_> {
     }
 
     fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
-        self.fs.read(self.fh, offset, count)
+        let policy = self.fs.client.retry_policy().clone();
+        pipeline::read_with_progress(&policy, offset, count, || {
+            self.fs.read(self.fh, offset, count)
+        })
     }
 }
 
@@ -372,6 +375,25 @@ impl WriteIo for V3Writes<'_, '_> {
 
     fn complete(&mut self, xid: u32) -> Result<WriteAck> {
         let r: Reply<WriteOk> = self.fs.client.recv_reply(xid)?;
+        let w = r.0;
+        Ok(WriteAck {
+            count: w.count,
+            durable: w.committed == FILE_SYNC,
+            verf: w.verf,
+        })
+    }
+
+    fn write_sync(&mut self, offset: u64, data: &[u8]) -> Result<WriteAck> {
+        // WRITE at a fixed offset is retried under the policy (see `idempotent`).
+        let r: Reply<WriteOk> = self.fs.call(
+            proto::WRITE,
+            &WriteArgs {
+                fh: self.fh,
+                offset,
+                stable: UNSTABLE,
+                data,
+            },
+        )?;
         let w = r.0;
         Ok(WriteAck {
             count: w.count,
