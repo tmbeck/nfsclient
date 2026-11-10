@@ -38,6 +38,7 @@ pub const OP_DESTROY_CLIENTID: u32 = 57;
 pub const OP_RECLAIM_COMPLETE: u32 = 58;
 
 /// stable_how4 FILE_SYNC: data and metadata are on stable storage on return.
+pub const UNSTABLE4: u32 = 0;
 pub const FILE_SYNC4: u32 = 2;
 
 /// Channel attributes (channel_attrs4), used for both directions of a session.
@@ -136,7 +137,8 @@ pub enum Op {
     Setattr { stateid: StateId, attrs: Fattr },
     Readlink,
     Read { stateid: StateId, offset: u64, count: u32 },
-    Write { stateid: StateId, offset: u64, data: Vec<u8> },
+    /// `stable` is UNSTABLE4 or FILE_SYNC4.
+    Write { stateid: StateId, offset: u64, data: Vec<u8>, stable: u32 },
     Commit { offset: u64, count: u32 },
     Open(OpenArgs),
     OpenConfirm { stateid: StateId, seqid: u32 },
@@ -270,8 +272,8 @@ impl Pack for Op {
             Op::Read { stateid, offset, count } => {
                 e.put_u32(OP_READ).put(stateid).put_u64(*offset).put_u32(*count);
             }
-            Op::Write { stateid, offset, data } => {
-                e.put_u32(OP_WRITE).put(stateid).put_u64(*offset).put_u32(FILE_SYNC4).put_opaque(data);
+            Op::Write { stateid, offset, data, stable } => {
+                e.put_u32(OP_WRITE).put(stateid).put_u64(*offset).put_u32(*stable).put_opaque(data);
             }
             Op::Commit { offset, count } => {
                 e.put_u32(OP_COMMIT).put_u64(*offset).put_u32(*count);
@@ -350,7 +352,7 @@ pub enum Res {
     Fh(Vec<u8>),
     Attr(Box<AttrSet>),
     Read { eof: bool, data: Vec<u8> },
-    Write { count: u32, committed: u32 },
+    Write { count: u32, committed: u32, verf: [u8; 8] },
     Verf([u8; 8]),
     Readdir { verifier: [u8; 8], entries: Vec<DirEnt>, eof: bool },
     Readlink(Vec<u8>),
@@ -460,8 +462,8 @@ impl Unpack for ResOp {
             OP_WRITE => {
                 let count = d.get_u32()?;
                 let committed = d.get_u32()?;
-                let _verf = get_verf(d)?;
-                Res::Write { count, committed }
+                let verf = get_verf(d)?;
+                Res::Write { count, committed, verf }
             }
             OP_READDIR => {
                 let verifier = get_verf(d)?;

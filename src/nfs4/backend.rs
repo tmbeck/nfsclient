@@ -14,7 +14,8 @@ use crate::fs::{
 use crate::rpc::{RpcClient, RpcOptions};
 
 use super::compound::{CompoundArgs, CompoundRes, PROC_COMPOUND};
-use super::ops::{ChannelAttrs, Claim, CreateKind, Op, OpenHow, Res, ResOp, FILE_SYNC4, OP_CLOSE, OP_OPEN, OP_OPEN_CONFIRM};
+use super::ops::{ChannelAttrs, Claim, CreateKind, Op, OpenHow, Res, ResOp, FILE_SYNC4, OP_CLOSE, OP_OPEN, OP_OPEN_CONFIRM, UNSTABLE4};
+use crate::rpc::pipeline::{self, ReadIo, WriteAck, WriteIo, DEFAULT_WINDOW};
 use super::types::{
     attr, code, encode_setattr, Fattr, StateId, ANON_STATEID, BASIC_ATTRS, FSSTAT_ATTRS, OPEN4_SHARE_ACCESS_BOTH,
     READDIR_ATTRS,
@@ -30,6 +31,8 @@ pub(crate) const MAX_IO: u32 = 1024 * 1024;
 const CHAN_OVERHEAD: u32 = 1024;
 /// Largest channel size we request in CREATE_SESSION.
 pub(super) const CHAN_REQUEST: u32 = MAX_IO + 8192;
+/// Session slots requested in CREATE_SESSION (the server may grant fewer).
+pub(super) const MAX_SLOTS: u32 = 16;
 /// Callback program number we advertise; no callbacks are ever served.
 pub(super) const CB_PROGRAM: u32 = 0x4000_0000;
 /// How long to keep retrying NFS4ERR_GRACE.
@@ -39,13 +42,24 @@ const DEFAULT_LEASE: Duration = Duration::from_secs(90);
 /// Cap on remembered (parent, name) pairs used to open files by name in NFSv4.0.
 const NAME_CACHE_CAP: usize = 65_536;
 
-/// Session state (NFSv4.1+). Only slot 0 is used; requests are sequential.
+/// Session state (NFSv4.1+). Each slot carries one request at a time; blocking
+/// calls use a free slot, and pipelined transfers use several.
 pub(crate) struct Session {
     pub id: [u8; 16],
-    /// Sequence id to use for the next SEQUENCE on slot 0.
-    pub seq: u32,
+    /// Sequence id to use for the next SEQUENCE on each slot (index = slot id).
+    pub slot_seq: Vec<u32>,
+    /// Slots with a pipelined request whose reply has not been read yet.
+    pub busy: Vec<bool>,
     pub max_req: u32,
     pub max_resp: u32,
+}
+
+/// A COMPOUND sent by [`Nfs4Backend::issue_compound`] whose reply is still due.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Pending {
+    xid: u32,
+    /// Session slot the request was sequenced on (NFSv4.1+).
+    slot: Option<usize>,
 }
 
 pub(crate) struct Nfs4Backend {
@@ -169,25 +183,37 @@ impl Nfs4Backend {
     pub(super) fn send(&mut self, ops: Vec<Op>, sequenced: bool) -> Result<CompoundRes> {
         let use_seq = sequenced && self.minor >= 1;
         let mut all = Vec::with_capacity(ops.len() + 1);
+        let mut slot = None;
         if use_seq {
             let s = self
                 .session
                 .as_ref()
                 .ok_or_else(|| Error::Protocol("NFSv4.1 operation without a session".into()))?;
-            all.push(Op::Sequence { session: s.id, seqid: s.seq, slot: 0, highest: 0 });
+            let free = s
+                .busy
+                .iter()
+                .position(|b| !b)
+                .ok_or_else(|| Error::Protocol("no free session slot".into()))?;
+            all.push(Op::Sequence {
+                session: s.id,
+                seqid: s.slot_seq[free],
+                slot: free as u32,
+                highest: (s.busy.len() - 1) as u32,
+            });
+            slot = Some(free);
         }
         all.extend(ops);
         let args = CompoundArgs { minor: self.minor, ops: all };
         let res: CompoundRes = self.rpc.call(PROC_COMPOUND, &args)?;
         self.last_activity = Instant::now();
         let mut results = res.results;
-        if use_seq {
+        if let Some(free) = slot {
             let seq_ok = matches!(results.first(), Some(r) if r.status == code::OK);
             if !results.is_empty() {
                 results.remove(0);
             }
             if let Some(s) = self.session.as_mut().filter(|_| seq_ok) {
-                s.seq = s.seq.wrapping_add(1);
+                s.slot_seq[free] = next_seqid(s.slot_seq[free]);
             }
         }
         for r in &results {
@@ -196,6 +222,79 @@ impl Nfs4Backend {
             }
         }
         Ok(CompoundRes { status: res.status, results })
+    }
+
+    /// Send one COMPOUND without waiting for its reply (pipelining). On NFSv4.1+
+    /// the SEQUENCE is sent on a free session slot, which stays busy until
+    /// [`Nfs4Backend::complete_compound`] reads the reply.
+    pub(super) fn issue_compound(&mut self, ops: Vec<Op>) -> Result<Pending> {
+        let mut all = Vec::with_capacity(ops.len() + 1);
+        let mut slot = None;
+        if self.minor >= 1 {
+            let s = self
+                .session
+                .as_ref()
+                .ok_or_else(|| Error::Protocol("NFSv4.1 operation without a session".into()))?;
+            let free = s
+                .busy
+                .iter()
+                .position(|b| !b)
+                .ok_or_else(|| Error::Protocol("no free session slot".into()))?;
+            all.push(Op::Sequence {
+                session: s.id,
+                seqid: s.slot_seq[free],
+                slot: free as u32,
+                highest: (s.busy.len() - 1) as u32,
+            });
+            slot = Some(free);
+        }
+        all.extend(ops);
+        let args = CompoundArgs { minor: self.minor, ops: all };
+        let xid = self.rpc.send_call(PROC_COMPOUND, &args)?;
+        if let (Some(i), Some(s)) = (slot, self.session.as_mut()) {
+            s.busy[i] = true;
+        }
+        self.last_activity = Instant::now();
+        Ok(Pending { xid, slot })
+    }
+
+    /// Read the reply to a pipelined COMPOUND, free its slot, advance the slot's
+    /// seqid on success, and return the results (SEQUENCE stripped) or the
+    /// failing status.
+    pub(super) fn complete_compound(&mut self, p: Pending) -> Result<Vec<ResOp>> {
+        let reply = self.rpc.recv_reply::<CompoundRes>(p.xid);
+        if let (Some(i), Some(s)) = (p.slot, self.session.as_mut()) {
+            s.busy[i] = false;
+        }
+        let res = reply?;
+        self.last_activity = Instant::now();
+        let mut results = res.results;
+        if let Some(i) = p.slot {
+            let seq_ok = matches!(results.first(), Some(r) if r.status == code::OK);
+            if !results.is_empty() {
+                results.remove(0);
+            }
+            if let Some(s) = self.session.as_mut().filter(|_| seq_ok) {
+                s.slot_seq[i] = next_seqid(s.slot_seq[i]);
+            }
+        }
+        if res.status == code::OK {
+            Ok(results)
+        } else {
+            Err(self.status_err(res.status))
+        }
+    }
+
+    /// Pipelined requests in flight at once: the session's slot count (capped),
+    /// or the default window for NFSv4.0. One over UDP.
+    fn window(&self) -> usize {
+        if !self.rpc.pipelined() {
+            return 1;
+        }
+        match &self.session {
+            Some(s) if self.minor >= 1 => s.busy.len().min(DEFAULT_WINDOW),
+            _ => DEFAULT_WINDOW,
+        }
     }
 
     /// Run a sequenced compound with retry and recovery:
@@ -399,6 +498,82 @@ impl Drop for Nfs4Backend {
     }
 }
 
+/// Sequence id after `s` (never 0, which is reserved for "no request yet").
+fn next_seqid(s: u32) -> u32 {
+    match s.wrapping_add(1) {
+        0 => 1,
+        n => n,
+    }
+}
+
+/// READ pipeline: one COMPOUND per request, sequenced on a free slot (4.1+).
+struct V4Reads<'a, 'b> {
+    be: &'a mut Nfs4Backend,
+    fh: &'b FileHandle,
+    stateid: StateId,
+}
+
+impl ReadIo for V4Reads<'_, '_> {
+    type Tag = Pending;
+
+    fn issue(&mut self, offset: u64, count: u32) -> Result<Pending> {
+        let (fh, stateid) = (self.fh.0.clone(), self.stateid);
+        self.be.issue_compound(vec![Op::Putfh(fh), Op::Read { stateid, offset, count }])
+    }
+
+    fn complete(&mut self, p: Pending) -> Result<(Vec<u8>, bool)> {
+        let res = self.be.complete_compound(p)?;
+        match body(&res, 1)? {
+            Res::Read { eof, data } => Ok((data.clone(), *eof)),
+            _ => Err(xdr_err("READ")),
+        }
+    }
+
+    fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
+        self.be.read(self.fh, offset, count)
+    }
+}
+
+/// UNSTABLE WRITE pipeline; COMMIT goes through the normal blocking path.
+struct V4Writes<'a, 'b> {
+    be: &'a mut Nfs4Backend,
+    fh: &'b FileHandle,
+    stateid: StateId,
+}
+
+impl WriteIo for V4Writes<'_, '_> {
+    type Tag = Pending;
+
+    fn issue(&mut self, offset: u64, data: &[u8]) -> Result<Pending> {
+        let (fh, stateid) = (self.fh.0.clone(), self.stateid);
+        self.be.issue_compound(vec![
+            Op::Putfh(fh),
+            Op::Write { stateid, offset, data: data.to_vec(), stable: UNSTABLE4 },
+        ])
+    }
+
+    fn complete(&mut self, p: Pending) -> Result<WriteAck> {
+        let res = self.be.complete_compound(p)?;
+        match body(&res, 1)? {
+            Res::Write { count, committed, verf } => Ok(WriteAck {
+                count: *count,
+                durable: *committed == FILE_SYNC4,
+                verf: *verf,
+            }),
+            _ => Err(xdr_err("WRITE")),
+        }
+    }
+
+    fn commit(&mut self, offset: u64, count: u32) -> Result<[u8; 8]> {
+        let fh = self.fh.0.clone();
+        let res = self.be.exec(|_| vec![Op::Putfh(fh.clone()), Op::Commit { offset, count }])?;
+        match body(&res, 1)? {
+            Res::Verf(v) => Ok(*v),
+            _ => Err(xdr_err("COMMIT")),
+        }
+    }
+}
+
 /// Result body of op `i`, or an error if it is missing.
 pub(super) fn body(res: &[ResOp], i: usize) -> Result<&Res> {
     res.get(i)
@@ -587,16 +762,19 @@ impl Filesystem for Nfs4Backend {
             let chunk = &data[done..done + n];
             let off = offset + done as u64;
             let res = self.exec_stateid(fh, true, |sid| {
-                vec![Op::Putfh(fh.0.clone()), Op::Write { stateid: sid, offset: off, data: chunk.to_vec() }]
+                vec![
+                    Op::Putfh(fh.0.clone()),
+                    Op::Write { stateid: sid, offset: off, data: chunk.to_vec(), stable: FILE_SYNC4 },
+                ]
             })?;
             let (count, committed) = match body(&res, 1)? {
-                Res::Write { count, committed } => (*count as usize, *committed),
+                Res::Write { count, committed, .. } => (*count as usize, *committed),
                 _ => return Err(xdr_err("WRITE")),
             };
             let count = count.min(n);
             if committed != FILE_SYNC4 && count > 0 {
                 // Server buffered the data; make it durable.
-                self.exec(|_| vec![Op::Commit { offset: off, count: count as u32 }])?;
+                self.exec(|_| vec![Op::Putfh(fh.0.clone()), Op::Commit { offset: off, count: count as u32 }])?;
             }
             if count == 0 {
                 break;
@@ -604,6 +782,33 @@ impl Filesystem for Nfs4Backend {
             done += count;
         }
         Ok(done as u32)
+    }
+
+    fn read_stream(
+        &mut self,
+        fh: &FileHandle,
+        offset: u64,
+        len: Option<u64>,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        self.maybe_renew();
+        let stateid = self.stateid_for_io(fh, false);
+        let (chunk, window) = (self.max_read, self.window());
+        let mut io = V4Reads { be: self, fh, stateid };
+        pipeline::read_pipelined(&mut io, offset, len, chunk, window, sink)
+    }
+
+    fn write_stream(
+        &mut self,
+        fh: &FileHandle,
+        offset: u64,
+        source: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+    ) -> Result<u64> {
+        self.maybe_renew();
+        let stateid = self.stateid_for_io(fh, true);
+        let (chunk, window) = (self.max_write as usize, self.window());
+        let mut io = V4Writes { be: self, fh, stateid };
+        pipeline::write_pipelined(&mut io, offset, chunk, window, source)
     }
 
     fn create(
@@ -773,7 +978,7 @@ pub(super) fn fore_channel_request() -> ChannelAttrs {
         maxresponsesize: CHAN_REQUEST,
         maxresponsesize_cached: 8192,
         maxoperations: 32,
-        maxrequests: 4,
+        maxrequests: MAX_SLOTS,
     }
 }
 
@@ -785,6 +990,17 @@ pub(super) fn back_channel_request() -> ChannelAttrs {
         maxresponsesize_cached: 0,
         maxoperations: 2,
         maxrequests: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_seqid;
+
+    #[test]
+    fn seqids_advance_and_skip_zero() {
+        assert_eq!(next_seqid(1), 2);
+        assert_eq!(next_seqid(u32::MAX), 1);
     }
 }
 

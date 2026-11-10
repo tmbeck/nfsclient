@@ -199,12 +199,22 @@ fn stateid_roundtrip_and_anon() {
 
 #[test]
 fn write_args_use_file_sync() {
-    let op = Op::Write { stateid: StateId::default(), offset: 0x10, data: b"xyz".to_vec() };
+    let op = Op::Write { stateid: StateId::default(), offset: 0x10, data: b"xyz".to_vec(), stable: 2 };
     let b = to_bytes(&op);
     // opcode 38, stateid(16), offset(8), stable=2, opaque(3 + pad)
     assert_eq!(&b[..4], &words(&[38])[..]);
     assert_eq!(&b[4 + 16 + 8..4 + 16 + 8 + 4], &words(&[2])[..]);
     assert_eq!(&b[b.len() - 8..], &[0, 0, 0, 3, b'x', b'y', b'z', 0]);
+}
+
+#[test]
+fn unstable_write_args_encode_stable_how_zero() {
+    use nfsc::nfs4::ops::UNSTABLE4;
+    let op = Op::Write { stateid: StateId::default(), offset: 0x20, data: b"ab".to_vec(), stable: UNSTABLE4 };
+    let b = to_bytes(&op);
+    // opcode 38, stateid(16), offset(8), stable_how=0 (UNSTABLE4), opaque(2 + pad)
+    assert_eq!(&b[..4], &words(&[38])[..]);
+    assert_eq!(&b[4 + 16 + 8..4 + 16 + 8 + 4], &words(&[0])[..]);
 }
 
 #[test]

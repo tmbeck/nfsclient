@@ -4,7 +4,7 @@
 
 use crate::error::{Error, Result};
 
-use super::backend::{back_channel_request, body, fore_channel_request, Nfs4Backend, Session, CB_PROGRAM, CHAN_REQUEST};
+use super::backend::{back_channel_request, body, fore_channel_request, Nfs4Backend, Session, CB_PROGRAM, CHAN_REQUEST, MAX_SLOTS};
 use super::ops::{Op, Res};
 use super::types::code;
 
@@ -38,9 +38,12 @@ impl Nfs4Backend {
         };
         self.clientid = clientid;
         self.open_seqid = 0;
+        // The server grants at most `fore.maxrequests` slots; each starts at seqid 1.
+        let slots = fore.maxrequests.clamp(1, MAX_SLOTS) as usize;
         self.session = Some(Session {
             id,
-            seq: 1,
+            slot_seq: vec![1; slots],
+            busy: vec![false; slots],
             max_req: fore.maxrequestsize.min(CHAN_REQUEST),
             max_resp: fore.maxresponsesize.min(CHAN_REQUEST),
         });

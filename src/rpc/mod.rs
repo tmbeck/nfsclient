@@ -4,10 +4,11 @@
 //! against the items in this file. Signatures here are fixed; bodies are
 //! implemented in this module and its submodules.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::xdr::{Pack, Unpack};
 
 /// Transport protocol. Values match IPPROTO_* as used by portmap.
@@ -101,7 +102,14 @@ impl Default for RpcOptions {
 }
 
 /// A connected RPC client bound to one (program, version) on one server address.
-/// Not thread-safe; one outstanding call at a time.
+/// Not thread-safe.
+///
+/// Calls come in two styles. [`RpcClient::call`] is one synchronous round trip.
+/// [`RpcClient::send_call`] and [`RpcClient::recv_reply`] split it: several calls
+/// can be sent before their replies are read, and replies are matched by xid
+/// (out-of-order replies are buffered). Pipelining needs a TCP connection; over
+/// UDP `send_call` performs the round trip immediately, so the same code runs
+/// sequentially there.
 pub struct RpcClient {
     inner: transport::Transport,
     prog: u32,
@@ -109,6 +117,11 @@ pub struct RpcClient {
     auth: Auth,
     next_xid: u32,
     privileged: bool,
+    timeout: Duration,
+    /// Xids sent over TCP whose replies have not been read yet.
+    pending: HashSet<u32>,
+    /// Replies read ahead of their caller (out of order), keyed by xid.
+    ready: HashMap<u32, Vec<u8>>,
 }
 
 impl RpcClient {
@@ -124,18 +137,106 @@ impl RpcClient {
             auth: opts.auth.clone(),
             next_xid: transport::initial_xid(),
             privileged,
+            timeout: opts.timeout,
+            pending: HashSet::new(),
+            ready: HashMap::new(),
         })
     }
 
     /// Perform one call: encode `args`, send, wait for the matching xid, check
     /// reply/accept status, decode the result body as `R` (must consume it fully).
     pub fn call<A: Pack + ?Sized, R: Unpack>(&mut self, procedure: u32, args: &A) -> Result<R> {
+        let xid = self.send_call(procedure, args)?;
+        self.recv_reply(xid)
+    }
+
+    /// Send one call without waiting for its reply and return its xid. Pair it
+    /// with [`RpcClient::recv_reply`]. Over TCP, any number of calls may be
+    /// outstanding (the caller bounds the window). Over UDP the call completes
+    /// here, and its reply is held until `recv_reply`.
+    ///
+    /// If the connection fails, every outstanding call is lost: its
+    /// `recv_reply` returns an error.
+    pub fn send_call<A: Pack + ?Sized>(&mut self, procedure: u32, args: &A) -> Result<u32> {
         let xid = self.next_xid;
         self.next_xid = self.next_xid.wrapping_add(1);
         let msg = message::encode_call(xid, self.prog, self.vers, procedure, &self.auth, args);
-        let reply = self.inner.round_trip(xid, &msg)?;
+        match self.inner.proto() {
+            Proto::Udp => {
+                let reply = self.inner.round_trip(xid, &msg)?;
+                self.ready.insert(xid, reply);
+            }
+            Proto::Tcp => {
+                if let Err(e) = self.inner.send_record(&msg) {
+                    self.discard_outstanding();
+                    return Err(e);
+                }
+                self.pending.insert(xid);
+            }
+        }
+        Ok(xid)
+    }
+
+    /// Wait for the reply to a call sent with [`RpcClient::send_call`] and decode
+    /// it as `R`. Replies to other outstanding calls that arrive first are kept
+    /// for their own `recv_reply`. A reply that fails to decode fails only this
+    /// call.
+    pub fn recv_reply<R: Unpack>(&mut self, xid: u32) -> Result<R> {
+        let reply = self.take_reply(xid)?;
         let body = message::decode_reply(xid, &reply)?;
         crate::xdr::from_bytes(body)
+    }
+
+    /// Forget every outstanding call. Their replies, if they still arrive, are
+    /// discarded. Their `recv_reply` calls then fail. Callers that abandon
+    /// pipelined calls should wait for them first where the server state
+    /// requires it (see the NFSv4.1 slot rules in `nfs4`).
+    pub fn discard_outstanding(&mut self) {
+        self.pending.clear();
+        self.ready.clear();
+    }
+
+    /// Number of calls sent whose replies have not been received yet.
+    pub fn outstanding(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether more than one call can be in flight at a time (TCP).
+    pub fn pipelined(&self) -> bool {
+        self.inner.proto() == Proto::Tcp
+    }
+
+    fn take_reply(&mut self, xid: u32) -> Result<Vec<u8>> {
+        if let Some(reply) = self.ready.remove(&xid) {
+            return Ok(reply);
+        }
+        if !self.pending.contains(&xid) {
+            return Err(Error::Invalid(format!("no outstanding RPC call with xid {xid:#010x}")));
+        }
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let record = match self.inner.recv_record(deadline) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.discard_outstanding();
+                    return Err(e);
+                }
+            };
+            if record.len() < 4 {
+                self.inner.reset();
+                self.discard_outstanding();
+                return Err(Error::Protocol(format!("reply record of {} bytes", record.len())));
+            }
+            let got = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
+            if !self.pending.remove(&got) {
+                // A reply to a call we no longer track (for example after a timeout): drop it.
+                continue;
+            }
+            if got == xid {
+                return Ok(record);
+            }
+            self.ready.insert(got, record);
+        }
     }
 
     /// NULL procedure (proc 0): a ping.
@@ -167,5 +268,6 @@ impl RpcClient {
 }
 
 pub mod auth;
+pub(crate) mod pipeline;
 pub mod message;
 pub mod transport;
