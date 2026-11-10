@@ -246,9 +246,14 @@ impl Fallback {
     /// says more: the blocking read's when it is definitive (not retryable, so
     /// the backend's retries did not help and the server gave a real answer),
     /// otherwise the pipelined error that started it all.
+    ///
+    /// A blocking read that gave up after retrying ([`Error::GaveUp`]) or
+    /// was interrupted is definitive too: it says why the transfer ended.
     fn final_error(&mut self, sync: Error) -> Error {
+        let interrupted =
+            matches!(&sync, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted);
         match self.err.take() {
-            Some(first) if sync.is_retryable() => first,
+            Some(first) if sync.is_retryable() && !interrupted => first,
             _ => sync,
         }
     }
@@ -882,6 +887,7 @@ mod tests {
                 port_mode: PortMode::Unprivileged,
                 timeout: Duration::from_secs(5),
                 auth: Auth::None,
+                ..RpcOptions::default()
             };
             let mut io = RpcReads(RpcClient::connect(addr, PROG, 1, &opts).unwrap());
             let mut out = Vec::new();

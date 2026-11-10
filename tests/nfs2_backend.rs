@@ -23,6 +23,7 @@ fn rpc_opts(proto: Proto) -> RpcOptions {
         port_mode: PortMode::Unprivileged,
         timeout: Duration::from_secs(5),
         auth: Auth::None,
+        ..RpcOptions::default()
     }
 }
 
@@ -390,6 +391,7 @@ fn timeout_when_server_never_answers() {
     let srv = start();
     let mut opts = rpc_opts(Proto::Udp);
     opts.timeout = Duration::from_millis(1500);
+    opts.retry = nfsc::rpc::RetryPolicy::none();
     let mut fs =
         connect_with_root(IpAddr::V4(Ipv4Addr::LOCALHOST), srv.port, srv.root(), &opts).unwrap();
     // Drop more requests than the client will send in its window.

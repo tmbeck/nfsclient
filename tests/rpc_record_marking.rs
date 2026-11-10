@@ -97,6 +97,7 @@ fn client(addr: SocketAddr, timeout: Duration) -> RpcClient {
         port_mode: PortMode::Unprivileged,
         timeout,
         auth: Auth::None,
+        ..RpcOptions::default()
     };
     RpcClient::connect(addr, PROG, VERS, &opts).unwrap()
 }

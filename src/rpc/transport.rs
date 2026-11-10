@@ -217,6 +217,20 @@ impl Transport {
         }
     }
 
+    /// TCP: re-establish the stream if it was lost, without sending
+    /// anything, so a failure here means no call went out. UDP: no-op.
+    pub fn ensure_connected(&mut self) -> Result<()> {
+        let (addr, timeout, mode) = (self.addr, self.timeout, self.port_mode);
+        if let Conn::Tcp(slot @ None) = &mut self.conn {
+            // A reconnect may land on a different privilege level than the
+            // first connection; track the new socket's.
+            let (stream, privileged) = connect_tcp(addr, timeout, mode)?;
+            *slot = Some(stream);
+            self.privileged = privileged;
+        }
+        Ok(())
+    }
+
     /// TCP only: write one call record, reconnecting first if the stream was
     /// lost. Does not wait for a reply. Any failure drops the stream.
     pub fn send_record(&mut self, msg: &[u8]) -> Result<()> {

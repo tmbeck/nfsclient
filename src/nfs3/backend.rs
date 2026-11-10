@@ -187,13 +187,75 @@ fn page_from(verf: Verf, eof: bool, entries: Vec<DirEntry3>) -> Page {
     }
 }
 
+/// Procedure name for retry events and errors.
+pub(crate) fn proc_name(procedure: u32) -> &'static str {
+    match procedure {
+        proto::NULL => "NULL",
+        proto::GETATTR => "GETATTR",
+        proto::SETATTR => "SETATTR",
+        proto::LOOKUP => "LOOKUP",
+        proto::ACCESS => "ACCESS",
+        proto::READLINK => "READLINK",
+        proto::READ => "READ",
+        proto::WRITE => "WRITE",
+        proto::CREATE => "CREATE",
+        proto::MKDIR => "MKDIR",
+        proto::SYMLINK => "SYMLINK",
+        proto::REMOVE => "REMOVE",
+        proto::RMDIR => "RMDIR",
+        proto::RENAME => "RENAME",
+        proto::LINK => "LINK",
+        proto::READDIR => "READDIR",
+        proto::READDIRPLUS => "READDIRPLUS",
+        proto::FSSTAT => "FSSTAT",
+        proto::FSINFO => "FSINFO",
+        proto::PATHCONF => "PATHCONF",
+        proto::COMMIT => "COMMIT",
+        _ => "NFSv3 call",
+    }
+}
+
+/// Whether sending `procedure` twice has the same effect as sending it once,
+/// so it may be resent after a timeout or a lost connection.
+///
+/// WRITE counts as idempotent: it stores the same bytes at the same offset
+/// (UNSTABLE writes are additionally checked against the write verifier at
+/// COMMIT, which catches a server that lost them). SETATTR does not (a
+/// size or time change can race with other clients, and RFC 1813 guards it
+/// for that reason), nor do the namespace operations (CREATE, MKDIR,
+/// SYMLINK, MKNOD, REMOVE, RMDIR, RENAME, LINK): a repeat of an executed one
+/// fails with EXIST / NOENT although the first attempt worked. Those are
+/// only retried when the server certainly did not execute them
+/// (NFS3ERR_JUKEBOX, or no connection to send on); see
+/// [`RpcClient::call_retrying`].
+pub(crate) fn idempotent(procedure: u32) -> bool {
+    matches!(
+        procedure,
+        proto::NULL
+            | proto::GETATTR
+            | proto::LOOKUP
+            | proto::ACCESS
+            | proto::READLINK
+            | proto::READ
+            | proto::WRITE
+            | proto::READDIR
+            | proto::READDIRPLUS
+            | proto::FSSTAT
+            | proto::FSINFO
+            | proto::PATHCONF
+            | proto::COMMIT
+    )
+}
+
 impl Nfs3 {
+    /// One call under the connection's retry policy (see [`idempotent`]).
     fn call<A: Pack + ?Sized, R: crate::xdr::Unpack>(
         &mut self,
         procedure: u32,
         args: &A,
     ) -> Result<R> {
-        self.client.call(procedure, args)
+        self.client
+            .call_retrying(procedure, args, proc_name(procedure), idempotent(procedure))
     }
 
     /// The object created by CREATE/MKDIR/SYMLINK, with its attributes. The server
@@ -847,3 +909,7 @@ mod endless_listing_tests {
         assert!(calls <= RUNAWAY, "no entry cap: fake ran {calls} pages");
     }
 }
+
+#[cfg(test)]
+#[path = "retry_tests.rs"]
+mod retry_tests;
