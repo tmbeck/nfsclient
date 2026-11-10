@@ -201,6 +201,21 @@ fn rw_all_targets_all_minors() {
     for t in &ts {
         for minor in [0, 1, 2] {
             eprintln!("== {} NFSv4.{minor}", t.name);
+            // Not every server offers every minor (e.g. some kernels drop 4.0).
+            let opts = ConnectOptions {
+                rpc: RpcOptions { auth: Auth::sys_from_process(), ..RpcOptions::default() },
+                ..ConnectOptions::default()
+            };
+            match nfsc::nfs4::connect(t.ip, &t.path, Some(minor), &opts) {
+                Err(e) if e.is_version_unsupported() => {
+                    eprintln!("{} does not offer NFSv4.{minor}: {e}; skipping", t.name);
+                    continue;
+                }
+                Ok(mut c) => {
+                    let _ = c.fs.disconnect();
+                }
+                Err(_) => {} // let run_target report it
+            }
             run_target(t, minor);
         }
     }

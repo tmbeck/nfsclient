@@ -130,8 +130,9 @@ source port below 1024. A normal user cannot bind those ports.
 
 `--port-mode` controls this:
 
-- `auto` (default): try a reserved port, and fall back to an ephemeral port
-  with a warning if the bind is refused.
+- `auto` (default): try a reserved port, and silently fall back to an
+  ephemeral port if the bind is refused. If a server then denies access, the
+  error explains that a reserved port may be required.
 - `priv`: require a reserved port and fail otherwise.
 - `unpriv`: always use an ephemeral port.
 

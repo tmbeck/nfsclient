@@ -26,5 +26,16 @@ pub const VERSION: u32 = 4;
 /// Connect with the given minor version, or negotiate the highest supported
 /// (2, then 1, then 0) when `minor` is None. Walks `path` from PUTROOTFH.
 pub fn connect(host: IpAddr, path: &[u8], minor: Option<u32>, opts: &ConnectOptions) -> Result<Connected> {
-    backend::connect(host, path, minor, opts)
+    if opts.rpc.proto == crate::rpc::Proto::Udp {
+        // RFC 7530 section 3.1: NFSv4 requires a congestion-controlled transport.
+        return Err(crate::error::Error::VersionUnsupported("NFSv4 requires TCP".into()));
+    }
+    backend::connect(host, path, minor, opts).map_err(|e| match e {
+        crate::error::Error::Nfs(st @ (crate::fs::Status::Perm | crate::fs::Status::Access))
+            if crate::rpc::fell_back_to_unprivileged() =>
+        {
+            crate::error::Error::Invalid(format!("{st}: {}", crate::rpc::PRIVILEGED_PORT_HINT))
+        }
+        e => e,
+    })
 }

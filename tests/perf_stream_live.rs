@@ -374,9 +374,22 @@ fn bench_ro_read_sequential_vs_pipelined() {
             "4.2" => VersionPref::Exact(NfsVersion::V4(2)),
             other => panic!("unknown version {other}"),
         };
-        let (mut fs, _) = open(ip, export, version);
-        let root = fs.root();
-        let (fh, attr) = fs.lookup(&root, name).expect("lookup benchmark file");
+        let opts = ConnectOptions {
+            rpc: RpcOptions {
+                auth: Auth::sys_from_process(),
+                ..RpcOptions::default()
+            },
+            version,
+            ..ConnectOptions::default()
+        };
+        let c = connect(ip, export, &opts).expect("connect");
+        let mut fs = c.fs;
+        // The directory may lie below the export (v2/v3): walk the remainder.
+        let mut dir = fs.root();
+        for comp in &c.remainder {
+            dir = fs.lookup(&dir, comp).expect("lookup benchmark dir").0;
+        }
+        let (fh, attr) = fs.lookup(&dir, name).expect("lookup benchmark file");
         let len = mib.min(attr.size / (1024 * 1024)).max(1) * 1024 * 1024;
         let seq = time_read(fs.as_mut(), &fh, len, false);
         let pipe = time_read(fs.as_mut(), &fh, len, true);

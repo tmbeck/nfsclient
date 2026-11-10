@@ -31,17 +31,19 @@ const RESERVED_HI: u16 = 1023;
 
 const WARN_RESERVED: &str = "cannot bind a reserved port (need root or CAP_NET_BIND_SERVICE)";
 
-/// Set once the fallback warning has been printed.
-static WARNED: AtomicBool = AtomicBool::new(false);
+/// Set once any connection fell back from a reserved to an unprivileged port.
+static FELL_BACK: AtomicBool = AtomicBool::new(false);
 
-/// Print the unprivileged-fallback warning, at most once per process.
-fn warn_fallback(reason: &str) {
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "nfsc: warning: {reason}; using an unprivileged port, \
-             servers exporting with 'secure' may reject requests"
-        );
-    }
+/// Record the unprivileged fallback. Silent: most servers accept unprivileged
+/// ports, so callers add a hint only when a server actually refuses access
+/// (see [`super::fell_back_to_unprivileged`]).
+fn warn_fallback(_reason: &str) {
+    FELL_BACK.store(true, Ordering::Relaxed);
+}
+
+/// Whether any connection in this process fell back to an unprivileged port.
+pub fn fell_back() -> bool {
+    FELL_BACK.load(Ordering::Relaxed)
 }
 
 /// A random-ish starting xid, from the clock, pid and std's per-process hash seed.

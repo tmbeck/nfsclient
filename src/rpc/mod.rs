@@ -267,6 +267,18 @@ impl RpcClient {
     }
 }
 
+/// True if some connection in this process wanted a reserved source port
+/// (`PortMode::Auto`) but had to use an unprivileged one. Use it to explain
+/// permission errors from servers that export with `secure`.
+pub fn fell_back_to_unprivileged() -> bool {
+    transport::fell_back()
+}
+
+/// Hint appended to permission errors when [`fell_back_to_unprivileged`] is true.
+pub const PRIVILEGED_PORT_HINT: &str = "the server may require a reserved source port \
+(exports marked 'secure'); run as root, grant CAP_NET_BIND_SERVICE \
+(setcap cap_net_bind_service=+ep), or use --port-mode priv";
+
 pub mod auth;
 pub(crate) mod pipeline;
 pub mod message;
