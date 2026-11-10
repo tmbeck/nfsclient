@@ -11,7 +11,7 @@ pub mod types;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::error::{Error, Result};
-use crate::fs::{ConnectOptions, Connected};
+use crate::fs::{ConnectOptions, Connected, Status};
 use crate::mount;
 use crate::portmap;
 use crate::rpc::RpcClient;
@@ -36,7 +36,22 @@ pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Conne
     };
     let client = RpcClient::connect(SocketAddr::new(host, port), PROGRAM, VERSION, &opts.rpc)?;
 
-    let (root, flavors) = mount::mnt(host, opts.mount_port, 3, &export, &opts.rpc)?;
+    let (root, flavors) = match mount::mnt(host, opts.mount_port, 3, &export, &opts.rpc) {
+        Ok(v) => v,
+        Err(Error::Nfs(Status::Access)) => {
+            let hint = if client.is_privileged() {
+                "the export does not list this client address, or the path is not exported"
+            } else {
+                "this client used an unprivileged source port; exports marked 'secure' require \
+                 a reserved port (run as root / with CAP_NET_BIND_SERVICE, or use --port-mode priv)"
+            };
+            return Err(Error::Invalid(format!(
+                "MOUNT of {} was refused (permission denied): {hint}",
+                String::from_utf8_lossy(&export)
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     if let Err(e) = check_flavors(&flavors, &export) {
         let _ = mount::umnt(host, opts.mount_port, 3, &export, &opts.rpc);
         return Err(e);
