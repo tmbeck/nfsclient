@@ -372,6 +372,8 @@ pub trait Filesystem {
     /// comes first) to `sink`, in order, in chunks of any size. Returns the
     /// number of bytes delivered. An error from `sink` aborts the transfer and
     /// is returned. Backends may override this to keep several READs in flight.
+    /// With `len` given, a result shorter than `len` means the server reported
+    /// EOF; a reply with no data and no EOF is an error, not a short result.
     fn read_stream(
         &mut self,
         fh: &FileHandle,
@@ -398,7 +400,19 @@ pub trait Filesystem {
                 sink(&data)?;
                 pos += data.len() as u64;
             }
-            if eof || data.is_empty() {
+            if eof {
+                break;
+            }
+            if data.is_empty() {
+                // No data and no EOF: the server makes no progress. With a
+                // requested length, stopping here would return a silently
+                // short result, so it is an error.
+                if let Some(l) = len {
+                    return Err(crate::error::Error::Protocol(format!(
+                        "READ at {pos} returned no data before EOF ({} of {l} bytes read)",
+                        pos - offset
+                    )));
+                }
                 break;
             }
         }

@@ -11,9 +11,15 @@
 //!   write verifier at COMMIT differs from the one a write was acknowledged
 //!   under, the server lost that data and it is sent again. Retained data is
 //!   bounded by [`COMMIT_INTERVAL`] plus the window.
-//! - Any failed request ends the pipeline: outstanding replies are drained, and
-//!   READ continues with blocking reads (which carry the backend's retry and
-//!   session recovery). WRITE reports the error.
+//! - A failed READ request pauses the pipeline: outstanding replies are
+//!   drained and the transfer continues with blocking reads (which carry the
+//!   backend's retry and session recovery). After a few blocking reads succeed
+//!   the pipeline is tried again; each further failure doubles that count. If
+//!   a blocking read fails too, the transfer ends with an error.
+//! - A failed WRITE request ends the transfer with its error (there is no
+//!   blocking fallback for writes).
+//! - With a length given, READ never returns a silently short result: fewer
+//!   bytes than asked means the server reported EOF, otherwise it is an error.
 
 use std::collections::VecDeque;
 
@@ -25,6 +31,9 @@ pub const DEFAULT_WINDOW: usize = 8;
 pub const COMMIT_INTERVAL: u64 = 64 << 20;
 /// Consecutive COMMIT rounds that may end with a verifier mismatch before giving up.
 const MAX_COMMIT_ROUNDS: u32 = 8;
+/// Upper bound on the blocking READs done before pipelining is tried again
+/// (the count starts at 2 and doubles with each fallback in one transfer).
+const MAX_RECOVER_AFTER: u32 = 256;
 
 /// One READ request/reply pipeline on a backend.
 pub(crate) trait ReadIo {
@@ -70,6 +79,9 @@ pub(crate) struct WriteAck {
 /// to `window` READs of at most `chunk` bytes in flight. Returns the bytes
 /// delivered. A sink error stops the transfer after the outstanding replies are
 /// drained, and that error is returned.
+///
+/// When `len` is given, a return value below it means the server reported EOF.
+/// A reply with no data and no EOF before `len` is reached is an error.
 pub(crate) fn read_pipelined<I: ReadIo>(
     io: &mut I,
     offset: u64,
@@ -87,11 +99,10 @@ pub(crate) fn read_pipelined<I: ReadIo>(
     let mut next = offset;
     let mut inflight: VecDeque<(I::Tag, u64, u32)> = VecDeque::new();
     let mut issuing = true;
-    // Set after a pipelined request failed; the rest is read with blocking calls.
-    let mut fell_back = false;
+    let mut fb = Fallback::default();
 
     loop {
-        while issuing && !fell_back && inflight.len() < window {
+        while issuing && !fb.active && inflight.len() < window {
             let want = match end {
                 Some(e) if next >= e => {
                     issuing = false;
@@ -105,30 +116,32 @@ pub(crate) fn read_pipelined<I: ReadIo>(
                     inflight.push_back((tag, next, want));
                     next += u64::from(want);
                 }
-                Err(_) => {
-                    fell_back = true;
+                Err(e) => {
+                    fb.enter(e);
                     break;
                 }
             }
         }
 
-        let (data, eof, want, off) = if let Some((tag, off, want)) = inflight.pop_front() {
+        let (data, eof, want, off, synced) = if let Some((tag, off, want)) = inflight.pop_front() {
             match io.complete(tag) {
-                Ok((data, eof)) => (data, eof, want, off),
-                Err(_) => {
+                Ok((data, eof)) => (data, eof, want, off, false),
+                Err(e) => {
                     drain_reads(io, &mut inflight);
-                    fell_back = true;
+                    fb.enter(e);
                     continue;
                 }
             }
-        } else if fell_back {
+        } else if fb.active {
             let want = match end {
                 Some(e) if delivered >= e => break,
                 Some(e) => (e - delivered).min(u64::from(chunk)) as u32,
                 None => chunk,
             };
-            let (data, eof) = io.read_sync(delivered, want)?;
-            (data, eof, want, delivered)
+            match io.read_sync(delivered, want) {
+                Ok((data, eof)) => (data, eof, want, delivered, true),
+                Err(e) => return Err(fb.final_error(e)),
+            }
         } else {
             break;
         };
@@ -155,20 +168,90 @@ pub(crate) fn read_pipelined<I: ReadIo>(
         }
 
         let at_end = end.is_some_and(|e| delivered >= e);
-        if at_end || eof || data.is_empty() {
+        if at_end || eof {
             // Nothing past this point is wanted; outstanding replies are drained.
             drain_reads(io, &mut inflight);
             break;
         }
-        if data.len() < want as usize && !fell_back {
+        if data.is_empty() {
+            // No data and no EOF: the server makes no progress here.
+            drain_reads(io, &mut inflight);
+            if let Some(l) = len {
+                // Stopping would hand back a silently short result.
+                return Err(Error::Protocol(format!(
+                    "READ at {off} returned no data before EOF ({} of {l} bytes read)",
+                    delivered - offset
+                )));
+            }
+            break;
+        }
+        if synced {
+            if fb.sync_succeeded() {
+                // Blocking reads work again: resume pipelining where they left off.
+                next = delivered;
+                issuing = true;
+            }
+        } else if data.len() < want as usize {
             // Short read before EOF: refetch from the first missing byte. Requests
-            // already sent past the gap are drained and dropped.
+            // already sent past the gap are drained and dropped. (In fallback
+            // mode the blocking reads continue from `delivered`.)
             drain_reads(io, &mut inflight);
             next = delivered;
             issuing = true;
         }
     }
     Ok(delivered - offset)
+}
+
+/// Blocking-read fallback state for [`read_pipelined`].
+#[derive(Default)]
+struct Fallback {
+    /// A pipelined request failed; reads are blocking for now.
+    active: bool,
+    /// Blocking reads that must succeed in a row before pipelining resumes.
+    /// Doubles on every fallback within one transfer, so a pipeline that keeps
+    /// failing costs less and less.
+    recover_after: u32,
+    /// Blocking reads that succeeded since the fallback.
+    ok: u32,
+    /// The error that started the fallback.
+    err: Option<Error>,
+}
+
+impl Fallback {
+    /// A pipelined request failed with `e`.
+    fn enter(&mut self, e: Error) {
+        if !self.active {
+            self.active = true;
+            self.ok = 0;
+            self.recover_after = (self.recover_after.max(1) * 2).min(MAX_RECOVER_AFTER);
+        }
+        // Keep the first error: later ones are usually its consequences.
+        self.err.get_or_insert(e);
+    }
+
+    /// A blocking read delivered data. Returns true (and leaves fallback mode)
+    /// when enough have succeeded to try pipelining again.
+    fn sync_succeeded(&mut self) -> bool {
+        self.ok += 1;
+        if self.ok < self.recover_after {
+            return false;
+        }
+        self.active = false;
+        self.err = None;
+        true
+    }
+
+    /// The blocking read failed with `sync` as well. Return the error that
+    /// says more: the blocking read's when it is definitive (not retryable, so
+    /// the backend's retries did not help and the server gave a real answer),
+    /// otherwise the pipelined error that started it all.
+    fn final_error(&mut self, sync: Error) -> Error {
+        match self.err.take() {
+            Some(first) if sync.is_retryable() => first,
+            _ => sync,
+        }
+    }
 }
 
 /// Wait for every outstanding READ and discard its reply.
@@ -373,6 +456,16 @@ mod tests {
         fail_complete_at: Option<usize>,
         issued: usize,
         sync_calls: usize,
+        /// Fail every n-th pipelined reply (by tag).
+        fail_complete_every: usize,
+        /// The error a failing `issue`/`complete` returns.
+        pipe_err: fn() -> Error,
+        /// When set, every blocking read fails with this error.
+        sync_err: Option<fn() -> Error>,
+        /// A READ at this offset returns no data and no EOF.
+        stall_at: Option<u64>,
+        /// Requests issued (pipelined) after the first blocking read.
+        issued_after_sync: usize,
     }
 
     impl FakeReads {
@@ -388,11 +481,19 @@ mod tests {
                 fail_complete_at: None,
                 issued: 0,
                 sync_calls: 0,
+                fail_complete_every: 0,
+                pipe_err: || Error::Timeout,
+                sync_err: None,
+                stall_at: None,
+                issued_after_sync: 0,
             }
         }
 
         fn serve(&mut self, offset: u64, count: u32) -> (Vec<u8>, bool) {
             self.served += 1;
+            if self.stall_at == Some(offset) {
+                return (Vec::new(), false);
+            }
             let size = self.data.len() as u64;
             let start = offset.min(size) as usize;
             let mut n = (count as usize).min(self.data.len() - start);
@@ -410,8 +511,11 @@ mod tests {
 
         fn issue(&mut self, offset: u64, count: u32) -> Result<usize> {
             self.issued += 1;
+            if self.sync_calls > 0 {
+                self.issued_after_sync += 1;
+            }
             if self.fail_issue_at == Some(self.issued) {
-                return Err(Error::Timeout);
+                return Err((self.pipe_err)());
             }
             let tag = self.next_tag;
             self.next_tag += 1;
@@ -423,14 +527,20 @@ mod tests {
         fn complete(&mut self, tag: usize) -> Result<(Vec<u8>, bool)> {
             let (offset, count, t) = self.pending.pop_front().expect("reply without request");
             assert_eq!(t, tag, "replies must come back in request order here");
-            if self.fail_complete_at == Some(t + 1) {
-                return Err(Error::Timeout);
+            if self.fail_complete_at == Some(t + 1)
+                || (self.fail_complete_every > 0
+                    && (t + 1).is_multiple_of(self.fail_complete_every))
+            {
+                return Err((self.pipe_err)());
             }
             Ok(self.serve(offset, count))
         }
 
         fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
             self.sync_calls += 1;
+            if let Some(err) = self.sync_err {
+                return Err(err());
+            }
             Ok(self.serve(offset, count))
         }
     }
@@ -561,6 +671,265 @@ mod tests {
         let (r, out) = run_read(&mut fake, 0, Some(9_000), 1000, 8);
         assert_eq!(r.unwrap(), 9_000);
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn pipelining_resumes_after_a_fallback() {
+        let data = pattern(100_000);
+        let mut fake = FakeReads::new(data.clone());
+        fake.fail_complete_at = Some(4);
+        let (r, out) = run_read(&mut fake, 0, None, 1000, 8);
+        assert_eq!(r.unwrap(), data.len() as u64);
+        assert_eq!(out, data);
+        // Two blocking reads, then the rest is pipelined again (not ~96 blocking reads).
+        assert_eq!(fake.sync_calls, 2);
+        assert!(fake.issued_after_sync > 50, "{}", fake.issued_after_sync);
+    }
+
+    #[test]
+    fn repeated_pipeline_failures_back_off_and_still_complete() {
+        let data = pattern(300_000);
+        let mut fake = FakeReads::new(data.clone());
+        fake.fail_complete_every = 7;
+        let (r, out) = run_read(&mut fake, 0, Some(300_000), 1000, 8);
+        assert_eq!(r.unwrap(), data.len() as u64);
+        assert_eq!(out, data);
+        // Fallback lengths double (2, 4, 8, ...), so most chunks are still pipelined
+        // at first and blocking reads dominate only once failures keep recurring.
+        assert!(fake.sync_calls < 300, "{}", fake.sync_calls);
+        assert!(fake.issued_after_sync > 0);
+    }
+
+    #[test]
+    fn short_pipelined_reply_during_fallback_is_refetched() {
+        // An issue fails while earlier requests are in flight; one of those replies
+        // is short. The gap must be read, not reported as an offset mismatch.
+        let data = pattern(20_000);
+        let mut fake = FakeReads::new(data.clone());
+        fake.fail_issue_at = Some(5);
+        fake.short_every = 2;
+        let (r, out) = run_read(&mut fake, 0, Some(20_000), 1000, 8);
+        assert_eq!(r.unwrap(), 20_000);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn original_error_is_kept_when_fallback_fails_transiently() {
+        let mut fake = FakeReads::new(pattern(20_000));
+        fake.fail_complete_at = Some(2);
+        fake.pipe_err = || Error::Nfs(crate::fs::Status::Stale);
+        fake.sync_err = Some(|| Error::Timeout);
+        let (r, out) = run_read(&mut fake, 0, Some(20_000), 1000, 8);
+        assert!(
+            matches!(r, Err(Error::Nfs(crate::fs::Status::Stale))),
+            "{r:?}"
+        );
+        assert_eq!(out, pattern(1000), "only the first chunk was delivered");
+    }
+
+    #[test]
+    fn definitive_fallback_error_wins() {
+        let mut fake = FakeReads::new(pattern(20_000));
+        fake.fail_complete_at = Some(1);
+        fake.pipe_err = || Error::Timeout;
+        fake.sync_err = Some(|| Error::Nfs(crate::fs::Status::Access));
+        let (r, _) = run_read(&mut fake, 0, None, 1000, 8);
+        assert!(
+            matches!(r, Err(Error::Nfs(crate::fs::Status::Access))),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn empty_reply_before_eof_with_length_is_an_error() {
+        let data = pattern(10_000);
+        for window in [1usize, 8] {
+            let mut fake = FakeReads::new(data.clone());
+            fake.stall_at = Some(4000);
+            let (r, out) = run_read(&mut fake, 0, Some(10_000), 1000, window);
+            assert!(
+                matches!(r, Err(Error::Protocol(_))),
+                "window {window}: {r:?}"
+            );
+            assert_eq!(out, data[..4000], "window {window}");
+            assert!(fake.pending.is_empty());
+        }
+        // Without a length the stream just ends there (unchanged behaviour).
+        let mut fake = FakeReads::new(data.clone());
+        fake.stall_at = Some(4000);
+        let (r, _) = run_read(&mut fake, 0, None, 1000, 8);
+        assert_eq!(r.unwrap(), 4000);
+    }
+
+    /// READ over a real RPC client against a loopback TCP server that drops
+    /// connections. Procedure 1 takes (offset u64, count u32) and returns
+    /// (opaque data, bool eof).
+    mod loopback {
+        use super::super::*;
+        use super::pattern;
+        use crate::rpc::{Auth, PortMode, Proto, RpcClient, RpcOptions};
+        use crate::xdr::Opaque;
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        const PROG: u32 = 0x2000_0042;
+
+        fn be32(b: &[u8], off: usize) -> u32 {
+            u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
+        }
+
+        fn read_record(s: &mut TcpStream) -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            loop {
+                let mut hdr = [0u8; 4];
+                s.read_exact(&mut hdr).ok()?;
+                let w = u32::from_be_bytes(hdr);
+                let mut frag = vec![0u8; (w & 0x7fff_ffff) as usize];
+                s.read_exact(&mut frag).ok()?;
+                out.extend_from_slice(&frag);
+                if w & 0x8000_0000 != 0 {
+                    return Some(out);
+                }
+            }
+        }
+
+        fn answer(file: &[u8], call: &[u8]) -> Vec<u8> {
+            let xid = be32(call, 0);
+            let mut off = 24;
+            for _ in 0..2 {
+                off += 4;
+                off += 4 + (be32(call, off) as usize).div_ceil(4) * 4;
+            }
+            let offset = u64::from_be_bytes(call[off..off + 8].try_into().unwrap()) as usize;
+            let count = be32(call, off + 8) as usize;
+            let start = offset.min(file.len());
+            let end = (start + count).min(file.len());
+            let mut e = crate::xdr::Encoder::new();
+            e.put_u32(xid).put_u32(1).put_u32(0).put_u32(0).put_u32(0);
+            e.put_u32(0);
+            e.put_opaque(&file[start..end]).put_bool(end >= file.len());
+            let body = e.as_bytes();
+            let mut rec = (0x8000_0000u32 | body.len() as u32).to_be_bytes().to_vec();
+            rec.extend_from_slice(body);
+            rec
+        }
+
+        /// Serve `file`. Connection `i` answers `limit(i)` calls (None: all) and
+        /// then closes. At most `max_conns` connections are accepted.
+        fn spawn(
+            file: Arc<Vec<u8>>,
+            limit: fn(usize) -> Option<usize>,
+            max_conns: usize,
+        ) -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            thread::spawn(move || {
+                for i in 0..max_conns {
+                    let Ok((mut s, _)) = listener.accept() else {
+                        return;
+                    };
+                    let file = Arc::clone(&file);
+                    thread::spawn(move || {
+                        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+                        let mut answered = 0;
+                        while limit(i).is_none_or(|l| answered < l) {
+                            let Some(call) = read_record(&mut s) else {
+                                return;
+                            };
+                            if s.write_all(&answer(&file, &call)).is_err() {
+                                return;
+                            }
+                            answered += 1;
+                        }
+                        // Drop the stream with calls possibly still unread.
+                    });
+                }
+                // The listener closes here: further connects are refused.
+            });
+            addr
+        }
+
+        struct RpcReads(RpcClient);
+
+        impl ReadIo for RpcReads {
+            type Tag = u32;
+            fn issue(&mut self, offset: u64, count: u32) -> Result<u32> {
+                self.0.send_call(1, &(offset, count))
+            }
+            fn complete(&mut self, xid: u32) -> Result<(Vec<u8>, bool)> {
+                let (Opaque(d), eof): (Opaque, bool) = self.0.recv_reply(xid)?;
+                Ok((d, eof))
+            }
+            fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
+                // One retry on a transient error, like the backends' blocking READ.
+                let mut once = || -> Result<(Vec<u8>, bool)> {
+                    let (Opaque(d), eof): (Opaque, bool) = self.0.call(1, &(offset, count))?;
+                    Ok((d, eof))
+                };
+                match once() {
+                    Err(e) if e.is_retryable() => once(),
+                    r => r,
+                }
+            }
+        }
+
+        fn run(addr: SocketAddr, len: usize) -> (Result<u64>, Vec<u8>) {
+            let opts = RpcOptions {
+                proto: Proto::Tcp,
+                port_mode: PortMode::Unprivileged,
+                timeout: Duration::from_secs(5),
+                auth: Auth::None,
+            };
+            let mut io = RpcReads(RpcClient::connect(addr, PROG, 1, &opts).unwrap());
+            let mut out = Vec::new();
+            let r = read_pipelined(&mut io, 0, Some(len as u64), 4096, 8, &mut |b: &[u8]| {
+                out.extend_from_slice(b);
+                Ok(())
+            });
+            (r, out)
+        }
+
+        #[test]
+        fn connection_drop_mid_transfer_recovers_with_correct_data() {
+            let file = Arc::new(pattern(200_000));
+            let addr = spawn(Arc::clone(&file), |i| (i == 0).then_some(10), 16);
+            let (r, out) = run(addr, file.len());
+            assert_eq!(r.unwrap(), file.len() as u64);
+            assert_eq!(out, *file);
+        }
+
+        #[test]
+        fn flapping_connection_gives_correct_data_or_a_clear_error() {
+            let file = Arc::new(pattern(200_000));
+            let addr = spawn(Arc::clone(&file), |_| Some(5), 1000);
+            let (r, out) = run(addr, file.len());
+            match r {
+                Ok(n) => {
+                    assert_eq!(n, file.len() as u64, "never a silently short result");
+                    assert_eq!(out, *file);
+                }
+                Err(e) => {
+                    assert!(e.is_retryable(), "a connection-level error: {e:?}");
+                    assert!(out.len() < file.len());
+                    assert_eq!(out, file[..out.len()], "delivered data is a correct prefix");
+                }
+            }
+        }
+
+        #[test]
+        fn server_gone_mid_transfer_is_an_error_not_short_data() {
+            let file = Arc::new(pattern(200_000));
+            // One connection that answers 10 calls; then nothing listens.
+            let addr = spawn(Arc::clone(&file), |_| Some(10), 1);
+            let (r, out) = run(addr, file.len());
+            let e = r.expect_err("the transfer cannot complete");
+            assert!(e.is_retryable(), "{e:?}");
+            assert!(out.len() < file.len());
+            assert_eq!(out, file[..out.len()]);
+        }
     }
 
     /// In-memory WRITE server with a volatile cache that a reboot discards.
