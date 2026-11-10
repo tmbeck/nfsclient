@@ -9,7 +9,14 @@ mount -t tmpfs -o mode=1777,size=512m tmpfs /export/rw
 mount -t tmpfs -o mode=0755,size=64m tmpfs /export/ro
 sh /usr/local/share/nfsc-testenv/fixtures.sh /export/ro
 
-mkdir -p /var/lib/nfs/v4recovery /var/lib/nfs/rpc_pipefs /run/rpcbind
+# NFSv4 pseudo-root (fsid=0) on tmpfs; overlayfs "/" is not exportable.
+mkdir -p /srv/nfsroot
+mount -t tmpfs -o mode=0755,size=1m tmpfs /srv/nfsroot
+mkdir -p /srv/nfsroot/export/rw /srv/nfsroot/export/ro
+mount --bind /export/rw /srv/nfsroot/export/rw
+mount --bind /export/ro /srv/nfsroot/export/ro
+
+mkdir -p /var/lib/nfs/v4recovery /var/lib/nfs/nfsdcld /var/lib/nfs/rpc_pipefs /run/rpcbind
 mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs 2>/dev/null || true
 mount -t nfsd nfsd /proc/fs/nfsd
 
@@ -23,6 +30,9 @@ log "nfsd versions: $(cat /proc/fs/nfsd/versions)"
 rpcbind -w
 exportfs -ra
 rpc.mountd
+# NFSv4 client tracking: without nfsdcld recent kernels log -110 and may
+# misbehave. Best effort; nfsd falls back to other trackers if it is absent.
+[ -x /usr/sbin/nfsdcld ] && { /usr/sbin/nfsdcld || log "nfsdcld failed to start"; }
 # Start nfsd with rpc.nfsd rather than writing portlist/threads directly:
 # recent kernels (seen on 7.2) no longer register NFS with the portmapper
 # when nfsd is started through /proc, and rpc.nfsd does the registration.
