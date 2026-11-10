@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Retry policy (`RpcOptions::retry`, `RetryPolicy`): failed calls are
+  retried with jittered exponential backoff for up to 5 minutes per
+  operation (`--retry-time SECS`, `NFSC_RETRY_TIME`; 0 disables). Covers
+  refused or dropped connections (nfsd/NAS restart), timeouts, NFSv3
+  JUKEBOX and NFSv4 DELAY/GRACE, and NFSv4 session/clientid recovery.
+  Idempotent calls retry on any transient error; non-idempotent ones
+  (CREATE, REMOVE, RENAME, ...) only when the server certainly did not run
+  them. Retries are reported on stderr, Ctrl-C cancels a backoff wait, and
+  an exhausted budget fails with `Error::GaveUp`.
+- `sum [-a sha256|sha512]`: checksum remote files like `sha256sum`.
+- `get -V` / `--verify`: hash the download as it is written, re-read the
+  remote file and compare before renaming into place.
+- `get -c` compares the last 1 MiB before the resume point with the server
+  and refuses to resume onto mismatching data.
+- `get` takes several remotes (`get a b c dir/`); `put` expands local globs,
+  takes several files, and gains `-k` and `-n`.
+- `rm -r` (no symlink following, loop and cwd protection) and
+  `du [-s] [-h]`.
+- `NFSC_*` environment defaults for the global options (`NFSC_UID`,
+  `NFSC_TIMEOUT`, `NFSC_PROTO`, `NFSC_VERS`, ...); the command line wins.
+- In-process fake NFSv3/MOUNT/portmap server with fault injection, and an
+  integration suite covering JUKEBOX, restarts, drops, short reads, verifier
+  changes, >4 GiB offsets and READDIR fallbacks.
 - `get -k` / `--keep-going`: `get -r` and glob gets continue past per-file
   errors, print a summary of failures, and exit non-zero.
 - `get -n` / `--no-clobber`: skip files that already exist locally.
@@ -39,8 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A read that returns no data before EOF is an error, not a silent short
-  transfer.
+- A read that returns no data before EOF is retried and then an error, never
+  a silent short transfer (also for `cat` and `get x -`, which read without
+  a known length).
 - Decoded XDR arrays bound their preallocation in bytes; a hostile count can
   no longer force a huge allocation.
 - Replies already received are kept when the connection drops.

@@ -92,8 +92,11 @@ pub fn run(g: &Globals, args: &ShellArgs) -> Result<(), CmdError> {
         (a, b) => a.or(b),
     };
     let ip = cli::resolve(&target.host)?;
+    let mut rpc = cli::rpc_options(g, cli::sys_auth(g)?);
+    // Ctrl-C also ends a retry backoff wait, not just a running transfer.
+    rpc.retry.cancel = Some(interrupt::global());
     let opts = ConnectOptions {
-        rpc: cli::rpc_options(g, cli::sys_auth(g)?),
+        rpc,
         nfs_port,
         mount_port: g.mount_port,
         version: args.nfs_version.into(),

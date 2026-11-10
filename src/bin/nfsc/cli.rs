@@ -7,7 +7,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nfsc::fs::{NfsVersion, VersionPref};
 use nfsc::portmap;
-use nfsc::rpc::{Auth, PortMode, Proto, RpcOptions};
+use nfsc::rpc::{Auth, PortMode, Proto, RetryEvent, RetryPolicy, RpcOptions};
+use std::sync::Arc;
 
 use crate::exports;
 use crate::rpcinfo::{self, ServiceNames};
@@ -28,6 +29,7 @@ Global options (before or after the command):
   --port-mode auto|priv|unpriv   source port [auto]; see 'Permission denied' below
   --proto tcp|udp                transport [tcp]; NFSv4 is TCP only
   --timeout SECS                 per-reply timeout [10]
+  --retry-time SECS              keep retrying a failed call this long [300]; 0 = off
   --nfs-port P, --mount-port P   skip portmap lookups
 Each also reads NFSC_<NAME> from the environment (NFSC_UID, NFSC_TIMEOUT,
 NFSC_PORT_MODE, ...); the command line wins.
@@ -93,6 +95,10 @@ pub struct Globals {
     /// Seconds to wait for each reply (UDP: across all retransmits)
     #[arg(long, global = true, hide = true, value_name = "SECS", default_value = "10", value_parser = parse_timeout, env = "NFSC_TIMEOUT")]
     pub timeout: Duration,
+
+    /// Seconds to keep retrying a failed call (server down, stalled, JUKEBOX/DELAY); 0 disables
+    #[arg(long, global = true, hide = true, value_name = "SECS", default_value = "300", value_parser = parse_retry_time, env = "NFSC_RETRY_TIME")]
+    pub retry_time: Duration,
 
     /// NFS server port; skips portmap for NFS (a port in an nfs:// target wins if equal)
     #[arg(long, global = true, hide = true, value_name = "PORT", env = "NFSC_NFS_PORT", value_parser = clap::value_parser!(u16).range(1..))]
@@ -205,6 +211,14 @@ impl From<nfsc::Error> for CmdError {
     }
 }
 
+fn parse_retry_time(s: &str) -> Result<Duration, String> {
+    let secs: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a number of seconds"))?;
+    Duration::try_from_secs_f64(secs)
+        .map_err(|_| format!("retry time must be zero or a positive number of seconds, got '{s}'"))
+}
+
 fn parse_timeout(s: &str) -> Result<Duration, String> {
     let secs: f64 = s
         .parse()
@@ -241,7 +255,40 @@ pub fn rpc_options(g: &Globals, auth: Auth) -> RpcOptions {
         port_mode: g.port_mode.into(),
         timeout: g.timeout,
         auth,
-        ..RpcOptions::default()
+        retry: RetryPolicy {
+            budget: g.retry_time,
+            on_retry: Some(Arc::new(report_retry)),
+            ..RetryPolicy::default()
+        },
+    }
+}
+
+/// Prints retry progress on stderr so a stalled transfer is visibly waiting,
+/// not frozen. Giving up is reported by the failing command itself.
+fn report_retry(ev: &RetryEvent<'_>) {
+    match ev {
+        RetryEvent::Retrying {
+            op,
+            error,
+            delay,
+            elapsed,
+            budget,
+            ..
+        } => eprintln!(
+            "nfsc: {op}: {error}; retrying in {:.1}s ({:.0}s of {:.0}s)",
+            delay.as_secs_f64(),
+            elapsed.as_secs_f64(),
+            budget.as_secs_f64()
+        ),
+        RetryEvent::Recovered {
+            op,
+            attempts,
+            elapsed,
+        } => eprintln!(
+            "nfsc: {op}: recovered after {attempts} attempts ({:.1}s)",
+            elapsed.as_secs_f64()
+        ),
+        RetryEvent::GaveUp { .. } => {}
     }
 }
 
