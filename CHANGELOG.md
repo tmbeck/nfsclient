@@ -9,9 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `get -k` / `--keep-going`: `get -r` and glob gets continue past per-file
+  errors, print a summary of failures, and exit non-zero.
+- `get -n` / `--no-clobber`: skip files that already exist locally.
+- `Error::is_retryable()` classifies transient failures (timeouts, dropped
+  connections, JUKEBOX/DELAY, GRACE).
+- CI: MSRV (1.85), macOS, `cargo doc -D warnings`, `cargo-deny`, Dependabot,
+  and a tag-triggered release workflow building glibc and musl binaries.
+
 ### Changed
 
+- `get` downloads into `NAME.nfsc-part` and renames on success. A failed
+  download no longer leaves a truncated file under the final name or
+  truncates an existing one; `get -c` resumes from the `.part` file.
+- `get -r` restores directory modes (minus setuid/setgid/sticky) and mtimes.
+- Local write errors (disk full, quota, permission, read-only) are reported
+  in plain words.
+- A closed stdout pipe (`cat x | head`) ends quietly with status 141.
+- The read pipeline returns to pipelined mode after a fallback instead of
+  staying one-request-at-a-time for the rest of the file, and reports the
+  original error when the fallback also fails.
+- NFSv4 grace-period wait follows the server lease (2x, 30s–300s); setup
+  (SETCLIENTID, EXCHANGE_ID, CREATE_SESSION) retries DELAY/GRACE.
+- NFSv4.1 recovers a lost session with CREATE_SESSION on the existing
+  clientid, keeping open state.
+- NFS port falls back to 2049 when portmap is unreachable; mountd lookup
+  tries the other transport; `-v auto` reports the error from the version
+  that got furthest.
+
 ### Fixed
+
+- A read that returns no data before EOF is an error, not a silent short
+  transfer.
+- Decoded XDR arrays bound their preallocation in bytes; a hostile count can
+  no longer force a huge allocation.
+- Replies already received are kept when the connection drops.
+- The privileged-port flag is updated after a reconnect, so the setcap hint
+  still appears for `secure` exports.
+- NFSv4.0 open-owner seqid is not advanced on errors excluded by RFC 7530
+  §9.1.7; BAD_SEQID recovers with a new open-owner.
+- NFSv4 OPEN_CONFIRM failure no longer leaks an open; `OPEN_DELEGATE_NONE_EXT`
+  (4.1) is decoded; 4.0 lease renewal is tracked only for renewing ops; an
+  internal "no free slot" error no longer forces a reconnect.
+- NFSv3: FSINFO failure falls back to default sizes; transfer size is
+  clamped to rtmax/wtmax; READ replies with count > data are rejected;
+  READDIRPLUS falls back to READDIR on TOOSMALL.
+- NFSv2 normalizes the mount path like v3.
+- Three rustdoc warnings.
 
 ## [1.0.0] - 2026-11-09
 
