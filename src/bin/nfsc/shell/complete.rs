@@ -138,7 +138,8 @@ fn arg_kind(cmd: &str, index: usize) -> Option<Kind> {
 fn flags_for(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "ls" | "dir" => &["-l"],
-        "get" | "put" => &["-c", "-r"],
+        "get" => &["-c", "-k", "-n", "-r"],
+        "put" => &["-c", "-r"],
         "ln" => &["-s"],
         _ => &[],
     }

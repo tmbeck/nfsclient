@@ -37,7 +37,7 @@ fn shell_help_documents_the_version_and_port_flags() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("--nfs-version"), "{text}");
     assert!(
-        text.contains("get [-r] [-c]"),
+        text.contains("get [-rckn]"),
         "shell commands listed: {text}"
     );
     assert!(

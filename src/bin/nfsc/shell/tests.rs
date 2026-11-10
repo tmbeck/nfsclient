@@ -378,7 +378,7 @@ fn help_lists_the_commands_and_exit_ends_the_script() {
     assert!(help.contains("help <cmd>"), "{help}");
     let get = ok(&mut s, "help get");
     assert!(
-        get.starts_with("get [-r] [-c] remote [local]\n") && get.contains("-c  resume"),
+        get.starts_with("get [-rckn] remote [local]\n") && get.contains("-c  resume"),
         "{get}"
     );
     assert_eq!(ok(&mut s, "help quit"), ok(&mut s, "help exit"));
@@ -398,7 +398,7 @@ fn unknown_commands_and_bad_options_are_reported() {
     assert_eq!(fails(&mut s, "ls -z"), "nfsc: ls: invalid option -- 'z'");
     assert_eq!(
         fails(&mut s, "get"),
-        "nfsc: get: usage: get [-r] [-c] remote [local]"
+        "nfsc: get: usage: get [-rckn] remote [local]"
     );
 }
 
@@ -787,6 +787,9 @@ struct Tripwire {
     flag: Arc<AtomicBool>,
     calls: usize,
     trip_after: usize,
+    /// Reads of this file at or past this offset fail with an I/O error, as
+    /// if the server or the network broke down mid-transfer.
+    fail_reads: Option<(FileHandle, u64)>,
 }
 
 impl Tripwire {
@@ -796,6 +799,23 @@ impl Tripwire {
             flag,
             calls: 0,
             trip_after,
+            fail_reads: None,
+        }
+    }
+
+    /// A backend whose reads of `path` fail from `offset` on.
+    fn failing(fs: Rc<RefCell<MemFs>>, flag: Arc<AtomicBool>, path: &str, offset: u64) -> Self {
+        let fh = {
+            let mut inner = fs.borrow_mut();
+            let mut fh = inner.root();
+            for part in path.split('/') {
+                fh = inner.lookup(&fh, part.as_bytes()).unwrap().0;
+            }
+            fh
+        };
+        Tripwire {
+            fail_reads: Some((fh, offset)),
+            ..Self::new(fs, flag, usize::MAX)
         }
     }
 
@@ -837,6 +857,12 @@ impl Filesystem for Tripwire {
     }
     fn read(&mut self, fh: &FileHandle, offset: u64, count: u32) -> nfsc::Result<(Vec<u8>, bool)> {
         self.tick();
+        if let Some((bad, from)) = &self.fail_reads
+            && bad == fh
+            && offset >= *from
+        {
+            return Err(nfsc::Error::Nfs(nfsc::fs::Status::Io));
+        }
         self.fs.borrow_mut().read(fh, offset, count)
     }
     fn write(&mut self, fh: &FileHandle, offset: u64, data: &[u8]) -> nfsc::Result<u32> {
@@ -1018,7 +1044,12 @@ fn flags_complete_after_a_dash() {
     assert_eq!(complete(&s, "ls -"), vec![pair("-l", "-l ")]);
     assert_eq!(
         complete(&s, "get -"),
-        vec![pair("-c", "-c"), pair("-r", "-r")]
+        vec![
+            pair("-c", "-c"),
+            pair("-k", "-k"),
+            pair("-n", "-n"),
+            pair("-r", "-r")
+        ]
     );
     assert_eq!(complete(&s, "ln -"), vec![pair("-s", "-s ")]);
 }
@@ -1406,4 +1437,239 @@ fn get_r_does_not_write_through_a_local_symlink() {
         "download wrote through a symlink"
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// big.bin (8192 bytes, read in 512-byte chunks) behind a backend whose reads
+/// of it fail from offset 2048, plus the shared inner filesystem.
+fn failing_big_file() -> (Session, Rc<RefCell<MemFs>>, Vec<u8>) {
+    let data = pattern(8192);
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.max_read = 512;
+    inner.add_file("big.bin", &data).unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    let s = session_with(
+        Box::new(Tripwire::failing(
+            backend.clone(),
+            flag.clone(),
+            "big.bin",
+            2048,
+        )),
+        flag,
+    );
+    (s, backend, data)
+}
+
+#[test]
+fn a_failed_get_leaves_no_partial_file_and_keeps_an_existing_one() {
+    let dir = scratch("atomic_get");
+    let (mut s, _, _) = failing_big_file();
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get big.bin");
+    assert!(r.failure.is_some(), "the read error fails the get");
+    assert!(r.err.contains("removed partial file"), "{}", r.err);
+    assert!(!dir.join("big.bin").exists(), "no truncated final file");
+    assert!(!dir.join("big.bin.nfsc-part").exists(), "part file removed");
+
+    fs::write(dir.join("big.bin"), b"good old copy").unwrap();
+    let r = run(&mut s, "get big.bin");
+    assert!(r.failure.is_some());
+    assert_eq!(
+        fs::read(dir.join("big.bin")).unwrap(),
+        b"good old copy",
+        "a failed get must not damage the existing file"
+    );
+    assert!(!dir.join("big.bin.nfsc-part").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_c_keeps_the_part_file_on_failure_and_resumes_from_it() {
+    let dir = scratch("resume_part");
+    let (mut s, backend, data) = failing_big_file();
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get -c big.bin");
+    assert!(r.failure.is_some());
+    assert!(r.err.contains("partial file kept as"), "{}", r.err);
+    assert!(
+        !dir.join("big.bin").exists(),
+        "nothing under the final name"
+    );
+    assert_eq!(
+        fs::metadata(dir.join("big.bin.nfsc-part")).unwrap().len(),
+        2048
+    );
+
+    // The server recovers.
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut s = session_with(
+        Box::new(Tripwire::new(backend, flag.clone(), usize::MAX)),
+        flag,
+    );
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get -c big.bin");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("resumed at 2048"), "{}", r.err);
+    assert_eq!(fs::read(dir.join("big.bin")).unwrap(), data);
+    assert!(
+        !dir.join("big.bin.nfsc-part").exists(),
+        "renamed into place"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// t/{a.bin, b.bin, c.bin, sub/d.txt}; reads of t/b.bin fail.
+fn failing_tree() -> Session {
+    let mut inner = MemFs::new();
+    inner.clock = NOW;
+    inner.add_dir("t").unwrap();
+    inner.add_file("t/a.bin", b"aaaa").unwrap();
+    inner.add_file("t/b.bin", b"bbbb").unwrap();
+    inner.add_file("t/c.bin", b"cccc").unwrap();
+    inner.add_dir("t/sub").unwrap();
+    inner.add_file("t/sub/d.txt", b"dddd").unwrap();
+    let backend = Rc::new(RefCell::new(inner));
+    let flag = Arc::new(AtomicBool::new(false));
+    session_with(
+        Box::new(Tripwire::failing(backend, flag.clone(), "t/b.bin", 0)),
+        flag,
+    )
+}
+
+#[test]
+fn get_r_stops_at_the_first_error_without_keep_going() {
+    let dir = scratch("tree_stop");
+    let mut s = failing_tree();
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get -r t");
+    assert!(r.failure.is_some());
+    assert!(dir.join("t/a.bin").exists());
+    assert!(!dir.join("t/b.bin").exists());
+    assert!(!dir.join("t/c.bin").exists(), "stopped at b.bin");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_r_keep_going_fetches_the_rest_and_fails_with_a_summary() {
+    let dir = scratch("tree_keep_going");
+    let mut s = failing_tree();
+    lcd(&mut s, &dir);
+    // A local directory where a file should go is a second, local failure.
+    fs::create_dir_all(dir.join("t/c.bin")).unwrap();
+    let r = run(&mut s, "get -r -k t");
+    assert_eq!(
+        r.failure.as_deref(),
+        Some("nfsc: get: 2 items failed (listed above)")
+    );
+    assert_eq!(fs::read(dir.join("t/a.bin")).unwrap(), b"aaaa");
+    assert_eq!(fs::read(dir.join("t/sub/d.txt")).unwrap(), b"dddd");
+    assert!(!dir.join("t/b.bin").exists());
+    assert!(!dir.join("t/b.bin.nfsc-part").exists());
+    let summary = r.err.split("nfsc: get: failed:\n").nth(1).unwrap_or("");
+    let listed: Vec<&str> = summary.lines().collect();
+    assert_eq!(listed.len(), 2, "{}", r.err);
+    assert!(listed[0].contains("t/b.bin: "), "{}", r.err);
+    assert!(listed[1].contains("is not a regular file"), "{}", r.err);
+
+    // In a script the failure stops the run with status 1.
+    let _ = fs::remove_dir_all(dir.join("t"));
+    let cmds = parse_script("get --keep-going -r t; pwd").unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let result = run_script_to(&mut s, &cmds, &mut out, &mut err);
+    assert!(matches!(result, Err(CmdError::Reported(1))), "{result:?}");
+    assert!(out.is_empty(), "pwd did not run");
+    assert_eq!(fs::read(dir.join("t/c.bin")).unwrap(), b"cccc");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_n_skips_existing_local_files() {
+    let dir = scratch("no_clobber");
+    let mut s = session(fixture());
+    lcd(&mut s, &dir);
+    fs::write(dir.join("b.txt"), b"mine").unwrap();
+    let r = run(&mut s, "get -n b.txt");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("skipping"), "{}", r.err);
+    assert_eq!(fs::read(dir.join("b.txt")).unwrap(), b"mine");
+
+    fs::create_dir_all(dir.join("a")).unwrap();
+    fs::write(dir.join("a/inner.txt"), b"local").unwrap();
+    ok(&mut s, "get -rn a");
+    assert_eq!(fs::read(dir.join("a/inner.txt")).unwrap(), b"local");
+
+    ok(&mut s, "get -n b.txt fresh.txt");
+    assert_eq!(fs::read(dir.join("fresh.txt")).unwrap(), b"hello");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_r_restores_directory_modes_and_mtimes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("dir_attrs");
+    let mut fs_ = fixture();
+    let root = fs_.root();
+    let (a, _) = fs_.lookup(&root, b"a").unwrap();
+    fs_.setattr(
+        &a,
+        &SetAttr {
+            mode: Some(0o3555),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    let mut s = session(fs_);
+    lcd(&mut s, &dir);
+    ok(&mut s, "get -r a");
+    let meta = fs::metadata(dir.join("a")).unwrap();
+    assert_eq!(
+        meta.modified().unwrap(),
+        UNIX_EPOCH + Duration::from_secs(NOW as u64)
+    );
+    assert_eq!(
+        meta.permissions().mode() & 0o7777,
+        0o555,
+        "mode restored without setgid/sticky"
+    );
+    assert_eq!(fs::read(dir.join("a/inner.txt")).unwrap(), b"inner data");
+    // A second run can still write into the read-only directory.
+    ok(&mut s, "get -r a");
+    assert_eq!(
+        fs::metadata(dir.join("a")).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+    fs::set_permissions(dir.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A stdout whose reader has gone away.
+struct ClosedPipe;
+
+impl Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+#[test]
+fn a_closed_stdout_pipe_ends_cat_and_get_quietly() {
+    for line in ["cat b.txt; pwd", "get b.txt -; pwd"] {
+        let mut s = session(fixture());
+        let cmds = parse_script(line).unwrap();
+        let mut err = Vec::new();
+        let result = run_script_to(&mut s, &cmds, &mut ClosedPipe, &mut err);
+        assert!(
+            matches!(result, Err(CmdError::Reported(141))),
+            "{line}: {result:?}"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "",
+            "{line}: nothing printed"
+        );
+    }
 }

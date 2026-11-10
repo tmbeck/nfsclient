@@ -84,7 +84,7 @@ const DETAILS: &[(&[&str], &str)] = &[
     (&["cat"], "cat path\n  Write a remote file to stdout."),
     (
         &["get"],
-        "get [-r] [-c] remote [local]\n  Download. local defaults to the local directory; - writes to stdout.\n  -r  download a directory tree (symlinks and special files are skipped)\n  -c  resume a partial local file from its current size\n  Keeps the remote mtime and mode (without setuid/setgid/sticky). Ctrl-C\n  removes a partial download unless -c is given.",
+        "get [-rckn] remote [local]\n  Download. local defaults to the local directory; - writes to stdout.\n  Data goes to NAME.nfsc-part and is renamed to NAME when complete, so a\n  failed download never replaces an existing file.\n  -r  download a directory tree (symlinks and special files are skipped)\n  -c  resume NAME.nfsc-part (or a partial NAME) from its current size;\n      on failure the partial file is kept for the next get -c\n  -k  with -r or several files: report errors, continue, list them at the\n      end, and fail the command (--keep-going)\n  -n  skip files that already exist locally\n  Keeps the remote mtime and mode (without setuid/setgid/sticky), also for\n  directories under -r. Without -c a failed or interrupted download is removed.",
     ),
     (
         &["put"],
@@ -338,7 +338,7 @@ impl Session {
         if node.attr.ftype == FileType::Directory {
             return Err(CmdFailure::from_error(CMD, path, Error::Nfs(Status::IsDir)));
         }
-        self.stream_to(&node.fh, 0, out).ctx(CMD, path).map(|_| ())
+        self.stream_to(CMD, path, &node.fh, out).map(|_| ())
     }
 
     pub(super) fn cmd_mkdir(&mut self, args: &[String]) -> CmdResult<()> {
