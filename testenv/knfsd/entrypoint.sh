@@ -20,14 +20,15 @@ for v in 3 4 4.0 4.1 4.2; do
 done
 log "nfsd versions: $(cat /proc/fs/nfsd/versions)"
 
-# Kernel nfsd refuses to start without listeners.
-echo "tcp 2049" > /proc/fs/nfsd/portlist || log "cannot add tcp listener"
-echo "udp 2049" > /proc/fs/nfsd/portlist 2>/dev/null || log "udp listener unavailable"
-
 rpcbind -w
 exportfs -ra
 rpc.mountd
-echo 8 > /proc/fs/nfsd/threads
+# Start nfsd with rpc.nfsd rather than writing portlist/threads directly:
+# recent kernels (seen on 7.2) no longer register NFS with the portmapper
+# when nfsd is started through /proc, and rpc.nfsd does the registration.
+# Ask for a UDP listener too; fall back to TCP only if UDP is unavailable.
+rpc.nfsd -u 8 2>/dev/null || { log "udp listener unavailable"; rpc.nfsd 8; }
+rpcinfo -p 2>/dev/null | grep -q ' 100003 ' || log "warning: nfs is not registered with rpcbind"
 log "ready"
 
 trap 'exit 0' TERM INT
