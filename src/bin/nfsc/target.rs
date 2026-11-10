@@ -1,54 +1,47 @@
-//! Export target syntax.
+//! Target syntax for `nfsc shell`.
 //!
-//! - `nfs://host[:port]/export[/path]` (IPv6 literals in brackets: `nfs://[::1]:2049/export`)
-//! - `host:/export[/path]` (IPv6 literals in brackets: `[::1]:/export`)
+//! - `nfs://host[:port]/path` (IPv6 literals in brackets: `nfs://[::1]:2049/export/x`)
+//! - `host:/path` (IPv6 literals in brackets: `[::1]:/export`)
 //!
-//! The export is the first path segment after the host. Exports whose names span
-//! several segments (`/srv/data`) are resolved against the server's export list
-//! once MOUNT EXPORT exists (milestone 2); until then the first segment is used.
+//! The path is a full server path. Which export it lives in is decided by
+//! `fs::connect`, not by the parser, so `nfs://nas/srv/data/x` works whatever
+//! the export names are.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// Host name or IP literal, without brackets.
     pub host: String,
+    /// Port from an `nfs://host:port/...` target.
     pub port: Option<u16>,
-    /// Absolute export name, e.g. `/export`.
-    pub export: String,
-    /// Absolute path inside the export; `/` when none was given.
+    /// Absolute server path, normalized (no empty, `.` or `..` segments). `/` when none was given.
     pub path: String,
 }
 
 pub fn parse_target(s: &str) -> Result<Target, String> {
     if let Some(rest) = s.strip_prefix("nfs://") {
-        let (authority, path_part) = rest
-            .find('/')
-            .map(|i| rest.split_at(i))
-            .ok_or_else(|| format!("'{s}': missing /export after host"))?;
+        let (authority, path_part) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        };
         let (host, port) = split_host_port(authority, s)?;
-        let (export, path) = split_export(path_part, s)?;
-        return Ok(Target {
-            host,
-            port,
-            export,
-            path,
-        });
+        let path = normalize_path(path_part, s)?;
+        return Ok(Target { host, port, path });
     }
     if let Some(i) = s.find(":/") {
         let (host_part, rest) = (&s[..i], &s[i + 1..]);
         let (host, port) = split_host_port(host_part, s)?;
         if port.is_some() {
-            return Err(format!("'{s}': use nfs://host:port/export to give a port"));
+            return Err(format!("'{s}': use nfs://host:port/path to give a port"));
         }
-        let (export, path) = split_export(rest, s)?;
+        let path = normalize_path(rest, s)?;
         return Ok(Target {
             host,
             port: None,
-            export,
             path,
         });
     }
     Err(format!(
-        "'{s}': expected nfs://host[:port]/export[/path] or host:/export[/path]"
+        "'{s}': expected nfs://host[:port]/path or host:/path"
     ))
 }
 
@@ -71,7 +64,7 @@ fn split_host_port(authority: &str, whole: &str) -> Result<(String, Option<u16>)
     let (host, port) = match authority.matches(':').count() {
         0 => (authority, None),
         1 => {
-            let (h, p) = authority.split_once(':').unwrap();
+            let (h, p) = authority.split_once(':').expect("one colon");
             (h, Some(parse_port(p, whole)?))
         }
         _ => {
@@ -93,35 +86,28 @@ fn parse_port(p: &str, whole: &str) -> Result<u16, String> {
     }
 }
 
-/// Splits `/export/sub/dir` into (`/export`, `/sub/dir`). Empty segments are ignored.
-fn split_export(path_part: &str, whole: &str) -> Result<(String, String), String> {
+/// `/a//b/` becomes `/a/b`; an empty path becomes `/`.
+fn normalize_path(path_part: &str, whole: &str) -> Result<String, String> {
     let segs: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
-    if segs.is_empty() {
-        return Err(format!("'{whole}': missing export name"));
-    }
     if let Some(bad) = segs.iter().find(|s| **s == "." || **s == "..") {
         return Err(format!(
             "'{whole}': '{bad}' is not allowed in a target path"
         ));
     }
-    let export = format!("/{}", segs[0]);
-    let path = if segs.len() == 1 {
-        "/".to_string()
-    } else {
-        format!("/{}", segs[1..].join("/"))
-    };
-    Ok((export, path))
+    if segs.is_empty() {
+        return Ok("/".to_string());
+    }
+    Ok(format!("/{}", segs.join("/")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn t(host: &str, port: Option<u16>, export: &str, path: &str) -> Target {
+    fn t(host: &str, port: Option<u16>, path: &str) -> Target {
         Target {
             host: host.into(),
             port,
-            export: export.into(),
             path: path.into(),
         }
     }
@@ -130,19 +116,34 @@ mod tests {
     fn nfs_url_forms() {
         assert_eq!(
             parse_target("nfs://nas/export").unwrap(),
-            t("nas", None, "/export", "/")
+            t("nas", None, "/export")
         );
         assert_eq!(
             parse_target("nfs://nas:2049/export/a/b").unwrap(),
-            t("nas", Some(2049), "/export", "/a/b")
+            t("nas", Some(2049), "/export/a/b")
         );
         assert_eq!(
             parse_target("nfs://nas/export/").unwrap(),
-            t("nas", None, "/export", "/")
+            t("nas", None, "/export")
         );
         assert_eq!(
             parse_target("nfs://nas//export//a/").unwrap(),
-            t("nas", None, "/export", "/a")
+            t("nas", None, "/export/a")
+        );
+        assert_eq!(parse_target("nfs://nas").unwrap(), t("nas", None, "/"));
+        assert_eq!(parse_target("nfs://nas/").unwrap(), t("nas", None, "/"));
+    }
+
+    #[test]
+    fn full_path_is_kept_without_guessing_an_export() {
+        // The first segment is not special: a multi-segment export is just a path.
+        assert_eq!(
+            parse_target("nfs://nas/srv/data/x").unwrap(),
+            t("nas", None, "/srv/data/x")
+        );
+        assert_eq!(
+            parse_target("nas:/srv/data").unwrap(),
+            t("nas", None, "/srv/data")
         );
     }
 
@@ -150,11 +151,11 @@ mod tests {
     fn nfs_url_ipv6() {
         assert_eq!(
             parse_target("nfs://[fd00::5]/export").unwrap(),
-            t("fd00::5", None, "/export", "/")
+            t("fd00::5", None, "/export")
         );
         assert_eq!(
             parse_target("nfs://[::1]:2049/export/x").unwrap(),
-            t("::1", Some(2049), "/export", "/x")
+            t("::1", Some(2049), "/export/x")
         );
     }
 
@@ -162,16 +163,17 @@ mod tests {
     fn host_colon_slash_forms() {
         assert_eq!(
             parse_target("nas:/export").unwrap(),
-            t("nas", None, "/export", "/")
+            t("nas", None, "/export")
         );
         assert_eq!(
             parse_target("nas:/export/dir/sub").unwrap(),
-            t("nas", None, "/export", "/dir/sub")
+            t("nas", None, "/export/dir/sub")
         );
         assert_eq!(
             parse_target("[fd00::5]:/export").unwrap(),
-            t("fd00::5", None, "/export", "/")
+            t("fd00::5", None, "/export")
         );
+        assert_eq!(parse_target("nas:/").unwrap(), t("nas", None, "/"));
     }
 
     #[test]
@@ -181,8 +183,6 @@ mod tests {
             "nas",
             "nas:export",
             "nfs://",
-            "nfs://nas",
-            "nfs://nas/",
             "nfs:///export",
             "nfs://nas:0/export",
             "nfs://nas:99999/export",

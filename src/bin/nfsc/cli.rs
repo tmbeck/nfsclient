@@ -5,11 +5,13 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use nfsc::fs::{NfsVersion, VersionPref};
 use nfsc::portmap;
 use nfsc::rpc::{Auth, PortMode, Proto, RpcOptions};
 
+use crate::exports;
 use crate::rpcinfo::{self, ServiceNames};
-use crate::target;
+use crate::shell;
 
 /// Unix AUTH_SYS limit on supplementary groups.
 const MAX_GIDS: usize = 16;
@@ -64,13 +66,21 @@ pub struct Globals {
     /// Seconds to wait for each reply (UDP: across all retransmits)
     #[arg(long, global = true, value_name = "SECS", default_value = "10", value_parser = parse_timeout)]
     pub timeout: Duration,
+
+    /// NFS server port; skips portmap for NFS (a port in an nfs:// target wins if equal)
+    #[arg(long, global = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub nfs_port: Option<u16>,
+
+    /// MOUNT server port; skips portmap for MOUNT (used by `exports` and `shell`)
+    #[arg(long, global = true, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub mount_port: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Interactive shell on an export, or run -c commands and exit
+    /// Interactive shell on a path below an export, or run -c commands and exit
     Shell(ShellArgs),
-    /// List the exports of a server (MOUNT EXPORT)
+    /// List the exports of a server (MOUNT EXPORT, like showmount -e)
     Exports(HostArgs),
     /// List the RPC services registered with the portmapper (rpcinfo -p)
     Rpcinfo(HostArgs),
@@ -78,10 +88,11 @@ pub enum Command {
 
 #[derive(Args, Debug)]
 pub struct ShellArgs {
-    /// nfs://host[:port]/export[/path] or host:/export[/path]
+    /// nfs://host[:port]/path or host:/path (the full server path, e.g. /srv/data/x)
     pub target: String,
 
-    /// Run these commands separated by ';' and exit
+    /// Run these commands separated by ';' and exit. Stops at the first failure
+    /// (status 1); 'exit' or 'quit' ends early with status 0.
     #[arg(short = 'c', long = "command", value_name = "CMDS")]
     pub command: Option<String>,
 
@@ -121,17 +132,40 @@ pub enum NfsVersionArg {
     V2,
     #[value(name = "3")]
     V3,
+    /// Any NFSv4 minor version, highest first
+    #[value(name = "4")]
+    V4,
+    #[value(name = "4.0")]
+    V40,
+    #[value(name = "4.1")]
+    V41,
+    #[value(name = "4.2")]
+    V42,
     #[value(name = "auto")]
     Auto,
+}
+
+impl From<NfsVersionArg> for VersionPref {
+    fn from(v: NfsVersionArg) -> Self {
+        match v {
+            NfsVersionArg::V2 => VersionPref::Exact(NfsVersion::V2),
+            NfsVersionArg::V3 => VersionPref::Exact(NfsVersion::V3),
+            NfsVersionArg::V4 => VersionPref::AnyV4,
+            NfsVersionArg::V40 => VersionPref::Exact(NfsVersion::V4(0)),
+            NfsVersionArg::V41 => VersionPref::Exact(NfsVersion::V4(1)),
+            NfsVersionArg::V42 => VersionPref::Exact(NfsVersion::V4(2)),
+            NfsVersionArg::Auto => VersionPref::Auto,
+        }
+    }
 }
 
 /// Failure of a subcommand, mapped to the process exit status in `main`.
 #[derive(Debug)]
 pub enum CmdError {
-    /// Subcommand exists but is not built yet (exit 2).
-    NotImplemented(&'static str),
-    /// Any other failure (exit 1).
+    /// Printed as `nfsc: <message>`, exit 1.
     Failed(String),
+    /// Already reported on stderr; exit with this status and print nothing more.
+    Reported(u8),
 }
 
 impl From<nfsc::Error> for CmdError {
@@ -180,7 +214,6 @@ pub fn rpc_options(g: &Globals, auth: Auth) -> RpcOptions {
 }
 
 /// AUTH_SYS credentials: the process identity with any --uid/--gid/--gids overrides.
-#[allow(dead_code)] // used by exports and shell in later milestones
 pub fn sys_auth(g: &Globals) -> Result<Auth, CmdError> {
     apply_overrides(Auth::sys_from_process(), g.uid, g.gid, g.gids.as_deref())
 }
@@ -219,17 +252,13 @@ pub fn run(cli: &Cli) -> Result<(), CmdError> {
     let g = &cli.global;
     match &cli.command {
         Command::Rpcinfo(args) => rpcinfo(g, &args.host),
-        Command::Exports(_) => Err(CmdError::NotImplemented("exports")),
-        Command::Shell(args) => {
-            // Reject a malformed target before reporting the missing feature.
-            target::parse_target(&args.target).map_err(CmdError::Failed)?;
-            Err(CmdError::NotImplemented("shell"))
-        }
+        Command::Exports(args) => exports::run(g, &args.host),
+        Command::Shell(args) => shell::run(g, args),
     }
 }
 
 /// Resolves `host` to its first address, accepting `[v6]` brackets.
-fn resolve(host: &str) -> Result<IpAddr, CmdError> {
+pub fn resolve(host: &str) -> Result<IpAddr, CmdError> {
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -333,7 +362,8 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert!(parse(&["shell", "nas:/export", "-v", "4"]).is_err());
+        assert!(parse(&["shell", "nas:/export", "-v", "5"]).is_err());
+        assert!(parse(&["shell", "nas:/export", "-v", "4.3"]).is_err());
         assert!(parse(&["shell"]).is_err());
     }
 

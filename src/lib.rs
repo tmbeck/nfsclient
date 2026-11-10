@@ -11,6 +11,7 @@
 pub mod client;
 pub mod error;
 pub mod fs;
+pub mod memfs;
 pub mod mount;
 pub mod nfs2;
 pub mod nfs3;
