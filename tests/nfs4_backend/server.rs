@@ -79,6 +79,7 @@ pub const OP_SETATTR: u32 = 34;
 pub const OP_SETCLIENTID: u32 = 35;
 pub const OP_SETCLIENTID_CONFIRM: u32 = 36;
 pub const OP_WRITE: u32 = 38;
+pub const OP_BIND_CONN_TO_SESSION: u32 = 41;
 pub const OP_EXCHANGE_ID: u32 = 42;
 pub const OP_CREATE_SESSION: u32 = 43;
 pub const OP_DESTROY_SESSION: u32 = 44;
@@ -1029,7 +1030,7 @@ fn compound(shared: &Shared, xid: u32, args: &[u8]) -> Outcome {
             Some((at, code)) if at == i => injected(shared, &mut st, &ctx, op, code),
             _ => {
                 if let (0, ArgOp::Sequence { .. }) = (i, op) {
-                    match sequence(shared, &mut st, &mut ctx, op, args) {
+                    match sequence(shared, &mut st, &mut ctx, op, args, ops.len() == 1) {
                         Seq::Replay(reply) => {
                             drop(st);
                             return finish(xid, reply, after);
@@ -1114,7 +1115,11 @@ fn structure_error(shared: &Shared, minor: u32, ops: &[ArgOp]) -> Option<(u32, u
         Some(op) => {
             let sessionless = matches!(
                 op.code(),
-                OP_EXCHANGE_ID | OP_CREATE_SESSION | OP_DESTROY_SESSION | OP_DESTROY_CLIENTID
+                OP_EXCHANGE_ID
+                    | OP_CREATE_SESSION
+                    | OP_DESTROY_SESSION
+                    | OP_DESTROY_CLIENTID
+                    | OP_BIND_CONN_TO_SESSION
             );
             if !sessionless {
                 shared.violation(format!("op {} outside a session", op.code()));
@@ -1153,7 +1158,14 @@ fn next_seqid(s: u32) -> u32 {
     }
 }
 
-fn sequence(shared: &Shared, st: &mut State, ctx: &mut Ctx, op: &ArgOp, args: &[u8]) -> Seq {
+fn sequence(
+    shared: &Shared,
+    st: &mut State,
+    ctx: &mut Ctx,
+    op: &ArgOp,
+    args: &[u8],
+    probe: bool,
+) -> Seq {
     let ArgOp::Sequence {
         session,
         seqid,
@@ -1203,9 +1215,14 @@ fn sequence(shared: &Shared, st: &mut State, ctx: &mut Ctx, op: &ArgOp, args: &[
     }
     let want = next_seqid(sl.seqid);
     if seqid != want {
-        shared.violation(format!(
-            "SEQUENCE slot {slot}: seqid {seqid}, expected {want}"
-        ));
+        // RFC 8881 2.10.6.1: after a lost reply the client may probe with an
+        // empty SEQUENCE at N+1 to learn whether request N ran; when it did
+        // not, the server answers SEQ_MISORDERED. That probe is not misuse.
+        if !(probe && seqid == next_seqid(want)) {
+            shared.violation(format!(
+                "SEQUENCE slot {slot}: seqid {seqid}, expected {want}"
+            ));
+        }
         return Seq::Done(NFS4ERR_SEQ_MISORDERED, vec![]);
     }
     sl.seqid = seqid;
@@ -1409,6 +1426,7 @@ enum ArgOp {
         back: Chan,
     },
     DestroySession([u8; 16]),
+    BindConn([u8; 16]),
     Sequence {
         session: [u8; 16],
         seqid: u32,
@@ -1452,6 +1470,7 @@ impl ArgOp {
             ArgOp::ExchangeId { .. } => OP_EXCHANGE_ID,
             ArgOp::CreateSession { .. } => OP_CREATE_SESSION,
             ArgOp::DestroySession(_) => OP_DESTROY_SESSION,
+            ArgOp::BindConn(_) => OP_BIND_CONN_TO_SESSION,
             ArgOp::Sequence { .. } => OP_SEQUENCE,
             ArgOp::DestroyClientid(_) => OP_DESTROY_CLIENTID,
             ArgOp::ReclaimComplete => OP_RECLAIM_COMPLETE,
@@ -1734,6 +1753,12 @@ fn decode_op(d: &mut Decoder) -> R<ArgOp> {
             }
         }
         OP_DESTROY_SESSION => ArgOp::DestroySession(get_fixed::<16>(d)?),
+        OP_BIND_CONN_TO_SESSION => {
+            let id = get_fixed::<16>(d)?;
+            d.get_u32()?;
+            d.get_bool()?;
+            ArgOp::BindConn(id)
+        }
         OP_SEQUENCE => ArgOp::Sequence {
             session: get_fixed::<16>(d)?,
             seqid: d.get_u32()?,
@@ -2715,6 +2740,13 @@ fn exec_op(
                     slots,
                 },
             );
+        }
+        ArgOp::BindConn(id) => {
+            if !st.sessions.contains_key(id) {
+                return (NFS4ERR_BADSESSION, vec![]);
+            }
+            // Connections are never required to be bound; accept as is.
+            e.put_opaque_fixed(id).put_u32(1).put_bool(false);
         }
         ArgOp::DestroySession(id) => {
             if st.sessions.remove(id).is_none() {

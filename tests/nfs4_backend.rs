@@ -592,13 +592,14 @@ fn badsession_mid_transfer_keeps_client_and_opens_v42() {
 }
 
 /// From the sixth READ COMPOUND on, fail the SEQUENCE of every READ with
-/// `code` until the client sends `until`: the server really lost the state,
-/// so a blocking retry on the same session fails too.
-fn sequence_fault_until(srv: &FakeNfs4, code: u32, until: u32) {
+/// `code` until the client sends a COMPOUND for which `until` holds: the
+/// server really lost the state, so a blocking retry on the same session
+/// fails too.
+fn sequence_fault_until(srv: &FakeNfs4, code: u32, until: impl Fn(&Call) -> bool + Send + 'static) {
     let reads = AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicBool::new(false);
     srv.set_hook(move |c| {
-        if c.has(until) {
+        if until(c) {
             done.store(true, Ordering::SeqCst);
         }
         if done.load(Ordering::SeqCst) || !c.has(OP_READ) {
@@ -612,7 +613,10 @@ fn sequence_fault_until(srv: &FakeNfs4, code: u32, until: u32) {
 }
 
 /// [`read_under`] with [`sequence_fault_until`].
-fn read_under_sequence_fault(code: u32, until: u32) -> FakeNfs4 {
+fn read_under_sequence_fault(
+    code: u32,
+    until: impl Fn(&Call) -> bool + Send + 'static,
+) -> FakeNfs4 {
     let size = 4 * MIB + 4321;
     let (srv, mut fs, fh) = with_big(Config::default(), 1, size);
     sequence_fault_until(&srv, code, until);
@@ -629,7 +633,7 @@ fn read_under_sequence_fault(code: u32, until: u32) -> FakeNfs4 {
 
 #[test]
 fn deadsession_mid_transfer_gets_a_new_session_v41() {
-    let srv = read_under_sequence_fault(NFS4ERR_DEADSESSION, OP_CREATE_SESSION);
+    let srv = read_under_sequence_fault(NFS4ERR_DEADSESSION, |c| c.has(OP_CREATE_SESSION));
     let st = srv.stats();
     assert_eq!(st.op(OP_EXCHANGE_ID), 1);
     assert_eq!(st.op(OP_CREATE_SESSION), 2);
@@ -638,14 +642,22 @@ fn deadsession_mid_transfer_gets_a_new_session_v41() {
 
 #[test]
 fn sequence_errors_mid_read_recover_fully_v41() {
-    for code in [
-        NFS4ERR_STALE_CLIENTID,
-        NFS4ERR_BADSLOT,
-        NFS4ERR_SEQ_MISORDERED,
-    ] {
-        let srv = read_under_sequence_fault(code, OP_EXCHANGE_ID);
+    for code in [NFS4ERR_STALE_CLIENTID, NFS4ERR_BADSLOT] {
+        let srv = read_under_sequence_fault(code, |c| c.has(OP_EXCHANGE_ID));
         assert_eq!(srv.stats().op(OP_EXCHANGE_ID), 2, "status {code}");
     }
+}
+
+/// SEQ_MISORDERED leaves the slot's seqid unknown: the client probes the slot
+/// with SEQUENCE-only COMPOUNDs (RFC 8881 2.10.6.1) and keeps its client ID,
+/// session and opens.
+#[test]
+fn seq_misordered_mid_read_resyncs_the_slot_v41() {
+    let srv = read_under_sequence_fault(NFS4ERR_SEQ_MISORDERED, |c| c.ops == [OP_SEQUENCE]);
+    let st = srv.stats();
+    assert_eq!(st.op(OP_EXCHANGE_ID), 1, "client ID kept");
+    assert_eq!(st.op(OP_OPEN), 1, "open state kept");
+    assert_eq!(st.anon_io, 0);
 }
 
 fn expired_lease(minor: u32) {
@@ -662,10 +674,10 @@ fn expired_lease(minor: u32) {
 }
 
 #[test]
-#[ignore = "BUG: NFSv4.0 EXPIRED loop: exec_stateid (src/nfs4/backend.rs:781) captures the \
-            stateid once; exec (backend.rs:599) answers EXPIRED with a full recover() \
-            (backend.rs:643) and resends the dead stateid, which the server (like knfsd) \
-            keeps answering with EXPIRED, until Error::GaveUp"]
+#[ignore = "BUG: NFSv4.0 EXPIRED loop: exec_stateid (src/nfs4/backend.rs:1067) captures the \
+            stateid once; exec answers EXPIRED (backend.rs:731) with a full recover() \
+            (backend.rs:906), which drops the expired client's opens, then resends the dead \
+            stateid; the server (like knfsd) keeps answering EXPIRED until Error::GaveUp"]
 fn expired_lease_mid_read_recovers_v40() {
     expired_lease(0);
 }
@@ -917,27 +929,21 @@ fn repeated_drops(minor: u32, truncate: bool) {
 }
 
 #[test]
-#[ignore = "BUG: NFSv4.0 EXPIRED loop after reconnect (see server_down_2s_mid_transfer_completes_v40): \
-            a send on the dead connection fails, so exec reconnects and recovers the client ID"]
 fn connection_drops_during_read_stream_v40() {
     repeated_drops(0, false);
 }
 
 #[test]
-#[ignore = "BUG: NFSv4.0 EXPIRED loop after reconnect (see server_down_2s_mid_transfer_completes_v40): \
-            a truncated reply is a broken connection, so exec reconnects and recovers"]
 fn truncated_replies_during_read_stream_v40() {
     repeated_drops(0, true);
 }
 
 #[test]
-#[ignore = "BUG: stale slot seqid after lost reply"]
 fn connection_drops_during_read_stream_v41() {
     repeated_drops(1, false);
 }
 
 #[test]
-#[ignore = "BUG: stale slot seqid after lost reply"]
 fn truncated_replies_during_read_stream_v41() {
     repeated_drops(1, true);
 }
@@ -973,13 +979,11 @@ fn lost_write_reply(cfg: Config) {
 
 /// knfsd: a replayed slot seqid without cachethis gets RETRY_UNCACHED_REP.
 #[test]
-#[ignore = "BUG: stale slot seqid after lost reply"]
 fn lost_read_reply_mid_window_v41() {
     lost_read_reply(Config::default());
 }
 
 #[test]
-#[ignore = "BUG: stale slot seqid after lost reply"]
 fn lost_write_reply_mid_window_v41() {
     lost_write_reply(Config::default());
 }
@@ -987,7 +991,6 @@ fn lost_write_reply_mid_window_v41() {
 /// A fully caching server answers the reused slot seqid with the cached
 /// reply of a different request: wrong data at another offset.
 #[test]
-#[ignore = "BUG: stale slot seqid after lost reply"]
 fn lost_read_reply_mid_window_caching_server_v41() {
     lost_read_reply(Config {
         cache_all_replies: true,
@@ -996,7 +999,6 @@ fn lost_read_reply_mid_window_caching_server_v41() {
 }
 
 #[test]
-#[ignore = "BUG: stale slot seqid after lost reply"]
 fn lost_write_reply_mid_window_caching_server_v41() {
     lost_write_reply(Config {
         cache_all_replies: true,
@@ -1019,11 +1021,6 @@ fn server_down_mid_transfer(minor: u32) {
 }
 
 #[test]
-#[ignore = "BUG: NFSv4.0 EXPIRED loop after reconnect: reconnect() -> recover() \
-            (src/nfs4/backend.rs:636/643) replaces the client ID, which ends the old \
-            client's opens; exec_stateid (backend.rs:781) resends the captured stateid, the \
-            server (like knfsd) answers EXPIRED, exec (backend.rs:599) recovers again, \
-            until Error::GaveUp"]
 fn server_down_2s_mid_transfer_completes_v40() {
     server_down_mid_transfer(0);
 }
