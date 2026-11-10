@@ -1,5 +1,10 @@
-# Same paths for NFSv3 (MOUNT) and NFSv4 (pseudo-fs). No fsid=0 root: the
-# v4 pseudo-root is built from the export paths, so /export/rw is /export/rw
-# on every protocol. Explicit fsids keep the two tmpfs exports distinct.
-/export/rw  *(rw,sync,no_subtree_check,insecure,no_root_squash,fsid=1)
-/export/ro  *(ro,sync,no_subtree_check,insecure,root_squash,fsid=2)
+# NFSv4 needs an exportable pseudo-root, and the container's overlayfs root
+# cannot be exported. /srv/nfsroot is a tmpfs (fsid=0) holding bind mounts of
+# the two exports, so the v4 paths are /export/rw and /export/ro. The same
+# filesystems are also exported at their real paths (same fsid) so NFSv3
+# MOUNT sees /export/rw and /export/ro too.
+/srv/nfsroot            *(ro,sync,no_subtree_check,insecure,fsid=0)
+/srv/nfsroot/export/rw  *(rw,sync,no_subtree_check,insecure,no_root_squash,fsid=1)
+/srv/nfsroot/export/ro  *(ro,sync,no_subtree_check,insecure,root_squash,fsid=2)
+/export/rw              *(rw,sync,no_subtree_check,insecure,no_root_squash,fsid=1)
+/export/ro              *(ro,sync,no_subtree_check,insecure,root_squash,fsid=2)
