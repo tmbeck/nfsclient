@@ -121,11 +121,22 @@ fn mount_client(
 }
 
 /// The mountd port is only discoverable through portmap, so say what to do.
+/// A transient failure (refused, timed out: the server may be booting) stays
+/// an I/O error of the same kind, so connection setup can retry it.
 fn portmap_unreachable(e: &Error) -> Error {
-    Error::Invalid(format!(
+    let msg = format!(
         "portmap (port 111) is unreachable ({e}); mountd's port can only be found through \
          portmap, so pass --mount-port (and --nfs-port) to skip portmap lookups"
-    ))
+    );
+    let kind = match e {
+        Error::Timeout => Some(std::io::ErrorKind::TimedOut),
+        Error::Io(io) if e.is_retryable() => Some(io.kind()),
+        _ => None,
+    };
+    match kind {
+        Some(k) => Error::Io(std::io::Error::new(k, msg)),
+        None => Error::Invalid(msg),
+    }
 }
 
 /// Canonical absolute form: single slashes, no trailing slash (except root).
