@@ -26,8 +26,8 @@ use crate::text::display_str;
 
 /// Commands accepted by the shell, including aliases.
 pub const COMMANDS: &[&str] = &[
-    "ls", "dir", "cd", "pwd", "lcd", "stat", "get", "put", "cat", "mkdir", "rm", "rmdir", "mv",
-    "ln", "chmod", "chown", "df", "help", "exit", "quit",
+    "ls", "dir", "cd", "pwd", "lcd", "stat", "get", "put", "cat", "sum", "mkdir", "rm", "rmdir",
+    "mv", "ln", "chmod", "chown", "df", "du", "help", "exit", "quit",
 ];
 
 /// One component of the working-directory stack.
@@ -469,8 +469,10 @@ impl Session {
             "get" => self.cmd_get(args, out, err)?,
             "put" => self.cmd_put(args, err)?,
             "cat" => self.cmd_cat(args, out)?,
+            "sum" => self.cmd_sum(args, out, err)?,
+            "du" => self.cmd_du(args, out)?,
             "mkdir" => self.cmd_mkdir(args)?,
-            "rm" => self.cmd_rm(args)?,
+            "rm" => self.cmd_rm(args, err)?,
             "rmdir" => self.cmd_rmdir(args)?,
             "mv" => self.cmd_mv(args)?,
             "ln" => self.cmd_ln(args)?,

@@ -37,7 +37,7 @@ fn shell_help_documents_the_version_and_port_flags() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("--nfs-version"), "{text}");
     assert!(
-        text.contains("get [-rckn]"),
+        text.contains("get [-rcknV]") && text.contains("sum [-a alg]"),
         "shell commands listed: {text}"
     );
     assert!(
@@ -117,6 +117,28 @@ fn port_flags_reject_zero() {
     let out = nfsc(&["--nfs-port", "0", "exports", "nas"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("invalid value"), "{}", stderr(&out));
+}
+
+#[test]
+fn global_options_read_nfsc_environment_variables() {
+    let top = String::from_utf8_lossy(&nfsc(&["--help"]).stdout).into_owned();
+    assert!(
+        top.contains("NFSC_UID") && top.contains("NFSC_TIMEOUT"),
+        "{top}"
+    );
+    for (var, bad) in [
+        ("NFSC_TIMEOUT", "0"),
+        ("NFSC_UID", "root"),
+        ("NFSC_PROTO", "sctp"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_nfsc"))
+            .args(["rpcinfo", "nas"])
+            .env(var, bad)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{var}={bad} is a usage error");
+        assert!(stderr(&out).contains("invalid value"), "{}", stderr(&out));
+    }
 }
 
 #[test]

@@ -123,7 +123,7 @@ fn arg_kind(cmd: &str, index: usize) -> Option<Kind> {
     use Kind::{Local, Remote};
     Some(match (cmd, index) {
         ("ls" | "dir" | "cat", 0) => Remote { dirs_only: false },
-        ("stat" | "rm" | "rmdir", _) => Remote { dirs_only: false },
+        ("stat" | "rm" | "rmdir" | "sum" | "du", _) => Remote { dirs_only: false },
         ("cd" | "df", 0) => Remote { dirs_only: true },
         ("mv" | "ln", 0 | 1) => Remote { dirs_only: false },
         ("chmod" | "chown", i) if i >= 1 => Remote { dirs_only: false },
@@ -138,8 +138,11 @@ fn arg_kind(cmd: &str, index: usize) -> Option<Kind> {
 fn flags_for(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "ls" | "dir" => &["-l"],
-        "get" => &["-c", "-k", "-n", "-r"],
-        "put" => &["-c", "-r"],
+        "get" => &["-V", "-c", "-k", "-n", "-r"],
+        "put" => &["-c", "-k", "-n", "-r"],
+        "rm" => &["-r"],
+        "du" => &["-h", "-s"],
+        "sum" => &["-a"],
         "ln" => &["-s"],
         _ => &[],
     }
