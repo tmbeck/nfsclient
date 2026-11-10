@@ -98,7 +98,8 @@ testenv/run-live.sh "$NFSC_TESTENV"
 ## Caveats
 
 - knfsd needs the host `nfsd` module (`up.sh` loads it). Kernel nfsd here has
-  no NFSv2 and, on this kernel, no NFSv4.0 either.
+  no NFSv2. NFSv4.0 works even though `/proc/fs/nfsd/versions` lists only
+  `+4 +4.1 +4.2` (`+4` covers minor version 0).
 - Kernel nfsd and ganesha ownership is numeric: no idmapd runs, so v4 owner
   strings are numeric.
 - Scratch data lives in tmpfs (knfsd) or podman volumes `nfsc-ganesha-rw/ro`

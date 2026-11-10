@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `put` is atomic: uploads go to `NAME.nfsc-part` on the server and are
+  renamed over `NAME` on success. `put -c` resumes the remote part after
+  comparing the whole uploaded prefix with the local file, so a hole left by
+  a failed pipelined write is caught. `put -V` re-reads and compares SHA-256.
+- `get -p` / `--preserve` keeps the server's mode bits.
+- Connecting retries while the server is down or rebooting: the whole
+  version negotiation is repeated under one retry budget, and "version not
+  offered" answers still fall through immediately.
+- `Connected::fs` is `Box<dyn Filesystem + Send>`.
+- In-process fake NFSv4.0/4.1/4.2 server with fault injection (DELAY, GRACE,
+  reboot with grace period, BADSESSION, STALE_CLIENTID, lease expiry, lost
+  and truncated replies, knfsd-like and fully caching reply caches) and a
+  52-test backend suite; `tests/connect_retry.rs`.
+
+### Changed
+
+- `get` applies the local umask to downloaded files and directories (like
+  `cp`); use `-p` for the previous behaviour.
+- NFSv4 reconnects keep client state: the client verifier is fixed for the
+  life of a connection, NFSv4.1+ keeps its session on a new TCP connection
+  (BIND_CONN_TO_SESSION when asked), and NFSv4.0 renews its client ID, so
+  the server keeps open files.
+- Retry notices print above progress bars instead of through them, and
+  repeats are thinned.
+- `get -r` syncs each directory once instead of after every file.
+
+### Fixed
+
+- NFSv4.1: a lost reply no longer leaves its slot's sequence id stale. The
+  slot is probed before reuse, so the server never replays a different
+  request's reply (which could return data from another offset) or answers
+  RETRY_UNCACHED_REP.
+- NFSv4.0: a lease expiry or reconnect that loses client state no longer
+  loops on EXPIRED until the retry budget runs out; the file is reopened for
+  a fresh stateid.
+- `get -c` no longer resumes onto an all-zero tail or an older file kept in
+  place, which could join two versions of a file.
+- NFSv4 setup waits for DELAY/GRACE honour Ctrl-C and `--retry-time 0`.
+- testenv: kernel nfsd serves NFSv4 on Linux 7.2 (a tmpfs `fsid=0`
+  pseudo-root with bind mounts, and `nfsdcld`).
+
 ## [1.2.0] - 2026-11-10
 
 ### Added
