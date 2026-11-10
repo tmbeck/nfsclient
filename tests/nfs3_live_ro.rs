@@ -248,19 +248,23 @@ fn ro_fixtures_match_manifest() {
         eprintln!("NFSC_TEST_RO_MANIFEST not set; skipping fixture checks");
         return;
     };
-    let text = std::fs::read_to_string(&manifest).expect("read manifest");
+    // Raw bytes: fixtures deliberately include a non-UTF-8 file name.
+    let text = std::fs::read(&manifest).expect("read manifest");
     let Connected { mut fs, remainder, .. } = connect(ip, &path, Proto::Tcp);
     let root = fs.root();
     let (base, _) = walk(fs.as_mut(), root, &remainder);
 
     let mut checked = 0;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let (want, rel) = line.split_once("  ").expect("manifest line: '<sha256>  <path>'");
+    for line in text.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let (want, rel) = line.split_at(64);
+        let want = std::str::from_utf8(want).expect("hex digest");
+        let rel = rel.strip_prefix(b"  ").expect("manifest line: '<sha256>  <path>'");
         let mut fh = base.clone();
-        for comp in rel.trim().split('/').filter(|c| !c.is_empty()) {
-            fh = fs.lookup(&fh, comp.as_bytes()).expect("lookup fixture").0;
+        for comp in rel.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            fh = fs.lookup(&fh, comp).expect("lookup fixture").0;
         }
         let data = read_all(fs.as_mut(), &fh);
+        let rel = String::from_utf8_lossy(rel);
         assert_eq!(sha256_hex(&data), want, "sha256 mismatch for {rel}");
         checked += 1;
     }

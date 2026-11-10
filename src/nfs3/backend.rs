@@ -338,6 +338,7 @@ impl Filesystem for Nfs3 {
         mode: CreateMode,
         attrs: &SetAttr,
     ) -> Result<(FileHandle, Attr)> {
+        let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_FILE_MODE);
         let how = match mode {
             CreateMode::Unchecked => CreateHow::Unchecked(Sattr3::from_fs(attrs)),
             CreateMode::Guarded => CreateHow::Guarded(Sattr3::from_fs(attrs)),
@@ -380,6 +381,7 @@ impl Filesystem for Nfs3 {
     }
 
     fn mkdir(&mut self, dir: &FileHandle, name: &[u8], attrs: &SetAttr) -> Result<(FileHandle, Attr)> {
+        let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_DIR_MODE);
         let s = Sattr3::from_fs(attrs);
         let r: Reply<CreateOk> = self.call(
             proto::MKDIR,
@@ -398,6 +400,7 @@ impl Filesystem for Nfs3 {
         target: &[u8],
         attrs: &SetAttr,
     ) -> Result<(FileHandle, Attr)> {
+        let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_SYMLINK_MODE);
         let s = Sattr3::from_fs(attrs);
         let r: Reply<CreateOk> = self.call(
             proto::SYMLINK,

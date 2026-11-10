@@ -152,7 +152,7 @@ fn rw_small_write_read_back() {
 
         // Overwrite in the middle without changing the length.
         write_all(fs, &fh, 7, b"NFS!");
-        assert_eq!(read_all(fs, &fh), b"hello, NFS!");
+        assert_eq!(read_all(fs, &fh), b"hello, NFS!d");
         assert_eq!(fs.getattr(&fh).unwrap().size, 12);
 
         // Write past the end leaves a hole that reads back as zeros.

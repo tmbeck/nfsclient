@@ -311,6 +311,7 @@ impl Filesystem for Nfs2 {
         mode: CreateMode,
         attrs: &SetAttr,
     ) -> Result<(FileHandle, Attr)> {
+        let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_FILE_MODE);
         if matches!(mode, CreateMode::Guarded | CreateMode::Exclusive) {
             // v2 has no GUARDED or EXCLUSIVE create, so this check races with
             // other clients. Exclusive is only as strong as Guarded here.
@@ -332,6 +333,7 @@ impl Filesystem for Nfs2 {
         name: &[u8],
         attrs: &SetAttr,
     ) -> Result<(FileHandle, Attr)> {
+        let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_DIR_MODE);
         let args = (diropargs(dir, name)?, to_sattr(attrs)?);
         let r: Res<(WireFh, Fattr)> = self.call(PROC_MKDIR, &args)?;
         let (fh, attr) = r.into_result()?;
@@ -345,6 +347,7 @@ impl Filesystem for Nfs2 {
         target: &[u8],
         attrs: &SetAttr,
     ) -> Result<(FileHandle, Attr)> {
+        let attrs = &attrs.with_default_mode(SetAttr::DEFAULT_SYMLINK_MODE);
         if target.len() > MAXPATHLEN {
             return Err(Error::Nfs(Status::NameTooLong));
         }

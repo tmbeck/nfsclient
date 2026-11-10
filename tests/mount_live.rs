@@ -88,6 +88,10 @@ fn mount_v1_mnt_returns_32_byte_handle() {
             mount::umnt(ip, None, 1, &path, &o).expect("UMNT v1");
         }
         Err(e) if e.is_version_unsupported() => eprintln!("MOUNT v1 not registered: {e}"),
+        // Servers without NFSv2 (e.g. nfs-ganesha) register MOUNT v1 but refuse MNT.
+        Err(nfsc::Error::Accept(nfsc::error::AcceptError::ProcUnavail)) => {
+            eprintln!("MOUNT v1 MNT not offered by this server")
+        }
         Err(e) => panic!("MNT v1: {e}"),
     }
 }

@@ -136,6 +136,22 @@ pub struct SetAttr {
     pub mtime: Option<SetTime>,
 }
 
+impl SetAttr {
+    /// Default permission bits backends apply when a create-type call
+    /// (create / mkdir / symlink) leaves `mode` unset. Some servers (e.g.
+    /// nfs-ganesha) otherwise create objects with mode 0.
+    pub const DEFAULT_FILE_MODE: u32 = 0o644;
+    pub const DEFAULT_DIR_MODE: u32 = 0o755;
+    pub const DEFAULT_SYMLINK_MODE: u32 = 0o777;
+
+    /// A copy with `mode` filled in when unset.
+    pub fn with_default_mode(&self, mode: u32) -> SetAttr {
+        let mut a = self.clone();
+        a.mode.get_or_insert(mode);
+        a
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateMode {
     /// Create or truncate-if-exists semantics are NOT implied; succeeds if the file exists
@@ -308,6 +324,8 @@ pub trait Filesystem {
     /// be durable on return (FILE_SYNC, or UNSTABLE followed by `commit`).
     fn write(&mut self, fh: &FileHandle, offset: u64, data: &[u8]) -> Result<u32>;
 
+    /// For create, mkdir and symlink, an unset `attrs.mode` means the
+    /// `SetAttr::DEFAULT_*_MODE` value, never "server default".
     fn create(
         &mut self,
         dir: &FileHandle,
