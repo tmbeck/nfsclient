@@ -1,0 +1,5 @@
+# Same paths for NFSv3 (MOUNT) and NFSv4 (pseudo-fs). No fsid=0 root: the
+# v4 pseudo-root is built from the export paths, so /export/rw is /export/rw
+# on every protocol. Explicit fsids keep the two tmpfs exports distinct.
+/export/rw  *(rw,sync,no_subtree_check,insecure,no_root_squash,fsid=1)
+/export/ro  *(ro,sync,no_subtree_check,insecure,root_squash,fsid=2)
