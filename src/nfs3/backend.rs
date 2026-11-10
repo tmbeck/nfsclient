@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{AcceptError, Error, Result};
 use crate::fs::{self, Attr, CreateMode, FileHandle, Filesystem, FsStat, NfsVersion, SetAttr, Status};
 use crate::mount;
+use crate::rpc::pipeline::{self, ReadIo, WriteAck, WriteIo, DEFAULT_WINDOW};
 use crate::rpc::{Proto, RpcClient, RpcOptions};
 use crate::xdr::Pack;
 
@@ -15,7 +16,7 @@ use super::proto::{
     LinkOk, LookupOk, MkdirArgs, ReadArgs, ReadOk, ReadlinkOk, ReaddirArgs, ReaddirOk, ReaddirPlusArgs,
     RenameArgs, RenameOk, Reply, SetattrArgs, SymlinkArgs, WriteArgs, WriteOk,
 };
-use super::types::{CreateHow, Fattr3, Sattr3, TimeSet, Verf, WccData, FILE_SYNC};
+use super::types::{CreateHow, Fattr3, Sattr3, TimeSet, Verf, WccData, FILE_SYNC, UNSTABLE};
 
 /// Largest READ/WRITE transfer we will use, whatever FSINFO advertises.
 pub const MAX_TRANSFER: u32 = 1 << 20;
@@ -228,6 +229,77 @@ impl Nfs3 {
     }
 }
 
+/// READ pipeline over one RPC connection: each request is one RPC xid.
+struct V3Reads<'a, 'b> {
+    fs: &'a mut Nfs3,
+    fh: &'b FileHandle,
+}
+
+impl ReadIo for V3Reads<'_, '_> {
+    type Tag = u32;
+
+    fn issue(&mut self, offset: u64, count: u32) -> Result<u32> {
+        self.fs.client.send_call(proto::READ, &ReadArgs { fh: self.fh, offset, count })
+    }
+
+    fn complete(&mut self, xid: u32) -> Result<(Vec<u8>, bool)> {
+        let r: Reply<ReadOk> = self.fs.client.recv_reply(xid)?;
+        Ok((r.0.data, r.0.eof))
+    }
+
+    fn read_sync(&mut self, offset: u64, count: u32) -> Result<(Vec<u8>, bool)> {
+        self.fs.read(self.fh, offset, count)
+    }
+}
+
+/// UNSTABLE WRITE and COMMIT pipeline over one RPC connection.
+struct V3Writes<'a, 'b> {
+    fs: &'a mut Nfs3,
+    fh: &'b FileHandle,
+}
+
+impl WriteIo for V3Writes<'_, '_> {
+    type Tag = u32;
+
+    fn issue(&mut self, offset: u64, data: &[u8]) -> Result<u32> {
+        self.fs.client.send_call(
+            proto::WRITE,
+            &WriteArgs {
+                fh: self.fh,
+                offset,
+                stable: UNSTABLE,
+                data,
+            },
+        )
+    }
+
+    fn complete(&mut self, xid: u32) -> Result<WriteAck> {
+        let r: Reply<WriteOk> = self.fs.client.recv_reply(xid)?;
+        let w = r.0;
+        Ok(WriteAck {
+            count: w.count,
+            durable: w.committed == FILE_SYNC,
+            verf: w.verf,
+        })
+    }
+
+    fn commit(&mut self, offset: u64, count: u32) -> Result<[u8; 8]> {
+        let c: Reply<CommitOk> = self.fs.call(proto::COMMIT, &CommitArgs { fh: self.fh, offset, count })?;
+        Ok(c.0.verf)
+    }
+}
+
+impl Nfs3 {
+    /// Requests kept in flight for bulk transfers (1 over UDP).
+    fn window(&self) -> usize {
+        if self.client.pipelined() {
+            DEFAULT_WINDOW
+        } else {
+            1
+        }
+    }
+}
+
 impl Filesystem for Nfs3 {
     fn version(&self) -> NfsVersion {
         NfsVersion::V3
@@ -329,6 +401,29 @@ impl Filesystem for Nfs3 {
             }
         }
         Ok((w.count as usize).min(n) as u32)
+    }
+
+    fn read_stream(
+        &mut self,
+        fh: &FileHandle,
+        offset: u64,
+        len: Option<u64>,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        let (chunk, window) = (self.max_read, self.window());
+        let mut io = V3Reads { fs: self, fh };
+        pipeline::read_pipelined(&mut io, offset, len, chunk, window, sink)
+    }
+
+    fn write_stream(
+        &mut self,
+        fh: &FileHandle,
+        offset: u64,
+        source: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
+    ) -> Result<u64> {
+        let (chunk, window) = (self.max_write as usize, self.window());
+        let mut io = V3Writes { fs: self, fh };
+        pipeline::write_pipelined(&mut io, offset, chunk, window, source)
     }
 
     fn create(

@@ -189,13 +189,56 @@ impl Transport {
         Ok((Transport { addr, timeout: opts.timeout, port_mode: opts.port_mode, conn }, privileged))
     }
 
-    /// Send one call message and return the raw bytes of the reply whose xid matches
-    /// (skipping stale replies with other xids).
+    /// UDP only: send one call and return the raw bytes of the reply whose xid
+    /// matches, retransmitting with backoff (other xids are skipped).
     pub fn round_trip(&mut self, xid: u32, msg: &[u8]) -> Result<Vec<u8>> {
-        let (addr, timeout, mode) = (self.addr, self.timeout, self.port_mode);
         match &mut self.conn {
-            Conn::Tcp(slot) => tcp_round_trip(slot, addr, timeout, mode, xid, msg),
-            Conn::Udp(sock) => udp_round_trip(sock, timeout, xid, msg),
+            Conn::Udp(sock) => udp_round_trip(sock, self.timeout, xid, msg),
+            Conn::Tcp(_) => Err(Error::Invalid("round_trip is UDP-only; use send_record".into())),
+        }
+    }
+
+    /// TCP only: write one call record, reconnecting first if the stream was
+    /// lost. Does not wait for a reply. Any failure drops the stream.
+    pub fn send_record(&mut self, msg: &[u8]) -> Result<()> {
+        let (addr, timeout, mode) = (self.addr, self.timeout, self.port_mode);
+        let Conn::Tcp(slot) = &mut self.conn else {
+            return Err(Error::Invalid("send_record is TCP-only".into()));
+        };
+        if slot.is_none() {
+            // A reconnect may land on a different privilege level; the
+            // `privileged` flag reported at connect time is not updated.
+            *slot = Some(connect_tcp(addr, timeout, mode)?.0);
+        }
+        let stream = slot.as_mut().expect("stream was just ensured");
+        let result = tcp_send(stream, timeout, msg);
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    }
+
+    /// TCP only: the next reply record on the stream, whatever its xid, read
+    /// before `deadline`. Any failure drops the stream.
+    pub fn recv_record(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+        let Conn::Tcp(slot) = &mut self.conn else {
+            return Err(Error::Invalid("recv_record is TCP-only".into()));
+        };
+        let Some(stream) = slot.as_mut() else {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::NotConnected, "connection was lost")));
+        };
+        let result = read_record(stream, deadline);
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    }
+
+    /// Drop the TCP stream, if any, so the next send reconnects. Replies still
+    /// in flight on the old stream are lost.
+    pub fn reset(&mut self) {
+        if let Conn::Tcp(slot) = &mut self.conn {
+            *slot = None;
         }
     }
 
@@ -253,53 +296,17 @@ fn bind_reserved(ip: &str) -> io::Result<Option<UdpSocket>> {
     Ok(None)
 }
 
-fn tcp_round_trip(
-    slot: &mut Option<TcpStream>,
-    addr: SocketAddr,
-    timeout: Duration,
-    mode: PortMode,
-    xid: u32,
-    msg: &[u8],
-) -> Result<Vec<u8>> {
-    if slot.is_none() {
-        // A reconnect may land on a different privilege level; the
-        // `privileged` flag reported at connect time is not updated.
-        *slot = Some(connect_tcp(addr, timeout, mode)?.0);
-    }
-    let stream = slot.as_mut().expect("stream was just ensured");
-    let result = tcp_exchange(stream, timeout, xid, msg);
-    if result.is_err() {
-        // A timeout or I/O error may leave a partial record behind; start clean next time.
-        *slot = None;
-    }
-    result
-}
-
-fn tcp_exchange(stream: &mut TcpStream, timeout: Duration, xid: u32, msg: &[u8]) -> Result<Vec<u8>> {
-    let deadline = Instant::now() + timeout;
+/// Write one call message as a single last-fragment record.
+fn tcp_send(stream: &mut TcpStream, timeout: Duration, msg: &[u8]) -> Result<()> {
     let len = u32::try_from(msg.len())
         .ok()
         .filter(|&n| n & LAST_FRAGMENT == 0)
         .ok_or_else(|| Error::Invalid("RPC message too large".to_string()))?;
-
-    // One call is sent as a single last-fragment record.
     let mut frame = Vec::with_capacity(4 + msg.len());
     frame.extend_from_slice(&(LAST_FRAGMENT | len).to_be_bytes());
     frame.extend_from_slice(msg);
     stream.set_write_timeout(Some(timeout)).map_err(map_io)?;
-    stream.write_all(&frame).map_err(map_io)?;
-
-    loop {
-        let record = read_record(stream, deadline)?;
-        if record.len() < 4 {
-            return Err(Error::Protocol(format!("reply record of {} bytes", record.len())));
-        }
-        let got = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
-        if got == xid {
-            return Ok(record);
-        }
-        // Stale reply to an earlier call: discard and keep waiting.
-    }
+    stream.write_all(&frame).map_err(map_io)
 }
 
 /// Read one record, reassembling fragments, under the overall `deadline`.
