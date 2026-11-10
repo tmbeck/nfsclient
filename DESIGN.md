@@ -80,7 +80,7 @@ Shell commands (kept deliberately small):
 ## Milestones
 
 1. ✅ XDR + RPC (TCP/UDP, AUTH_SYS, reserved ports) + portmap → `nfsc rpcinfo`
-2. MOUNT → `nfsc exports`; Filesystem facade; shell
-3. NFSv3, NFSv2, NFSv4.x backends (read + write), container test env
+2. ✅ MOUNT → `nfsc exports`; Filesystem facade; shell
+3. ✅ NFSv3, NFSv2, NFSv4.x backends (read + write), container test env (kernel nfsd container pending)
 4. Polish: tab completion, recursive transfers, progress, pipelined READ/WRITE,
    RPCSEC_GSS
