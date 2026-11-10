@@ -318,3 +318,42 @@ mod tests {
         assert_eq!(rem.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod export_list_fuzz {
+    use super::*;
+
+    /// Random and truncated export lists must decode to Ok or Err, never panic.
+    #[test]
+    fn export_list_decoder_never_panics() {
+        let mut state: u64 = 0x1234_5678_9abc_def1;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        // A valid list: one export with two groups, then the end marker.
+        let mut seed = Vec::new();
+        for word in [1u32, 4, u32::from_be_bytes(*b"/srv"), 1, 3, u32::from_be_bytes(*b"a\0\0\0"), 0] {
+            seed.extend_from_slice(&word.to_be_bytes());
+        }
+        let mut inputs: Vec<Vec<u8>> = (0..=seed.len()).map(|n| seed[..n].to_vec()).collect();
+        for _ in 0..3000 {
+            let len = (next() % 200) as usize;
+            inputs.push((0..len).map(|_| next() as u8).collect());
+        }
+        for _ in 0..3000 {
+            let mut m = seed.clone();
+            let i = (next() as usize) % m.len();
+            m[i] = next() as u8;
+            inputs.push(m);
+        }
+        for buf in inputs {
+            let result = std::panic::catch_unwind(|| {
+                let _ = crate::xdr::from_bytes::<ExportList>(&buf);
+            });
+            assert!(result.is_ok(), "export list decoder panicked on {buf:02x?}");
+        }
+    }
+}

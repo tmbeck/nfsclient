@@ -429,6 +429,29 @@ impl MemFs {
         Ok(id)
     }
 
+    /// Test helper for hostile servers: adds a child named by arbitrary bytes
+    /// under the directory `dir`, pointing at the existing object `target`.
+    /// Nothing is checked, so the name may contain '/', "..", NUL or control
+    /// bytes, and a directory may be linked back into its own tree.
+    pub fn add_raw_child(&mut self, dir: &str, name: &[u8], target: &str) -> Result<()> {
+        let dir_id = self.id_of_path(dir)?;
+        let target_id = self.id_of_path(target)?;
+        self.entries_mut(dir_id)?.insert(name.to_vec(), target_id);
+        self.node_mut(target_id)?.attr.nlink += 1;
+        self.touch(dir_id);
+        Ok(())
+    }
+
+    fn id_of_path(&self, path: &str) -> Result<u64> {
+        let mut cur = ROOT;
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            cur = self
+                .child(cur, part.as_bytes())
+                .ok_or(Error::Nfs(Status::NoEnt))?;
+        }
+        Ok(cur)
+    }
+
     fn drop_link(&mut self, id: u64) {
         let gone = match self.nodes.get_mut(&id) {
             Some(n) => {

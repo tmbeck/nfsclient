@@ -711,6 +711,11 @@ impl Filesystem for Nfs4Backend {
                 Res::Readdir { verifier, entries, eof } => (*verifier, entries.clone(), *eof),
                 _ => return Err(xdr_err("READDIR")),
             };
+            // Without this, a server that returns empty pages without EOF would
+            // keep the loop spinning on the same cookie forever.
+            if entries.is_empty() && !eof {
+                return Err(Error::Protocol("READDIR returned no entries before eof".into()));
+            }
             for e in entries {
                 cookie = e.cookie;
                 if e.name == b"." || e.name == b".." {
@@ -723,6 +728,12 @@ impl Filesystem for Nfs4Backend {
                     self.remember(h, dir, &e.name);
                 }
                 out.push(DirEntry { name: e.name, fileid, attr, handle });
+            }
+            if out.len() > crate::fs::MAX_DIR_ENTRIES {
+                return Err(Error::Protocol(format!(
+                    "directory listing exceeds {} entries",
+                    crate::fs::MAX_DIR_ENTRIES
+                )));
             }
             verf = new_verf;
             if eof {

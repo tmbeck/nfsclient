@@ -262,6 +262,6 @@ pub fn within_export(export: &[u8], target: &[u8]) -> Result<Vec<u8>> {
     }
     Err(Error::Invalid(format!(
         "symbolic link target '{}' is outside the export",
-        String::from_utf8_lossy(target)
+        crate::text::display_name(target)
     )))
 }

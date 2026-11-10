@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use nfsc::fs::{Attr, FileType, Time};
 
-use crate::text::display_name;
+use crate::text::{display_name, display_str};
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -124,13 +124,21 @@ pub fn full_time(t: Time) -> String {
 }
 
 /// Owner as shown by ls and stat: the v4 owner string, else the numeric uid.
+/// The string is server-supplied, so it is escaped for the terminal.
 pub fn owner_of(attr: &Attr) -> String {
-    attr.owner.clone().unwrap_or_else(|| attr.uid.to_string())
+    match &attr.owner {
+        Some(o) => display_str(o),
+        None => attr.uid.to_string(),
+    }
 }
 
 /// Group as shown by ls and stat: the v4 group string, else the numeric gid.
+/// Escaped like [`owner_of`].
 pub fn group_of(attr: &Attr) -> String {
-    attr.group.clone().unwrap_or_else(|| attr.gid.to_string())
+    match &attr.group {
+        Some(g) => display_str(g),
+        None => attr.gid.to_string(),
+    }
 }
 
 /// Sizes in the style of `df -h`: one decimal below 10, rounded up.
@@ -408,5 +416,42 @@ mod tests {
         );
         let link = stat_text("ln", &attr, Some("notes.txt"), 4096);
         assert!(link.starts_with("  File: ln -> notes.txt\n"));
+    }
+}
+
+#[cfg(test)]
+mod server_text_tests {
+    use super::*;
+
+    fn attr_with_owner(owner: &str, group: &str) -> Attr {
+        let t = Time { seconds: 0, nseconds: 0 };
+        Attr {
+            ftype: FileType::Regular,
+            mode: 0o644,
+            nlink: 1,
+            uid: 1,
+            gid: 2,
+            owner: Some(owner.to_string()),
+            group: Some(group.to_string()),
+            size: 0,
+            used: 0,
+            rdev: (0, 0),
+            fsid: 0,
+            fileid: 0,
+            atime: t,
+            mtime: t,
+            ctime: t,
+        }
+    }
+
+    #[test]
+    fn owner_and_group_strings_from_the_server_are_escaped() {
+        let a = attr_with_owner("evil\u{1b}[2J@x", "grp\u{7}\u{202e}");
+        let owner = owner_of(&a);
+        let group = group_of(&a);
+        assert!(!owner.contains(['\u{1b}', '\u{7}']), "{owner:?}");
+        assert!(!group.contains(['\u{7}', '\u{202e}']), "{group:?}");
+        let text = stat_text("f", &a, None, 4096);
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text:?}");
     }
 }

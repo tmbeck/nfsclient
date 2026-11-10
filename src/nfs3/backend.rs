@@ -136,6 +136,12 @@ where
                 out.push(ent);
             }
         }
+        if out.len() > fs::MAX_DIR_ENTRIES {
+            return Err(Error::Protocol(format!(
+                "directory listing exceeds {} entries",
+                fs::MAX_DIR_ENTRIES
+            )));
+        }
         if page.eof {
             return Ok(out);
         }
@@ -727,5 +733,40 @@ mod tests {
             (s.total_bytes, s.free_bytes, s.avail_bytes, s.total_files, s.free_files, s.avail_files),
             (1, 2, 3, 4, 5, 6)
         );
+    }
+}
+
+#[cfg(test)]
+mod endless_listing_tests {
+    use super::*;
+
+    /// A server that never reaches EOF and keeps returning one entry per page.
+    /// The test's own guard stops the fake at 1.1 million pages, which is past
+    /// the entry cap (1 << 20), so a missing cap shows up as `calls` reaching it.
+    #[test]
+    fn list_all_gives_up_on_a_listing_that_never_ends() {
+        const RUNAWAY: u64 = 1_100_000;
+        let mut calls = 0u64;
+        let r = list_all(|_, _| {
+            calls += 1;
+            if calls > RUNAWAY {
+                return Err(crate::error::Error::Invalid("runaway fake".into()));
+            }
+            Ok(Page {
+                verf: [0; 8],
+                entries: vec![(
+                    1,
+                    fs::DirEntry {
+                        name: Vec::new(),
+                        fileid: calls,
+                        attr: None,
+                        handle: None,
+                    },
+                )],
+                eof: false,
+            })
+        });
+        assert!(r.is_err(), "endless READDIR was accepted");
+        assert!(calls <= RUNAWAY, "no entry cap: fake ran {calls} pages");
     }
 }

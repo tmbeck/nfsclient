@@ -1243,3 +1243,153 @@ fn put_c_past_four_gib_uploads_only_the_tail() {
     drop(b);
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---- Hostile server replies (review of v1.0.0) -----------------------------
+
+/// `t` holds a real file and several names a hostile server could send. The
+/// names are injected with `add_raw_child`, so MemFs does not reject them.
+fn hostile_fixture(abs: &str) -> MemFs {
+    let mut fs_ = fixture();
+    fs_.add_dir("t").unwrap();
+    fs_.add_dir("t/sub").unwrap();
+    fs_.add_file("t/src.txt", b"payload").unwrap();
+    fs_.add_file("t/real.txt", b"real").unwrap();
+    fs_.add_raw_child("t", b"../../escaped.txt", "t/src.txt")
+        .unwrap();
+    fs_.add_raw_child("t", abs.as_bytes(), "t/src.txt").unwrap();
+    fs_.add_raw_child("t", b"sub/../../escaped2.txt", "t/src.txt")
+        .unwrap();
+    fs_.add_raw_child("t", b"nul\0name", "t/src.txt").unwrap();
+    fs_.add_raw_child("t", b"dot/.", "t/src.txt").unwrap();
+    fs_
+}
+
+#[test]
+fn get_r_never_writes_outside_the_destination_for_server_names() {
+    let root = scratch("hostile_names");
+    let dl = root.join("dl");
+    fs::create_dir_all(&dl).unwrap();
+    let abs = format!("/tmp/nfsc-review-{}-abs.txt", std::process::id());
+    let mut s = session(hostile_fixture(&abs));
+    lcd(&mut s, &dl);
+    let r = run(&mut s, "get -r t");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(!root.join("escaped.txt").exists(), "wrote outside dl");
+    assert!(!root.join("escaped2.txt").exists(), "wrote outside dl");
+    assert!(
+        !Path::new(&abs).exists(),
+        "wrote to an absolute server name"
+    );
+    assert_eq!(fs::read(dl.join("t/real.txt")).unwrap(), b"real");
+    assert!(r.err.contains("unsafe name"), "{}", r.err);
+    let _ = fs::remove_file(&abs);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn get_r_stops_at_a_directory_linked_into_its_own_tree() {
+    let mut fs_ = hostile_fixture("/tmp/nfsc-review-unused-abs");
+    fs_.add_raw_child("t/sub", b"again", "t").unwrap();
+    let mut s = session(fs_);
+    let dir = scratch("get_r_loop");
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get -r t");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("directory loop"), "{}", r.err);
+    assert!(dir.join("t/real.txt").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_r_limits_directory_depth() {
+    let mut fs_ = fixture();
+    let mut p = String::from("deep");
+    fs_.add_dir(&p).unwrap();
+    for _ in 0..300 {
+        p.push_str("/d");
+        fs_.add_dir(&p).unwrap();
+    }
+    fs_.add_file("deep/top.txt", b"top").unwrap();
+    let mut s = session(fs_);
+    let dir = scratch("get_r_depth");
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get -r deep");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(r.err.contains("too deep"), "{}", r.err);
+    assert!(dir.join("deep/top.txt").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_strips_setuid_setgid_and_sticky_from_server_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("get_modes");
+    let mut fs_ = fixture();
+    let root = fs_.root();
+    let (fh, _) = fs_.lookup(&root, b"b.txt").unwrap();
+    fs_.setattr(
+        &fh,
+        &SetAttr {
+            mode: Some(0o7777),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    let mut s = session(fs_);
+    lcd(&mut s, &dir);
+    ok(&mut s, "get b.txt");
+    let mode = fs::metadata(dir.join("b.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "special bits from the server reached the local file"
+    );
+    assert_eq!(mode & 0o777, 0o777);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn server_names_with_control_bytes_are_shown_escaped() {
+    let dir = scratch("get_escape");
+    let mut fs_ = fixture();
+    fs_.add_file("ev\u{1b}[2Jil.txt", b"x").unwrap();
+    let mut s = session(fs_);
+    lcd(&mut s, &dir);
+    let r = run(&mut s, "get ev*");
+    assert!(r.failure.is_none(), "{:?}", r.failure);
+    assert!(!r.err.contains('\u{1b}'), "raw escape in {:?}", r.err);
+    assert!(r.err.contains("ev\\x1b[2Jil.txt"), "{}", r.err);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stat_shows_escaped_symlink_targets() {
+    let mut fs_ = fixture();
+    fs_.add_symlink("evlink", "tgt\u{1b}[31m").unwrap();
+    let mut s = session(fs_);
+    let out = ok(&mut s, "stat evlink");
+    assert!(!out.contains('\u{1b}'), "raw escape in {out:?}");
+}
+
+#[test]
+fn get_r_does_not_write_through_a_local_symlink() {
+    let root = scratch("get_r_symlink");
+    let dl = root.join("dl");
+    fs::create_dir_all(dl.join("t")).unwrap();
+    let victim = root.join("victim.txt");
+    fs::write(&victim, b"keep").unwrap();
+    std::os::unix::fs::symlink(&victim, dl.join("t/real.txt")).unwrap();
+    let mut s = session(hostile_fixture("/tmp/nfsc-review-unused-2"));
+    lcd(&mut s, &dl);
+    let r = run(&mut s, "get -r t");
+    assert!(
+        r.failure.as_deref().is_some_and(|f| f.contains("symbolic link")),
+        "{:?}",
+        r.failure
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"keep", "download wrote through a symlink");
+    let _ = fs::remove_dir_all(&root);
+}

@@ -22,6 +22,7 @@ use super::complete::ShellHelper;
 use super::format;
 use super::interrupt;
 use super::remote::{DirCache, RemoteCtx, SharedFs, resolve_path};
+use crate::text::display_str;
 
 /// Commands accepted by the shell, including aliases.
 pub const COMMANDS: &[&str] = &[
@@ -81,10 +82,12 @@ impl CmdFailure {
 }
 
 impl fmt::Display for CmdFailure {
+    /// Paths and messages can carry server-supplied names, so they are escaped.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = display_str(&self.msg);
         match &self.path {
-            Some(p) => write!(f, "nfsc: {}: {}: {}", self.cmd, p, self.msg),
-            None => write!(f, "nfsc: {}: {}", self.cmd, self.msg),
+            Some(p) => write!(f, "nfsc: {}: {}: {}", self.cmd, display_str(p), msg),
+            None => write!(f, "nfsc: {}: {}", self.cmd, msg),
         }
     }
 }
@@ -128,6 +131,13 @@ pub fn split_last(path: &str) -> (&str, &str) {
         Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
         None => ("", trimmed),
     }
+}
+
+/// Whether `name` is one plain path component: non-empty, not `.` or `..`, and
+/// without `/` or NUL. Server names must pass this before they are joined onto a
+/// local path, so that a hostile name cannot point outside the destination.
+pub fn is_plain_name(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.iter().any(|&b| b == b'/' || b == 0)
 }
 
 /// Rejects names that cannot be created, renamed or removed: empty, `.` and `..`.
@@ -348,8 +358,11 @@ impl Session {
         let stack = self.resolve(dir, true).ctx(cmd, pattern)?;
         let fh = last_node(&stack).fh.clone();
         let entries = self.fs.readdir(&fh).ctx(cmd, pattern)?;
+        // Names from the server that are not one plain component (a '/', "..",
+        // NUL) are never expanded: they would turn into a path outside `dir`.
         let mut names: Vec<String> = entries
             .into_iter()
+            .filter(|e| is_plain_name(&e.name))
             .filter_map(|e| String::from_utf8(e.name).ok())
             .filter(|n| super::line::glob_match(pat, n))
             .collect();
@@ -526,5 +539,18 @@ mod tests {
         assert_eq!(display_path(b"/", std::slice::from_ref(&root)), "/");
         let stack = vec![root, node("a"), node("b")];
         assert_eq!(display_path(b"/export/", &stack), "/export/a/b");
+    }
+}
+
+#[cfg(test)]
+mod failure_text_tests {
+    use super::*;
+
+    #[test]
+    fn failure_messages_escape_server_supplied_text() {
+        let f = CmdFailure::new("get", Some("dir/ev\u{1b}[31m"), "bad \u{1b}]0;x\u{7}");
+        let shown = f.to_string();
+        assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'), "{shown:?}");
+        assert!(shown.contains("dir/ev\\x1b[31m"), "{shown:?}");
     }
 }

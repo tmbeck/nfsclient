@@ -230,6 +230,12 @@ impl Filesystem for Nfs2 {
                     handle: None,
                 });
             }
+            if out.len() > crate::fs::MAX_DIR_ENTRIES {
+                return Err(Error::Protocol(format!(
+                    "directory listing exceeds {} entries",
+                    crate::fs::MAX_DIR_ENTRIES
+                )));
+            }
             if page.eof {
                 break;
             }

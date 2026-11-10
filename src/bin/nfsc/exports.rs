@@ -6,7 +6,7 @@ use nfsc::mount::{self, Export};
 use nfsc::rpc::Auth;
 
 use crate::cli::{self, CmdError, Globals};
-use crate::text::display_name;
+use crate::text::{display_name, display_str};
 
 /// The showmount layout: a header, then each directory left-justified to the
 /// widest one, one space, and the comma-separated groups (`(everyone)` if none).
@@ -15,10 +15,16 @@ pub fn format(host: &str, exports: &[Export]) -> String {
     let width = dirs.iter().map(|d| d.chars().count()).max().unwrap_or(0);
     let mut out = format!("Export list for {host}:\n");
     for (dir, export) in dirs.iter().zip(exports) {
+        // Group names come from the server, so they are escaped like paths.
         let groups = if export.groups.is_empty() {
             "(everyone)".to_string()
         } else {
-            export.groups.join(",")
+            export
+                .groups
+                .iter()
+                .map(|g| display_str(g))
+                .collect::<Vec<_>>()
+                .join(",")
         };
         out.push_str(&format!("{dir:<width$} {groups}\n"));
     }
@@ -64,5 +70,21 @@ mod tests {
     #[test]
     fn header_only_when_there_are_no_exports() {
         assert_eq!(format("nas", &[]), "Export list for nas:\n");
+    }
+}
+
+#[cfg(test)]
+mod server_text_tests {
+    use super::*;
+
+    #[test]
+    fn group_names_from_the_server_are_escaped() {
+        let list = vec![Export {
+            dir: b"/export".to_vec(),
+            groups: vec!["10.0.0.0/8\u{1b}[2J".to_string()],
+        }];
+        let text = format("nas", &list);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("10.0.0.0/8"), "{text:?}");
     }
 }

@@ -10,6 +10,11 @@ use std::net::IpAddr;
 use crate::error::Result;
 use crate::rpc::RpcOptions;
 
+/// Most entries one READDIR listing may collect before the backend gives up.
+/// Every backend enforces it, so a server that never sends EOF (or keeps
+/// returning cookies that cycle) cannot grow the client's memory without bound.
+pub(crate) const MAX_DIR_ENTRIES: usize = 1 << 20;
+
 /// Opaque server file handle (v2: 32 bytes, v3: <=64, v4: <=128).
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct FileHandle(pub Vec<u8>);
@@ -378,6 +383,12 @@ pub trait Filesystem {
                 None => self.max_read(),
             };
             let (data, eof) = self.read(fh, pos, want)?;
+            if data.len() > want as usize {
+                return Err(crate::error::Error::Protocol(format!(
+                    "READ at {pos} returned {} bytes for {want} requested",
+                    data.len()
+                )));
+            }
             if !data.is_empty() {
                 sink(&data)?;
                 pos += data.len() as u64;
@@ -413,6 +424,12 @@ pub trait Filesystem {
                 if w == 0 {
                     return Err(crate::error::Error::Protocol("server accepted a 0-byte write".into()));
                 }
+                if w > n - done {
+                    return Err(crate::error::Error::Protocol(format!(
+                        "server reported {w} bytes written for {} sent",
+                        n - done
+                    )));
+                }
                 done += w;
                 pos += w as u64;
             }
@@ -447,4 +464,107 @@ pub struct Connected {
 /// failed for a more specific reason than "not supported".
 pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Connected> {
     crate::client::connect(host, path, opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend whose READ and WRITE replies disagree with their requests.
+    /// Every other operation is unused by the tests below.
+    struct Liar {
+        read_extra: usize,
+        write_extra: u32,
+    }
+
+    fn unused<T>() -> Result<T> {
+        Err(crate::error::Error::Invalid("unused in this test".into()))
+    }
+
+    impl Filesystem for Liar {
+        fn version(&self) -> NfsVersion {
+            NfsVersion::V3
+        }
+        fn root(&self) -> FileHandle {
+            FileHandle(vec![1])
+        }
+        fn max_read(&self) -> u32 {
+            16
+        }
+        fn max_write(&self) -> u32 {
+            16
+        }
+        fn getattr(&mut self, _: &FileHandle) -> Result<Attr> {
+            unused()
+        }
+        fn setattr(&mut self, _: &FileHandle, _: &SetAttr) -> Result<Attr> {
+            unused()
+        }
+        fn lookup(&mut self, _: &FileHandle, _: &[u8]) -> Result<(FileHandle, Attr)> {
+            unused()
+        }
+        fn readdir(&mut self, _: &FileHandle) -> Result<Vec<DirEntry>> {
+            unused()
+        }
+        fn readlink(&mut self, _: &FileHandle) -> Result<Vec<u8>> {
+            unused()
+        }
+        fn read(&mut self, _: &FileHandle, _: u64, count: u32) -> Result<(Vec<u8>, bool)> {
+            Ok((vec![7; count as usize + self.read_extra], false))
+        }
+        fn write(&mut self, _: &FileHandle, _: u64, data: &[u8]) -> Result<u32> {
+            Ok(data.len() as u32 + self.write_extra)
+        }
+        fn create(&mut self, _: &FileHandle, _: &[u8], _: CreateMode, _: &SetAttr) -> Result<(FileHandle, Attr)> {
+            unused()
+        }
+        fn mkdir(&mut self, _: &FileHandle, _: &[u8], _: &SetAttr) -> Result<(FileHandle, Attr)> {
+            unused()
+        }
+        fn symlink(&mut self, _: &FileHandle, _: &[u8], _: &[u8], _: &SetAttr) -> Result<(FileHandle, Attr)> {
+            unused()
+        }
+        fn link(&mut self, _: &FileHandle, _: &FileHandle, _: &[u8]) -> Result<()> {
+            unused()
+        }
+        fn remove(&mut self, _: &FileHandle, _: &[u8]) -> Result<()> {
+            unused()
+        }
+        fn rmdir(&mut self, _: &FileHandle, _: &[u8]) -> Result<()> {
+            unused()
+        }
+        fn rename(&mut self, _: &FileHandle, _: &[u8], _: &FileHandle, _: &[u8]) -> Result<()> {
+            unused()
+        }
+        fn fsstat(&mut self, _: &FileHandle) -> Result<FsStat> {
+            unused()
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_stream_rejects_a_reply_larger_than_requested() {
+        let mut liar = Liar { read_extra: 10, write_extra: 0 };
+        let mut seen = 0u64;
+        let r = liar.read_stream(&FileHandle(vec![1]), 0, Some(16), &mut |c: &[u8]| {
+            seen += c.len() as u64;
+            Ok(())
+        });
+        assert!(r.is_err(), "oversized READ reply accepted");
+        assert_eq!(seen, 0, "oversized data reached the sink");
+    }
+
+    #[test]
+    fn write_stream_rejects_a_count_beyond_the_data_sent() {
+        let mut liar = Liar { read_extra: 0, write_extra: 5 };
+        let mut left = 40usize;
+        let r = liar.write_stream(&FileHandle(vec![1]), 0, &mut |buf: &mut [u8]| {
+            let n = left.min(buf.len());
+            left -= n;
+            Ok(n)
+        });
+        assert!(r.is_err(), "WRITE count beyond the data was accepted: {r:?}");
+    }
 }
