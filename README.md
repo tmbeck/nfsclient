@@ -22,8 +22,12 @@ protocols itself.
   `-v`. Over TCP and UDP where the protocol allows it.
 - Read and write: `ls`, `get`, `put`, `cat`, `mkdir`, `rm`, `rmdir`, `mv`,
   `ln`, `chmod`, `chown`, `stat`, `df`, with recursive `get -r` and `put -r`.
-- Resumable transfers (`get -c`, `put -c`), progress on stderr, and mtime
-  preserved on `get`.
+- Resumable transfers (`get -c`, `put -c`), and mtime preserved on `get`.
+- Progress bars with rate and ETA; `get -r` / `put -r` add a totals bar for
+  the whole tree and print a summary.
+- Pipelined READ/WRITE: several requests in flight for NFSv3 and NFSv4.x.
+- Concise `--help`, and `help <cmd>` inside the shell, suitable for scripts
+  and agents.
 - Ctrl-C interrupts a running transfer; tab completion in the interactive shell.
 - Source-port control for servers that require reserved ports.
 - AUTH_SYS with a chosen uid, gid and supplementary groups.
@@ -62,6 +66,10 @@ cargo install --path .
 
 This installs `nfsc` into `~/.cargo/bin`. To build only the library, without
 the command-line dependencies, use `cargo build --no-default-features`.
+
+With [`just`](https://github.com/casey/just), `just install-cap` installs and
+also grants the binary `cap_net_bind_service`, so `secure` exports work
+without root (see [Privileged source ports](#privileged-source-ports)).
 
 ## Quick start
 
@@ -168,8 +176,8 @@ or `\` to escape spaces. Separate several commands on one line with `;`.
 | `pwd`                      | Print the remote working directory.                                    |
 | `lcd [path]`               | Change the local working directory. No argument goes to `$HOME`.       |
 | `stat path...`             | Show attributes. Symlinks are shown, not followed.                     |
-| `get [-r] remote [local]`  | Download. `-r` includes directories. A local name of `-` writes to stdout. `-c` resumes a partial download. The local mtime is set from the remote one. |
-| `put [-r] local [remote]`  | Upload. `-r` includes directories. `-c` resumes a partial upload.      |
+| `get [-r] [-c] remote [local]` | Download. `-r` includes directories. A local name of `-` writes to stdout. `-c` resumes a partial download. The local mtime is set from the remote one. |
+| `put [-r] [-c] local [remote]` | Upload. `-r` includes directories. `-c` resumes a partial upload.  |
 | `cat path`                 | Write a remote file to stdout.                                         |
 | `mkdir path...`            | Create directories.                                                    |
 | `rm path...`               | Remove files or symlinks (not directories).                            |
@@ -179,7 +187,7 @@ or `\` to escape spaces. Separate several commands on one line with `;`.
 | `chmod mode path...`       | Change permissions. `mode` is octal, for example `644`.                |
 | `chown uid[:gid] path...`  | Change owner and group. Numeric IDs only.                              |
 | `df [path]`                | Show space on the file system.                                         |
-| `help`                     | Show the command list.                                                 |
+| `help [cmd]`               | Show the command summary, or details for one command.                  |
 | `exit`, `quit`             | Leave the shell.                                                       |
 
 Behavior that applies to all commands:
@@ -190,8 +198,11 @@ Behavior that applies to all commands:
 - `-c 'cmd; cmd'` and piped scripts run commands in order and stop at the
   first failure. `exit` or `quit` ends early with status 0.
 - Unknown command names in `-c` are rejected before connecting.
-- A progress line appears on stderr only when stderr is a terminal, so
-  scripts and pipes stay clean.
+- Progress bars appear on stderr only when stderr is a terminal, so scripts
+  and pipes stay clean. Recursive transfers scan the tree first and show a
+  totals bar (files and bytes) below the current file's bar.
+- `nfsc shell --help` lists the shell commands, so you can discover them
+  without connecting; `-c 'help get'` prints one command's details.
 - File data goes to stdout only for `cat` and `get -`. Diagnostics go to stderr.
 
 Global options, given before or after the subcommand:
@@ -208,7 +219,7 @@ Global options, given before or after the subcommand:
 | `--version`, `--help`               |               | Print the version or help.                           |
 
 Exit status: 0 on success, 1 when a command fails, 2 for invalid command-line
-options (clap's usage error).
+options (clap's usage error), 130 when interrupted with Ctrl-C.
 
 ## Library
 
@@ -257,16 +268,38 @@ timeout, credentials and version.
   Numeric owner strings map to their number.
 - **UDP:** NFSv2, NFSv3 and the MOUNT and portmap services. NFSv4 requires TCP.
 
+## Development
+
+Common tasks are in the [`justfile`](justfile); run `just` to list them.
+
+| Recipe                      | What it does                                                   |
+|-----------------------------|----------------------------------------------------------------|
+| `just build` / `just release` | Debug or optimized build.                                    |
+| `just test [ARGS]`          | Offline tests (`cargo test`); live suites skip themselves.     |
+| `just lint`                 | `cargo fmt --check`, clippy with `-D warnings`, library-only build. |
+| `just ci`                   | `lint` then `test`, as CI runs them.                           |
+| `just fmt`                  | Format the code.                                               |
+| `just install`              | `cargo install --path .`                                       |
+| `just setcap` / `just install-cap` | Grant `cap_net_bind_service` (sudo), optionally after installing. |
+| `just testenv-up [all\|knfsd\|ganesha]` | Start the podman NFS test servers.                |
+| `just testenv-down [...]`   | Stop them.                                                     |
+| `just live [--sudo] [--no-lease]` | Run every live suite against the test servers.           |
+| `just bench host:/export/dir/file [vers] [MiB]` | Read-only throughput benchmark, sequential vs pipelined. |
+| `just clean`                | `cargo clean`.                                                 |
+
+The test-server env file defaults to `testenv/testenv.env` (gitignored);
+set `NFSC_TESTENV_FILE` to use another path.
+
 ## Testing
 
-Unit and offline tests run with plain `cargo test`. Live tests need servers
-and skip themselves unless their environment variables are set. The
-`testenv/` directory starts local NFS servers in podman containers, and
+Unit and offline tests run with `just test` (plain `cargo test`). Live tests
+need servers and skip themselves unless their environment variables are set.
+The `testenv/` directory starts local NFS servers in podman containers, and
 `testenv/run-live.sh` runs the live suites against them:
 
 ```sh
-testenv/up.sh
-testenv/run-live.sh testenv/testenv.env
+just testenv-up          # testenv/up.sh
+just live --no-lease     # testenv/run-live.sh testenv/testenv.env
 ```
 
 See [`testenv/README.md`](testenv/README.md) for the servers, the environment
