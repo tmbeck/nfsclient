@@ -84,6 +84,24 @@ pub fn getport(host: IpAddr, prog: u32, vers: u32, proto: Proto, opts: &RpcOptio
     }
 }
 
+/// True when `e` means the portmapper itself could not be reached (refused,
+/// unreachable, or silent), as opposed to answering "not registered".
+pub fn is_unreachable(e: &Error) -> bool {
+    matches!(e, Error::Io(_) | Error::Timeout)
+}
+
+/// Standard NFS port, used when the portmapper cannot be reached.
+pub const NFS_DEFAULT_PORT: u16 = 2049;
+
+/// Port of the NFS service: GETPORT, falling back to 2049 when portmap (111)
+/// is unreachable. A portmap that answers "not registered" is not a fallback case.
+pub fn nfs_port(host: IpAddr, vers: u32, proto: Proto, opts: &RpcOptions) -> Result<u16> {
+    match getport(host, 100003, vers, proto, opts) {
+        Err(e) if is_unreachable(&e) => Ok(NFS_DEFAULT_PORT),
+        r => r,
+    }
+}
+
 /// PMAPPROC_DUMP. Talks to the portmapper using `opts.proto`.
 pub fn dump(host: IpAddr, opts: &RpcOptions) -> Result<Vec<Mapping>> {
     let mut client = connect(host, opts)?;

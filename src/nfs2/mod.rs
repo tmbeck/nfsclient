@@ -31,7 +31,7 @@ pub const VERSION: u32 = 2;
 pub fn connect(host: IpAddr, path: &[u8], opts: &ConnectOptions) -> Result<Connected> {
     let nfs_port = match opts.nfs_port {
         Some(p) => p,
-        None => portmap::getport(host, PROGRAM, VERSION, opts.rpc.proto, &opts.rpc)?,
+        None => portmap::nfs_port(host, VERSION, opts.rpc.proto, &opts.rpc)?,
     };
     let (export, remainder, root) = mount_root(host, path, opts)?;
     let umount = backend::Umount {
@@ -60,6 +60,8 @@ fn mount_root(
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>, FileHandle)> {
     // EXPORT failing (e.g. the server hides its export list) is not fatal:
     // MNT on the full path is the fallback.
+    let path = mount::normalize_path(path);
+    let path = path.as_slice();
     let exports = mount::exports(host, opts.mount_port, &opts.rpc).unwrap_or_default();
     let (export, remainder) = match mount::resolve_export(&exports, path) {
         Some((e, rest)) => (e.dir.clone(), rest),

@@ -303,6 +303,12 @@ impl Unpack for ReadOk {
         let count = d.get_u32()?;
         let eof = d.get_bool()?;
         let data = d.get_opaque_vec()?;
+        if count as usize > data.len() {
+            return Err(crate::error::Error::Protocol(format!(
+                "READ reply count {count} exceeds the {} data bytes returned",
+                data.len()
+            )));
+        }
         Ok(ReadOk {
             attr,
             count,
@@ -543,6 +549,24 @@ mod tests {
 
     fn fh(bytes: &[u8]) -> FileHandle {
         FileHandle(bytes.to_vec())
+    }
+
+    fn read_reply(count: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = vec![0, 0, 0, 0]; // no post-op attributes
+        b.extend_from_slice(&count.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 1]); // eof
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(data);
+        b.resize(b.len() + (4 - data.len() % 4) % 4, 0);
+        b
+    }
+
+    #[test]
+    fn read_count_must_not_exceed_data() {
+        let ok: ReadOk = from_bytes(&read_reply(3, b"abc")).unwrap();
+        assert_eq!(ok.data, b"abc");
+        let err = from_bytes::<ReadOk>(&read_reply(10, b"abc")).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Protocol(_)), "{err}");
     }
 
     #[test]

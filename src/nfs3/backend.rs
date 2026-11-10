@@ -55,10 +55,17 @@ pub(crate) fn open(
     export: Vec<u8>,
     root: FileHandle,
 ) -> Result<Nfs3> {
-    let info: Reply<FsinfoOk> = client.call(proto::FSINFO, &FhArg(&root))?;
     let proto = mount_opts.proto;
-    let max_read = transfer_size(info.0.rtpref, info.0.rtmax, proto);
-    let max_write = transfer_size(info.0.wtpref, info.0.wtmax, proto);
+    // FSINFO is advisory: if it fails, use the defaults (as for 0/0 sizes)
+    // instead of refusing to connect.
+    let (max_read, max_write) =
+        match client.call::<_, Reply<FsinfoOk>>(proto::FSINFO, &FhArg(&root)) {
+            Ok(info) => (
+                transfer_size(info.0.rtpref, info.0.rtmax, proto),
+                transfer_size(info.0.wtpref, info.0.wtmax, proto),
+            ),
+            Err(_) => (transfer_size(0, 0, proto), transfer_size(0, 0, proto)),
+        };
     Ok(Nfs3 {
         client,
         root,
@@ -77,7 +84,8 @@ pub fn transfer_size(pref: u32, max: u32, proto: Proto) -> u32 {
     let s = match (pref, max) {
         (0, 0) => 64 << 10,
         (0, m) => m,
-        (p, _) => p,
+        (p, 0) => p,
+        (p, m) => p.min(m),
     };
     let s = s.min(MAX_TRANSFER);
     match proto {
@@ -385,7 +393,8 @@ impl Filesystem for Nfs3 {
     fn readdir(&mut self, dir: &FileHandle) -> Result<Vec<fs::DirEntry>> {
         if self.readdirplus {
             match list_all(|cookie, verf| self.readdirplus_page(dir, cookie, verf)) {
-                Err(Error::Nfs(Status::NotSupp)) | Err(Error::Accept(AcceptError::ProcUnavail)) => {
+                Err(Error::Nfs(Status::NotSupp | Status::TooSmall))
+                | Err(Error::Accept(AcceptError::ProcUnavail)) => {
                     self.readdirplus = false;
                 }
                 r => return r,
@@ -740,6 +749,15 @@ mod tests {
             transfer_size(1 << 20, 1 << 20, Proto::Udp),
             UDP_MAX_TRANSFER
         );
+    }
+
+    #[test]
+    fn transfer_size_clamps_to_max() {
+        // Preferred above max: max wins.
+        assert_eq!(transfer_size(65536, 32768, Proto::Tcp), 32768);
+        // Max of 0 means "unspecified": preferred stands.
+        assert_eq!(transfer_size(16384, 0, Proto::Tcp), 16384);
+        assert_eq!(transfer_size(8192, 8192, Proto::Tcp), 8192);
     }
 
     #[test]
