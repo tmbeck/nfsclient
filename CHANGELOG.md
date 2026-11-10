@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-10
+
 ### Added
 
 - Retry policy (`RpcOptions::retry`, `RetryPolicy`): failed calls are
@@ -80,6 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   READDIRPLUS falls back to READDIR on TOOSMALL.
 - NFSv2 normalizes the mount path like v3.
 - Three rustdoc warnings.
+- testenv: the kernel nfsd container starts nfsd with `rpc.nfsd` so NFS is
+  registered with the portmapper (Linux 7.2 no longer registers it when nfsd
+  is started through `/proc`).
 
 ## [1.0.0] - 2026-11-09
 
