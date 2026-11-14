@@ -222,6 +222,7 @@ struct Shared {
     target: Mutex<SocketAddr>,
     start: Instant,
     stop: AtomicBool,
+    listener_open: AtomicBool,
     accepted: AtomicU64,
     to_server: AtomicU64,
     to_client: AtomicU64,
@@ -275,6 +276,10 @@ impl Shared {
             Fault::Down(d) => {
                 self.ctl.lock().unwrap().down_until = Some(now + d);
                 self.kill_all();
+                let wait_end = Instant::now() + d.min(Duration::from_millis(500));
+                while self.listener_open.load(Ordering::Acquire) && Instant::now() < wait_end {
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         }
     }
@@ -329,6 +334,7 @@ impl ChaosProxy {
             target: Mutex::new(target),
             start: Instant::now(),
             stop: AtomicBool::new(false),
+            listener_open: AtomicBool::new(true),
             accepted: AtomicU64::new(0),
             to_server: AtomicU64::new(0),
             to_client: AtomicU64::new(0),
@@ -422,13 +428,17 @@ fn accept_loop(listener: TcpListener, addr: SocketAddr, shared: Arc<Shared>) {
         if shared.down() {
             // Closing the socket makes connects fail with ECONNREFUSED.
             listener = None;
+            shared.listener_open.store(false, Ordering::Release);
             thread::sleep(Duration::from_millis(10));
             continue;
         }
         let Some(l) = listener.as_ref() else {
             // std sets SO_REUSEADDR on Unix, so the port can be bound again.
             match TcpListener::bind(addr).and_then(|l| l.set_nonblocking(true).map(|_| l)) {
-                Ok(l) => listener = Some(l),
+                Ok(l) => {
+                    listener = Some(l);
+                    shared.listener_open.store(true, Ordering::Release);
+                }
                 Err(_) => thread::sleep(Duration::from_millis(10)),
             }
             continue;
