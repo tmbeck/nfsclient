@@ -1448,7 +1448,9 @@ fn echo_roundtrip(s: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
 
 /// Whether the connection is broken: a read returns EOF or an error within `limit`.
 fn is_broken(s: &mut TcpStream, limit: Duration) -> bool {
-    s.set_read_timeout(Some(limit)).unwrap();
+    if s.set_read_timeout(Some(limit)).is_err() {
+        return true;
+    }
     let mut b = [0u8; 1];
     match s.read(&mut b) {
         Ok(0) => true,
