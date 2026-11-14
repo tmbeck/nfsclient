@@ -7,6 +7,19 @@ protocols itself.
 
 ## Why
 
+I vibe coded this project to solve a problem I had (scripting the download
+of files from an NFS server hosted by proxmox/zfs). I didn't want to
+constantly mount and unmount nfs when I knew the path to the file I needed.
+
+`nfsclient` was created in the spirit of `smbget`. I didn't do an exhaustive
+search for a similar solution and it was easier to vibe code one with a
+prompt. This version is also portable, which is something I wanted when
+using it on some of my old devices.
+
+I didn't exhaustively test it with all versions of NFS; I focused on the
+most common ones I had available (v3 and v4). I didn't test all the security
+feaures of v4 to validate they work correctly.
+
 - **No mount.** Nothing is added to the kernel's mount table, so no root is
   needed for the kernel client, no `/etc/fstab` entry, and no cleanup.
 - **Works where NFS client tools are missing.** A single binary is enough.
