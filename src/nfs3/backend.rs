@@ -24,6 +24,11 @@ use super::types::{CreateHow, FILE_SYNC, Fattr3, Sattr3, TimeSet, UNSTABLE, Verf
 /// Largest READ/WRITE transfer we will use, whatever FSINFO advertises.
 pub const MAX_TRANSFER: u32 = 1 << 20;
 /// Largest transfer over UDP (keeps replies under the datagram limit).
+/// On macOS / BSD systems, net.inet.udp.maxdgram is 9216 bytes by default,
+/// so UDP transfers must stay under 8 KiB.
+#[cfg(target_os = "macos")]
+pub const UDP_MAX_TRANSFER: u32 = 8 << 10;
+#[cfg(not(target_os = "macos"))]
 pub const UDP_MAX_TRANSFER: u32 = 32 << 10;
 /// READDIRPLUS `dircount` and `maxcount`.
 pub const READDIRPLUS_DIRCOUNT: u32 = 8 << 10;
@@ -290,14 +295,18 @@ impl Nfs3 {
     }
 
     fn readdirplus_page(&mut self, dir: &FileHandle, cookie: u64, verf: Verf) -> Result<Page> {
+        let (dircount, maxcount) = match self.client.proto() {
+            Proto::Udp => (UDP_MAX_TRANSFER.min(READDIRPLUS_DIRCOUNT), UDP_MAX_TRANSFER),
+            Proto::Tcp => (READDIRPLUS_DIRCOUNT, READDIRPLUS_MAXCOUNT),
+        };
         let r: Reply<ReaddirOk<true>> = self.call(
             proto::READDIRPLUS,
             &ReaddirPlusArgs {
                 dir,
                 cookie,
                 verf,
-                dircount: READDIRPLUS_DIRCOUNT,
-                maxcount: READDIRPLUS_MAXCOUNT,
+                dircount,
+                maxcount,
             },
         )?;
         let ok = r.0;
@@ -305,13 +314,17 @@ impl Nfs3 {
     }
 
     fn readdir_page(&mut self, dir: &FileHandle, cookie: u64, verf: Verf) -> Result<Page> {
+        let count = match self.client.proto() {
+            Proto::Udp => UDP_MAX_TRANSFER,
+            Proto::Tcp => READDIR_COUNT,
+        };
         let r: Reply<ReaddirOk<false>> = self.call(
             proto::READDIR,
             &ReaddirArgs {
                 dir,
                 cookie,
                 verf,
-                count: READDIR_COUNT,
+                count,
             },
         )?;
         let ok = r.0;

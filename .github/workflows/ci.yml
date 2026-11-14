@@ -13,9 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --component clippy,rustfmt
+          rustup default stable
 
       - name: Format
         run: cargo fmt --check
@@ -43,9 +44,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.100.0"
+      - name: Install Rust toolchain
+        run: rustup show
       - name: Build
         run: cargo build --locked --all-targets
       - name: Tests (offline)
@@ -55,7 +55,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup show
       - name: Build
         run: cargo build --locked --all-targets
       - name: Tests (offline)
