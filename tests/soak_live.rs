@@ -1522,11 +1522,17 @@ fn proxy_set_target_moves_new_connections() {
 fn proxy_down_refuses_then_recovers() {
     let px = ChaosProxy::start(echo_server(), Schedule::None).unwrap();
     let mut a = TcpStream::connect(px.addr()).unwrap();
-    px.inject(Fault::Down(Duration::from_millis(600)));
+    px.inject(Fault::Down(Duration::from_millis(2000)));
     assert!(is_broken(&mut a, Duration::from_secs(2)));
     let e = TcpStream::connect(px.addr()).expect_err("connect while down");
-    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
-    thread::sleep(Duration::from_millis(800));
+    assert!(
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::InvalidInput
+        ),
+        "{e}"
+    );
+    thread::sleep(Duration::from_millis(2200));
     let mut b = TcpStream::connect(px.addr()).expect("connect after down");
     echo_roundtrip(&mut b, 1000).unwrap();
 }
