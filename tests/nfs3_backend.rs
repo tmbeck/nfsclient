@@ -197,7 +197,13 @@ fn basic(proto: Proto) {
     assert_eq!(st.nfs(FSINFO), 1);
     match proto {
         Proto::Tcp => assert_eq!((fs.max_read(), fs.max_write()), (64 << 10, 64 << 10)),
-        Proto::Udp => assert_eq!((fs.max_read(), fs.max_write()), (32 << 10, 32 << 10)),
+        Proto::Udp => assert_eq!(
+            (fs.max_read(), fs.max_write()),
+            (
+                nfsc::nfs3::backend::UDP_MAX_TRANSFER,
+                nfsc::nfs3::backend::UDP_MAX_TRANSFER
+            )
+        ),
     }
 
     // ls of the root, with READDIRPLUS attributes.
@@ -590,7 +596,13 @@ fn huge_fsinfo_sizes_are_capped() {
     let fs = mount(&srv, Proto::Tcp);
     assert_eq!((fs.max_read(), fs.max_write()), (1 << 20, 1 << 20));
     let fs = mount(&srv, Proto::Udp);
-    assert_eq!((fs.max_read(), fs.max_write()), (32 << 10, 32 << 10));
+    assert_eq!(
+        (fs.max_read(), fs.max_write()),
+        (
+            nfsc::nfs3::backend::UDP_MAX_TRANSFER,
+            nfsc::nfs3::backend::UDP_MAX_TRANSFER
+        )
+    );
 }
 
 // ---------------------------------------------------------------- READDIR
