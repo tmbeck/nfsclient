@@ -8,7 +8,6 @@ readme = "README.md"
 authors = ["Tim Beck"]
 documentation = "https://docs.rs/nfsc"
 repository = "https://github.com/tmbeck/nfsclient"
-homepage = "https://github.com/tmbeck/nfsclient"
 exclude = ["/testenv/", "/.claude/", "/.github/", "/justfile", "/target/", "/DESIGN.md", "/.gitignore"]
 keywords = ["nfs", "rpc", "filesystem", "client", "cli"]
 categories = ["network-programming", "filesystem", "command-line-utilities"]

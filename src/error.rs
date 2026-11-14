@@ -102,21 +102,29 @@ impl Error {
         use crate::fs::{NfsVersion, Status};
         match self {
             Error::Timeout => true,
-            Error::Io(e) => matches!(
-                e.kind(),
-                io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::NotConnected
-                    | io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::TimedOut
-                    | io::ErrorKind::HostUnreachable
-                    | io::ErrorKind::NetworkUnreachable
-                    | io::ErrorKind::NetworkDown
-                    | io::ErrorKind::WouldBlock
-                    | io::ErrorKind::Interrupted
-            ),
+            Error::Io(e) => {
+                // On macOS / BSD, a failed connect to a closed port or a socket
+                // teardown can report EINVAL (code 22) instead of ECONNREFUSED.
+                #[cfg(target_os = "macos")]
+                if e.raw_os_error() == Some(22) {
+                    return true;
+                }
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::HostUnreachable
+                        | io::ErrorKind::NetworkUnreachable
+                        | io::ErrorKind::NetworkDown
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                )
+            }
             Error::Nfs(Status::Jukebox) => true,
             Error::Nfs(Status::Other(NfsVersion::V4(_), NFS4ERR_GRACE)) => true,
             _ => false,
