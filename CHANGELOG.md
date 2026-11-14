@@ -204,7 +204,8 @@ First release.
 - Downloaded file modes are taken from the server (minus setuid/setgid/sticky)
   without applying the local umask.
 
-<!-- TODO: once a remote exists, replace REPO_URL and uncomment:
-[Unreleased]: REPO_URL/compare/v1.0.0...HEAD
-[1.0.0]: REPO_URL/releases/tag/v1.0.0
--->
+[Unreleased]: https://github.com/tmbeck/nfsclient/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/tmbeck/nfsclient/compare/v1.2.1...v1.3.0
+[1.2.1]: https://github.com/tmbeck/nfsclient/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/tmbeck/nfsclient/compare/v1.0.0...v1.2.0
+[1.0.0]: https://github.com/tmbeck/nfsclient/releases/tag/v1.0.0
