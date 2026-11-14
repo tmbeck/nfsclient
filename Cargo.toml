@@ -1,6 +1,6 @@
 [package]
 name = "nfsc"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Userspace NFS client: browse and transfer files on NFS exports without mounting"
@@ -13,7 +13,7 @@ documentation = "https://docs.rs/nfsc"
 exclude = ["/testenv/", "/.claude/", "/.github/", "/justfile", "/target/", "/DESIGN.md", "/.gitignore"]
 keywords = ["nfs", "rpc", "filesystem", "client", "cli"]
 categories = ["network-programming", "filesystem", "command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.100.0"
 
 [lib]
 name = "nfsc"

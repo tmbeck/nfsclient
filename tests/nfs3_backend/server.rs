@@ -673,10 +673,10 @@ fn pick_fault(shared: &Shared, call: &Call) -> Option<Fault> {
             if r.prog != call.prog || r.proc_ != call.proc_ || r.times == 0 {
                 continue;
             }
-            if let Some(f) = &r.filter {
-                if !f(call) {
-                    continue;
-                }
+            if let Some(f) = &r.filter
+                && !f(call)
+            {
+                continue;
             }
             if r.after > 0 {
                 r.after -= 1;

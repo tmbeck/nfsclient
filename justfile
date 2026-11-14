@@ -35,8 +35,8 @@ doc:
 
 # Build and test with the minimum supported Rust version (needs rustup)
 msrv:
-    cargo +1.85 build --locked --all-targets
-    cargo +1.85 test --locked
+    cargo +1.100.0 build --locked --all-targets
+    cargo +1.100.0 test --locked
 
 # Everything CI runs (except msrv and cargo-deny)
 ci: lint doc test

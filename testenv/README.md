@@ -162,6 +162,6 @@ with `cargo test`.
 - Scratch data lives in tmpfs (knfsd) or podman volumes `nfsc-ganesha-rw/ro`
   (ganesha). `down.sh` removes the volumes; restarting containers resets data.
 - ganesha: tmpfs export paths fail in the VFS FSAL (ENOENT on resolve), and
-  overlay paths fail with ENOTSUP for file handles, so it uses named volumes
-  (btrfs-backed on this host). UDP transport is not offered by ganesha 14.
+  overlay paths fail with ENOTSUP for file handles, so it uses named volumes.
+  UDP transport is not offered by ganesha 14.
 - Locks (NLM, NFSv4 byte-range) are not exercised: ganesha has NLM disabled.

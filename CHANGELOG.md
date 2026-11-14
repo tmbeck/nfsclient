@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-14
+
+### Changed
+
+- Migrated toolchain and MSRV to Rust 1.100.0, with pinned `rust-toolchain.toml`.
+- Updated dependencies (`sha2` 0.11.1, `const-oid` 0.10.3, `bumpalo` 3.20.4).
+- Cleaned up clippy warnings under Rust 1.100.0 (adopted let-chains in test fakes).
+- Updated GitHub Actions CI and release workflows for Rust 1.100.0.
+- Sanitized repository for public release (removed private paths and host-specific infrastructure notes).
+
 ## [1.2.1] - 2026-11-10
 
 ### Added

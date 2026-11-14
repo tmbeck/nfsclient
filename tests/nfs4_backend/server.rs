@@ -879,10 +879,10 @@ fn pick_fault(shared: &Shared, call: &Call) -> Option<(Fault, u32)> {
             if r.times == 0 || (r.op != OP_ANY && !call.has(r.op)) {
                 continue;
             }
-            if let Some(f) = &r.filter {
-                if !f(call) {
-                    continue;
-                }
+            if let Some(f) = &r.filter
+                && !f(call)
+            {
+                continue;
             }
             if r.after > 0 {
                 r.after -= 1;
@@ -1063,13 +1063,13 @@ fn compound(shared: &Shared, xid: u32, args: &[u8]) -> Outcome {
         }
     }
     let reply = compound_body(status, &tag, &results);
-    if let (Some(id), Some(slot)) = (ctx.session, ctx.slot) {
-        if let Some(sess) = st.sessions.get_mut(&id) {
-            let sl = &mut sess.slots[slot];
-            sl.reply = Some(reply.clone());
-            sl.request = args.to_vec();
-            sl.cachethis = ctx.cachethis;
-        }
+    if let (Some(id), Some(slot)) = (ctx.session, ctx.slot)
+        && let Some(sess) = st.sessions.get_mut(&id)
+    {
+        let sl = &mut sess.slots[slot];
+        sl.reply = Some(reply.clone());
+        sl.request = args.to_vec();
+        sl.cachethis = ctx.cachethis;
     }
     drop(st);
     finish(xid, reply, after)
@@ -1206,10 +1206,10 @@ fn sequence(
             ));
         }
         shared.stats.lock().unwrap().slot_replays += 1;
-        if let Some(r) = &sl.reply {
-            if shared.cfg.cache_all_replies || (same && sl.cachethis) {
-                return Seq::Replay(r.clone());
-            }
+        if let Some(r) = &sl.reply
+            && (shared.cfg.cache_all_replies || (same && sl.cachethis))
+        {
+            return Seq::Replay(r.clone());
         }
         return Seq::Done(NFS4ERR_RETRY_UNCACHED_REP, vec![]);
     }
@@ -2688,10 +2688,10 @@ fn exec_op(
             let Some(c) = st.clients.get_mut(clientid).filter(|c| c.v41) else {
                 return (NFS4ERR_STALE_CLIENTID, vec![]);
             };
-            if *seq == c.create_seq.wrapping_sub(1) {
-                if let Some(cached) = &c.create_cache {
-                    return (NFS4_OK, cached.clone());
-                }
+            if *seq == c.create_seq.wrapping_sub(1)
+                && let Some(cached) = &c.create_cache
+            {
+                return (NFS4_OK, cached.clone());
             }
             if *seq != c.create_seq {
                 let want = c.create_seq;

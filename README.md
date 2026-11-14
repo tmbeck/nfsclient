@@ -52,7 +52,7 @@ Live testing used:
   TCP. The test host's kernel did not offer NFSv2 or NFSv4.0.
 - nfs-ganesha 14, in a privileged container: NFSv3 and NFSv4.0 / 4.1 / 4.2 over
   TCP. Ganesha does not offer UDP.
-- A ZFS-on-Linux NAS, read-only, as an external target.
+- An external ZFS storage server, read-only, as a remote target.
 
 The test environment is described in [`testenv/README.md`](testenv/README.md).
 
@@ -62,7 +62,7 @@ Prebuilt Linux binaries (x86_64 glibc and musl, aarch64 musl) with SHA-256
 checksums are attached to each release.
 
 Once published to crates.io, `cargo install nfsc` works too. To build from a
-checkout (requires Rust 1.85 or newer, edition 2024):
+checkout (requires Rust 1.100.0 or newer, edition 2024):
 
 ```sh
 cargo install --path .
