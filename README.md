@@ -11,7 +11,7 @@ I vibe coded this project to solve a problem I had (scripting the download
 of files from an NFS server hosted by proxmox/zfs). I didn't want to
 constantly mount and unmount nfs when I knew the path to the file I needed.
 
-`nfsclient` was created in the spirit of `smbget`. I didn't do an exhaustive
+`nfsclient` was created in the spirit of `smbclient`. I didn't do an exhaustive
 search for a similar solution and it was easier to vibe code one with a
 prompt. This version is also portable, which is something I wanted when
 using it on some of my old devices.
