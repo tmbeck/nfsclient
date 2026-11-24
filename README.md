@@ -1,6 +1,6 @@
-# nfsc
+# nfsclient
 
-`nfsc` is a userspace NFS client for the command line, in the spirit of
+`nfsclient` is a userspace NFS client for the command line, in the spirit of
 `smbclient`. You browse and transfer files on NFS exports without mounting
 them. It is pure Rust, runs entirely in user space, and speaks the wire
 protocols itself.
@@ -74,14 +74,14 @@ The test environment is described in [`testenv/README.md`](testenv/README.md).
 Prebuilt Linux binaries (x86_64 glibc and musl, aarch64 musl) with SHA-256
 checksums are attached to each release.
 
-Once published to crates.io, `cargo install nfsc` works too. To build from a
+Once published to crates.io, `cargo install nfsclient` works too. To build from a
 checkout (requires Rust 1.100.0 or newer, edition 2024):
 
 ```sh
 cargo install --path .
 ```
 
-This installs `nfsc` into `~/.cargo/bin`. To build only the library, without
+This installs `nfsclient` into `~/.cargo/bin`. To build only the library, without
 the command-line dependencies, use `cargo build --no-default-features`.
 
 With [`just`](https://github.com/casey/just), `just install-cap` installs and
@@ -93,50 +93,50 @@ without root (see [Privileged source ports](#privileged-source-ports)).
 List the exports of a server (like `showmount -e`):
 
 ```sh
-nfsc exports nas.example.net
+nfsclient exports nas.example.net
 ```
 
 List the RPC services the server registers (like `rpcinfo -p`):
 
 ```sh
-nfsc rpcinfo nas.example.net
+nfsclient rpcinfo nas.example.net
 ```
 
 Open an interactive shell on an export:
 
 ```sh
-nfsc shell nas.example.net:/export
+nfsclient shell nas.example.net:/export
 ```
 
 Open a shell on a subdirectory with the `nfs://` form and download a file
 non-interactively:
 
 ```sh
-nfsc shell nfs://nas.example.net/export/dir -c 'get big.iso'
+nfsclient shell nfs://nas.example.net/export/dir -c 'get big.iso'
 ```
 
 Stream a file to another tool without writing it to disk:
 
 ```sh
-nfsc shell nas.example.net:/export -c 'cat big.iso' | sha256sum
+nfsclient shell nas.example.net:/export -c 'cat big.iso' | sha256sum
 ```
 
 Pin the protocol version:
 
 ```sh
-nfsc shell nas.example.net:/export -v 3
+nfsclient shell nas.example.net:/export -v 3
 ```
 
 Read a script from stdin. The process stops at the first failing command:
 
 ```sh
-printf 'cd backups\nls -l\nget -c db.dump\n' | nfsc shell nas.example.net:/export
+printf 'cd backups\nls -l\nget -c db.dump\n' | nfsclient shell nas.example.net:/export
 ```
 
 ### Identity
 
 ```sh
-nfsc shell nas.example.net:/export --uid 1000 --gid 100 --gids 4,24,27
+nfsclient shell nas.example.net:/export --uid 1000 --gid 100 --gids 4,24,27
 ```
 
 `--uid`, `--gid` and `--gids` set the AUTH_SYS credentials. The defaults are
@@ -146,7 +146,7 @@ the local user, the primary group, and the user's groups.
 Anyone who can reach the NFS port can send any uid. Use these options only
 against servers you trust, on networks you control, or with export options
 (such as `root_squash` and host restrictions) that match your threat model.
-`nfsc` does not provide RPCSEC_GSS or Kerberos authentication.
+`nfsclient` does not provide RPCSEC_GSS or Kerberos authentication.
 
 ## Privileged source ports
 
@@ -163,14 +163,14 @@ source port below 1024. A normal user cannot bind those ports.
 
 To use a `secure` export, choose one of these:
 
-1. Run `nfsc` as root. This is simple but gives the whole process root.
+1. Run `nfsclient` as root. This is simple but gives the whole process root.
 2. Grant the binary the capability to bind low ports:
 
    ```sh
-   sudo setcap cap_net_bind_service=+ep "$(command -v nfsc)"
+   sudo setcap cap_net_bind_service=+ep "$(command -v nfsclient)"
    ```
 
-   The capability is stored on the file. Reinstalling `nfsc` (for example with
+   The capability is stored on the file. Reinstalling `nfsclient` (for example with
    `cargo install`) replaces the file and drops the capability, so run the
    `setcap` command again after each install or upgrade.
 
@@ -211,14 +211,14 @@ Behavior that applies to all commands:
 
 - Interactive: Ctrl-C cancels a running transfer or discards the current line
   and returns to the prompt. Ctrl-D exits. History is kept in
-  `$XDG_STATE_HOME/nfsc/history` (default `~/.local/state/nfsc/history`).
+  `$XDG_STATE_HOME/nfsclient/history` (default `~/.local/state/nfsclient/history`).
 - `-c 'cmd; cmd'` and piped scripts run commands in order and stop at the
   first failure. `exit` or `quit` ends early with status 0.
 - Unknown command names in `-c` are rejected before connecting.
 - Progress bars appear on stderr only when stderr is a terminal, so scripts
   and pipes stay clean. Recursive transfers scan the tree first and show a
   totals bar (files and bytes) below the current file's bar.
-- `nfsc shell --help` lists the shell commands, so you can discover them
+- `nfsclient shell --help` lists the shell commands, so you can discover them
   without connecting; `-c 'help get'` prints one command's details.
 - File data goes to stdout only for `cat` and `get -`. Diagnostics go to stderr.
 
@@ -240,16 +240,16 @@ options (clap's usage error), 130 when interrupted with Ctrl-C.
 
 ## Library
 
-The library crate is also called `nfsc`. Its only required dependency is
+The library crate is also called `nfsclient`. Its only required dependency is
 `socket2`. `fs::connect` negotiates the NFS version, and the `Filesystem`
 trait gives one interface across v2, v3 and v4:
 
 ```rust
 use std::net::IpAddr;
 
-use nfsc::fs::{self, ConnectOptions};
+use nfsclient::fs::{self, ConnectOptions};
 
-fn list_export() -> nfsc::Result<()> {
+fn list_export() -> nfsclient::Result<()> {
     let host: IpAddr = "192.0.2.10".parse().expect("literal address");
     let mut conn = fs::connect(host, b"/srv/data", &ConnectOptions::default())?;
 
